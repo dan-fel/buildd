@@ -1,0 +1,71 @@
+# buildd
+
+Coordinates the Cargo builds of many concurrent sessions (coding agents,
+editors, people) on one machine, so that build disk stays fixed and builds
+share one CPU budget instead of each assuming it owns the machine.
+
+## How it works
+
+- **Sessions never build in their worktree.** `buildd check` (or `clippy`,
+  `build`, `test`) snapshots the worktree's current content, committed or
+  not, as a git tree. Tracked files and untracked files git does not ignore
+  are included. The tree id is the revision every result reports.
+- **Build slots.** The daemon checks that tree out into a slot: a checkout at
+  a fixed path with the only target directory that path ever uses. Checking
+  out writes only the files that differ from the slot's previous build, so
+  Cargo sees ordinary edits and incremental compilation stays warm. Each
+  repository gets at most `slots` slot directories, created only when its
+  builds run concurrently, so build disk depends on the slot count rather
+  than the number of sessions or worktrees.
+- **Affinity.** A build prefers the slot that last built its worktree.
+- **One CPU budget.** Every Cargo the daemon runs shares one jobserver with
+  `jobs` tokens.
+- **Deduplication and supersession.** A request equal to a queued or running
+  build (same repository, tree, directory, command and arguments) waits for
+  that build. A newer request from a worktree replaces its own queued older
+  ones at their place in the queue.
+- **Cancellation.** Closing the client (Ctrl-C) withdraws the request. A
+  build nobody waits for any more is stopped with its whole process group.
+
+## Use
+
+```sh
+cargo install --path . --root ~/.local
+cd some/worktree
+buildd check -p my-crate        # starts the daemon on first use
+buildd test -p my-crate -- some_test
+buildd status
+```
+
+Arguments are passed to Cargo unchanged, except those that would take the
+slot's target directory, checkout, output format or parallelism away from
+the daemon (`--target-dir`, `--manifest-path`, `--message-format`,
+`--config`, `-j`, `-Z`, ...), which are rejected.
+
+State lives in `$BUILDD_HOME`, by default `buildd` in the user cache
+directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
+
+```text
+config.toml        slots = 2, jobs = <CPUs> by default
+sock               the daemon's socket
+daemon.log         output of a daemon a client started
+slots/<repo>-<hash>/<n>/{src,target}
+```
+
+## Protocol
+
+One JSON object per line over the Unix socket; see `src/protocol.rs`. The
+library's `client` module is what other programs integrate with.
+
+## Not yet
+
+- Memory-aware admission and priorities: builds start first come, first
+  served, at most `slots` at once.
+- A size cap on slot targets and pruning of stale incremental sessions.
+- A `cargo` shim that routes agents' own Cargo calls to the daemon.
+- Client environment: Cargo runs with the daemon's environment, so a
+  client's `RUSTFLAGS` or `RUST_LOG` do not reach the build.
+- Ignored files are not part of a snapshot; a build that needs a generated,
+  ignored file fails in a slot.
+
+Unix only (Unix sockets, process groups).
