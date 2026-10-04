@@ -7,6 +7,7 @@
 //! checkout. Cargo then sees ordinary edits, and the slot's path, and with it
 //! every fingerprint in its target, never changes.
 
+use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -207,17 +208,28 @@ fn read_directory(path: &Path) -> Result<Vec<PathBuf>, String> {
         .map_err(|error| format!("could not read {}: {error}", path.display()))
 }
 
-/// The disk space the files under `path` occupy, not following links.
+/// The disk space the files under `path` occupy, not following symbolic
+/// links and counting each hard-linked file once: rustc's incremental
+/// sessions and Cargo's uplifted artifacts are hard links.
 fn disk_usage(path: &Path) -> Result<u64, String> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let own = metadata.blocks() * 512;
-    if !metadata.is_dir() {
-        return Ok(own);
+    fn walk(path: &Path, seen: &mut HashSet<(u64, u64)>) -> Result<u64, String> {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if metadata.nlink() > 1
+            && !metadata.is_dir()
+            && !seen.insert((metadata.dev(), metadata.ino()))
+        {
+            return Ok(0);
+        }
+        let own = metadata.blocks() * 512;
+        if !metadata.is_dir() {
+            return Ok(own);
+        }
+        read_directory(path)?
+            .iter()
+            .try_fold(own, |total, child| Ok(total + walk(child, seen)?))
     }
-    read_directory(path)?
-        .iter()
-        .try_fold(own, |total, child| Ok(total + disk_usage(child)?))
+    walk(path, &mut HashSet::new())
 }
 
 /// A slot's display name: its project and index.
@@ -376,6 +388,17 @@ mod tests {
             Ok(Pruning::Cleared { .. })
         ));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn hard_linked_files_count_once() {
+        let directory = TempDir::new();
+        file(&directory.0.join("a/data"), 100_000);
+        let single = disk_usage(&directory.0).unwrap();
+        std::fs::create_dir(directory.0.join("b")).unwrap();
+        std::fs::hard_link(directory.0.join("a/data"), directory.0.join("b/data")).unwrap();
+        let linked = disk_usage(&directory.0).unwrap();
+        assert!(linked < single + 50_000, "{single} then {linked}");
     }
 
     #[test]
