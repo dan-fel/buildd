@@ -7,7 +7,9 @@
 //! checkout. Cargo then sees ordinary edits, and the slot's path, and with it
 //! every fingerprint in its target, never changes.
 
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::git;
 use crate::snapshot::Revision;
@@ -88,6 +90,134 @@ impl SlotDirectory {
         git::run(clean)?;
         Ok(())
     }
+
+    /// Keeps the slot's target within `limit` bytes of disk. Incremental
+    /// compilation caches go first, least recently compiled first: removing
+    /// one only makes rustc compile that unit from scratch once. The whole
+    /// target goes only when its compiled artifacts alone exceed the limit.
+    ///
+    /// Only call this while no build runs in the slot.
+    pub(crate) fn enforce_limit(&self, limit: u64) -> Result<Pruning, String> {
+        let target = self.target();
+        if !target.exists() {
+            return Ok(Pruning::Within { size: 0 });
+        }
+        let before = disk_usage(&target)?;
+        if before <= limit {
+            return Ok(Pruning::Within { size: before });
+        }
+        let mut caches = incremental_caches(&target)?;
+        caches.sort_by_key(|cache| cache.compiled);
+        let mut size = before;
+        let mut removed = 0;
+        for cache in caches {
+            if size <= limit {
+                break;
+            }
+            std::fs::remove_dir_all(&cache.path)
+                .map_err(|error| format!("could not remove {}: {error}", cache.path.display()))?;
+            size = size.saturating_sub(cache.size);
+            removed += 1;
+        }
+        if size <= limit {
+            return Ok(Pruning::Incremental {
+                before,
+                after: size,
+                removed,
+            });
+        }
+        std::fs::remove_dir_all(&target)
+            .map_err(|error| format!("could not remove {}: {error}", target.display()))?;
+        Ok(Pruning::Cleared { before })
+    }
+}
+
+/// What keeping a slot within its limit did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Pruning {
+    /// The target was within the limit.
+    Within { size: u64 },
+    /// `removed` incremental caches went.
+    Incremental {
+        before: u64,
+        after: u64,
+        removed: usize,
+    },
+    /// The compiled artifacts alone exceeded the limit; the target went.
+    Cleared { before: u64 },
+}
+
+impl Pruning {
+    /// The target's size afterwards.
+    pub(crate) fn size(self) -> u64 {
+        match self {
+            Self::Within { size } | Self::Incremental { after: size, .. } => size,
+            Self::Cleared { .. } => 0,
+        }
+    }
+}
+
+/// One compilation unit's incremental cache.
+struct IncrementalCache {
+    path: PathBuf,
+    size: u64,
+    /// When rustc last compiled the unit: it replaces the cache's session
+    /// directory on every incremental compilation.
+    compiled: SystemTime,
+}
+
+/// The incremental caches of every profile, for the host and each target
+/// triple: `<target>/[<triple>/]<profile>/incremental/<unit>`.
+fn incremental_caches(target: &Path) -> Result<Vec<IncrementalCache>, String> {
+    let mut caches = Vec::new();
+    let mut profiles = Vec::new();
+    for entry in read_directory(target)? {
+        if entry.join("incremental").is_dir() {
+            profiles.push(entry);
+        } else if entry.is_dir() {
+            profiles.extend(
+                read_directory(&entry)?
+                    .into_iter()
+                    .filter(|profile| profile.join("incremental").is_dir()),
+            );
+        }
+    }
+    for profile in profiles {
+        for path in read_directory(&profile.join("incremental"))? {
+            let compiled = std::fs::symlink_metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            caches.push(IncrementalCache {
+                size: disk_usage(&path)?,
+                path,
+                compiled,
+            });
+        }
+    }
+    Ok(caches)
+}
+
+fn read_directory(path: &Path) -> Result<Vec<PathBuf>, String> {
+    std::fs::read_dir(path)
+        .and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect()
+        })
+        .map_err(|error| format!("could not read {}: {error}", path.display()))
+}
+
+/// The disk space the files under `path` occupy, not following links.
+fn disk_usage(path: &Path) -> Result<u64, String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let own = metadata.blocks() * 512;
+    if !metadata.is_dir() {
+        return Ok(own);
+    }
+    read_directory(path)?
+        .iter()
+        .try_fold(own, |total, child| Ok(total + disk_usage(child)?))
 }
 
 /// A slot's display name: its project and index.
@@ -183,6 +313,69 @@ mod tests {
             git(&checkout, &["rev-parse", "HEAD^{tree}"]).trim(),
             third.to_string()
         );
+    }
+
+    /// Writes `bytes` of data to `path`, creating its directories.
+    fn file(path: &Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![7; bytes]).unwrap();
+    }
+
+    fn set_modified(path: &Path, seconds_ago: u64) {
+        let time = SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_target_over_its_limit_loses_the_least_recently_compiled_caches_first() {
+        let home = TempDir::new();
+        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+        let target = slot.target();
+        assert_eq!(slot.enforce_limit(0), Ok(Pruning::Within { size: 0 }));
+        file(&target.join("debug/deps/libbig.rlib"), 400_000);
+        for (unit, age) in [("old-1", 300), ("mid-2", 200), ("new-3", 100)] {
+            file(
+                &target.join(format!("debug/incremental/{unit}/s-1/query.bin")),
+                200_000,
+            );
+            set_modified(&target.join(format!("debug/incremental/{unit}")), age);
+        }
+        file(
+            &target.join("aarch64-apple-darwin/debug/incremental/cross-4/s-1/q.bin"),
+            200_000,
+        );
+        set_modified(
+            &target.join("aarch64-apple-darwin/debug/incremental/cross-4"),
+            400,
+        );
+
+        let size = disk_usage(&target).unwrap();
+        assert_eq!(slot.enforce_limit(size), Ok(Pruning::Within { size }));
+        // Two caches of about 200 kB must go: the cross-compiled one and old-1.
+        let Pruning::Incremental {
+            removed: 2, after, ..
+        } = slot.enforce_limit(size - 300_000).unwrap()
+        else {
+            panic!("two caches go");
+        };
+        assert!(after <= size - 300_000);
+        assert!(
+            !target
+                .join("aarch64-apple-darwin/debug/incremental/cross-4")
+                .exists()
+        );
+        assert!(!target.join("debug/incremental/old-1").exists());
+        assert!(target.join("debug/incremental/mid-2").exists());
+        assert!(target.join("debug/deps/libbig.rlib").exists());
+
+        assert!(matches!(
+            slot.enforce_limit(100_000),
+            Ok(Pruning::Cleared { .. })
+        ));
+        assert!(!target.exists());
     }
 
     #[test]

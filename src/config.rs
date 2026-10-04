@@ -8,41 +8,58 @@ use serde::Deserialize;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     /// Builds that run at once. Each repository gets at most this many slot
-    /// directories, so this also bounds build disk.
+    /// directories.
     pub slots: usize,
     /// Compiler jobs shared by all running builds.
     pub jobs: usize,
+    /// Disk one slot's target may keep between builds, in bytes. Build disk
+    /// is at most this times `slots` per repository, plus what a running
+    /// build adds before it is pruned.
+    pub slot_limit: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
     slots: Option<usize>,
     jobs: Option<usize>,
+    slot_limit_gib: Option<f64>,
 }
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
-    /// two slots, and one job per available CPU.
+    /// two slots, one job per available CPU, and 20 GiB per slot.
     ///
     /// # Errors
-    /// When the file cannot be read or parsed, or a limit is zero.
+    /// When the file cannot be read or parsed, or a limit is not positive.
     pub fn load(home: &Path) -> Result<Self, String> {
         let path = home.join("config.toml");
         let file = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str::<File>(&text)
                 .map_err(|error| format!("{}: {error}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => File {
-                slots: None,
-                jobs: None,
-            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => File::default(),
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
+        let slot_limit_gib = file.slot_limit_gib.unwrap_or(20.0);
+        if !(slot_limit_gib.is_finite() && slot_limit_gib > 0.0) {
+            return Err(format!(
+                "{}: slot_limit_gib must be positive",
+                path.display()
+            ));
+        }
         let config = Self {
             slots: file.slots.unwrap_or(2),
             jobs: file.jobs.unwrap_or_else(|| {
                 std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
             }),
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a positive, finite number of GiB rounds to bytes"
+            )]
+            slot_limit: (slot_limit_gib * GIB).round() as u64,
         };
         if config.slots == 0 || config.jobs == 0 {
             return Err(format!(
@@ -83,16 +100,25 @@ mod tests {
     use crate::snapshot::tests::TempDir;
 
     #[test]
-    fn settings_default_and_reject_zero_and_unknown_keys() {
+    fn settings_default_and_reject_nonpositive_and_unknown_keys() {
         let home = TempDir::new();
         let defaults = Config::load(&home.0).unwrap();
         assert_eq!(defaults.slots, 2);
         assert!(defaults.jobs >= 1);
-        std::fs::write(home.0.join("config.toml"), "slots = 3\njobs = 6\n").unwrap();
-        assert_eq!(Config::load(&home.0).unwrap(), Config { slots: 3, jobs: 6 });
-        std::fs::write(home.0.join("config.toml"), "slots = 0\n").unwrap();
-        assert!(Config::load(&home.0).is_err());
-        std::fs::write(home.0.join("config.toml"), "slot = 1\n").unwrap();
-        assert!(Config::load(&home.0).is_err());
+        assert_eq!(defaults.slot_limit, 20 << 30);
+        let write = |text: &str| std::fs::write(home.0.join("config.toml"), text).unwrap();
+        write("slots = 3\njobs = 6\nslot_limit_gib = 0.5\n");
+        let expected = Config {
+            slots: 3,
+            jobs: 6,
+            slot_limit: 1 << 29,
+        };
+        assert_eq!(Config::load(&home.0).unwrap(), expected);
+        write("slot_limit_gib = 12\n");
+        assert_eq!(Config::load(&home.0).unwrap().slot_limit, 12 << 30);
+        for invalid in ["slots = 0\n", "slot_limit_gib = 0\n", "slot = 1\n"] {
+            write(invalid);
+            assert!(Config::load(&home.0).is_err(), "{invalid}");
+        }
     }
 }

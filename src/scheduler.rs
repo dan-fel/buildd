@@ -12,10 +12,12 @@
 //!   their revision.
 //! - **Cancellation.** A running build nobody waits for any more is
 //!   cancelled; a queued one is dropped.
-//! - **Slots.** At most `capacity` builds run. A build prefers the idle slot
-//!   that last built its worktree, then the least recently used idle slot of
-//!   its repository, and only then a new slot, so slot directories are
-//!   created only when builds of a repository run concurrently.
+//! - **Slots.** At most `capacity` slots are busy: running a build, or being
+//!   kept within their disk limit right after one. A build prefers the idle
+//!   slot that last built its worktree, then the least recently used idle
+//!   slot of its repository. It gets a new slot only when every slot of its
+//!   repository runs a build, so slot directories are created only when
+//!   builds of a repository run concurrently.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -29,6 +31,10 @@ use crate::snapshot::{Revision, Source};
 /// A build the scheduler tracks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct JobId(u64);
+
+/// A slot the scheduler tracks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct SlotKey(usize);
 
 /// A client waiting for a build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -54,7 +60,9 @@ pub(crate) enum Effect {
 #[derive(Debug, PartialEq)]
 pub(crate) struct Start {
     pub(crate) job: JobId,
+    pub(crate) key: SlotKey,
     pub(crate) repository: PathBuf,
+    /// The slot's index among its repository's slots.
     pub(crate) slot: usize,
     pub(crate) prefix: PathBuf,
     pub(crate) revision: Revision,
@@ -95,9 +103,19 @@ struct Slot {
     /// The slot's index among its repository's slots.
     index: usize,
     job: Option<JobId>,
+    /// Its target is being kept within its disk limit after a build.
+    maintaining: bool,
+    /// Its target's disk usage after its last build, when measured.
+    size: Option<u64>,
     worktree: Option<PathBuf>,
     /// When it last started a build, on the scheduler's clock.
     used: u64,
+}
+
+impl Slot {
+    fn busy(&self) -> bool {
+        self.job.is_some() || self.maintaining
+    }
 }
 
 pub(crate) struct Scheduler {
@@ -300,6 +318,7 @@ impl Scheduler {
             panic!("only running jobs exit");
         };
         self.slots[slot].job = None;
+        self.slots[slot].maintaining = true;
         let build_ms = millis(started.elapsed());
         let mut effects = Vec::new();
         for waiter in job.waiters {
@@ -318,21 +337,40 @@ impl Scheduler {
         effects
     }
 
+    /// Slot `key` is within its disk limit again, `size` bytes when
+    /// measured.
+    pub(crate) fn maintained(&mut self, key: SlotKey, size: Option<u64>) -> Vec<Effect> {
+        let slot = &mut self.slots[key.0];
+        assert!(
+            slot.maintaining,
+            "only a slot that ran a build is maintained"
+        );
+        slot.maintaining = false;
+        slot.size = size;
+        self.start_ready()
+    }
+
+    /// Starts queued builds, next first, while slots are free. A build that
+    /// waits for its repository's slot lets later builds of other
+    /// repositories go first.
     fn start_ready(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
-        while self.slots.iter().filter(|slot| slot.job.is_some()).count() < self.capacity {
-            let Some(id) = self
-                .jobs
-                .iter()
-                .filter(|(_, job)| job.queued())
-                .min_by_key(|(id, job)| (job.order, **id))
-                .map(|(id, _)| *id)
-            else {
+        let mut queued = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.queued())
+            .map(|(id, job)| (job.order, *id))
+            .collect::<Vec<_>>();
+        queued.sort_unstable();
+        for (_, id) in queued {
+            if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
                 break;
-            };
+            }
             let job = &self.jobs[&id];
             let worktree = job.waiters[0].worktree.clone();
-            let slot = self.choose_slot(&job.repository.clone(), &worktree);
+            let Some(slot) = self.choose_slot(&job.repository.clone(), &worktree) else {
+                continue;
+            };
             self.clock += 1;
             let entry = &mut self.slots[slot];
             entry.job = Some(id);
@@ -351,6 +389,7 @@ impl Scheduler {
             effects.extend(job.send_all(&started));
             effects.push(Effect::Start(Start {
                 job: id,
+                key: SlotKey(slot),
                 repository: job.repository.clone(),
                 slot: self.slots[slot].index,
                 prefix: job.prefix.clone(),
@@ -361,10 +400,11 @@ impl Scheduler {
         effects
     }
 
-    /// The slot a build of `repository` for `worktree` runs in, creating one
-    /// when every slot of the repository is busy.
-    fn choose_slot(&mut self, repository: &PathBuf, worktree: &PathBuf) -> usize {
-        let idle = |slot: &&Slot| slot.repository == *repository && slot.job.is_none();
+    /// The slot a build of `repository` for `worktree` runs in now: an idle
+    /// one, or a new one when every slot of the repository runs a build and
+    /// it has fewer than `capacity`. None while the build must wait.
+    fn choose_slot(&mut self, repository: &PathBuf, worktree: &PathBuf) -> Option<usize> {
+        let idle = |slot: &&Slot| slot.repository == *repository && !slot.busy();
         let affine = self
             .slots
             .iter()
@@ -378,25 +418,28 @@ impl Scheduler {
                 .min_by_key(|(_, slot)| slot.used)
         };
         if let Some((index, _)) = affine.or_else(least_recent) {
-            return index;
+            return Some(index);
         }
-        let count = self
-            .slots
-            .iter()
-            .filter(|slot| slot.repository == *repository)
-            .count();
-        assert!(
-            count < self.capacity,
-            "fewer than capacity builds run, so a repository with capacity slots has an idle one"
-        );
+        let own = || {
+            self.slots
+                .iter()
+                .filter(|slot| slot.repository == *repository)
+        };
+        // A slot being maintained is free again soon, and warm.
+        if own().any(|slot| slot.maintaining) || own().count() >= self.capacity {
+            return None;
+        }
+        let index = own().count();
         self.slots.push(Slot {
             repository: repository.clone(),
-            index: count,
+            index,
             job: None,
+            maintaining: false,
+            size: None,
             worktree: None,
             used: 0,
         });
-        self.slots.len() - 1
+        Some(self.slots.len() - 1)
     }
 
     /// The slots and the queue, next build first.
@@ -407,6 +450,8 @@ impl Scheduler {
             .map(|slot| SlotStatus {
                 name: slot_name(&slot.repository, slot.index),
                 worktree: slot.worktree.clone(),
+                size: slot.size,
+                maintaining: slot.maintaining,
                 build: slot.job.map(|id| {
                     let job = &self.jobs[&id];
                     let State::Running {
@@ -537,6 +582,45 @@ mod tests {
         assert!(matches!(sent(&finished, 2)[..], [Message::Finished { .. }]));
     }
 
+    /// Ends running job `job` in slot `slot` and maintains the slot.
+    fn finish(scheduler: &mut Scheduler, job: JobId, slot: usize) -> Vec<Effect> {
+        let mut effects = scheduler.exited(job, &ok());
+        effects.extend(scheduler.maintained(SlotKey(slot), Some(1)));
+        effects
+    }
+
+    #[test]
+    fn a_slot_being_maintained_is_waited_for_rather_than_replaced() {
+        let mut scheduler = Scheduler::new(2);
+        let first = submit(&mut scheduler, 1, "/a", "a1");
+        let [(job, 0, _)] = starts(&first)[..] else {
+            panic!("{first:?}");
+        };
+        assert!(starts(&scheduler.exited(job, &ok())).is_empty());
+        let waiting = submit(&mut scheduler, 2, "/a", "a2");
+        assert!(starts(&waiting).is_empty(), "no second, cold slot");
+        // Another repository's build does not wait behind it.
+        let other = scheduler.submit(Submission {
+            waiter: WaiterId(3),
+            source: Source {
+                repository: "/other/.git".into(),
+                ..source("/o")
+            },
+            revision: revision("o1"),
+            operation: check(),
+        });
+        assert_eq!(starts(&other).len(), 1);
+        let (slots, queue) = scheduler.status();
+        assert!(slots[0].maintaining && slots[0].build.is_none());
+        assert_eq!(queue.len(), 1);
+        let ready = scheduler.maintained(SlotKey(0), Some(5));
+        assert!(
+            matches!(starts(&ready)[..], [(_, 0, ref tree)] if tree == "a2"),
+            "the waiting build takes its warm slot"
+        );
+        assert_eq!(scheduler.status().0[0].size, Some(5));
+    }
+
     #[test]
     fn a_newer_request_supersedes_its_worktrees_queued_ones_and_keeps_their_place() {
         let mut scheduler = Scheduler::new(1);
@@ -562,7 +646,7 @@ mod tests {
             [("t1".into(), 1), ("t2".into(), 2), ("u1".into(), 1)]
         );
 
-        let next = scheduler.exited(running, &ok());
+        let next = finish(&mut scheduler, running, 0);
         assert_eq!(
             starts(&next)
                 .iter()
@@ -587,7 +671,8 @@ mod tests {
         // An equal request does not join the build being stopped.
         let again = submit(&mut scheduler, 3, "/a", "t1");
         assert!(matches!(sent(&again, 3)[..], [Message::Queued { .. }]));
-        let next = scheduler.exited(job, &Outcome::Signaled { signal: 15 });
+        let mut next = scheduler.exited(job, &Outcome::Signaled { signal: 15 });
+        next.extend(scheduler.maintained(SlotKey(0), None));
         assert!(sent(&next, 1).is_empty());
         assert_eq!(starts(&next).len(), 1);
         assert!(scheduler.withdraw(WaiterId(1)).is_empty());
@@ -604,14 +689,14 @@ mod tests {
         let [(job_b, 1, _)] = starts(&b)[..] else {
             panic!("{b:?}")
         };
-        scheduler.exited(job_a, &ok());
-        scheduler.exited(job_b, &ok());
+        finish(&mut scheduler, job_a, 0);
+        finish(&mut scheduler, job_b, 1);
 
         let b = submit(&mut scheduler, 3, "/b", "b2");
         let [(job_b, 1, _)] = starts(&b)[..] else {
             panic!("{b:?}")
         };
-        scheduler.exited(job_b, &ok());
+        finish(&mut scheduler, job_b, 1);
         // A new worktree takes the least recently used slot, not a third one.
         let c = submit(&mut scheduler, 4, "/c", "c1");
         let [(_, 0, _)] = starts(&c)[..] else {

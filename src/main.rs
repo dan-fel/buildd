@@ -161,9 +161,14 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         let worktree = slot.worktree.map_or_else(String::new, |worktree| {
             format!(" for {}", worktree.display())
         });
+        let size = slot.size.map_or_else(String::new, |size| {
+            #[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
+            let gib = size as f64 / f64::from(1 << 30);
+            format!(" [{gib:.1} GiB]")
+        });
         match slot.build {
             Some(build) => println!(
-                "slot {}: {} {} ({} waiting, {}{}){worktree}",
+                "slot {}{size}: {} {} ({} waiting, {}{}){worktree}",
                 slot.name,
                 build.revision.short(),
                 build.operation,
@@ -171,7 +176,8 @@ fn status(home: &Path) -> Result<ExitCode, String> {
                 seconds(build.elapsed_ms),
                 if build.cancelled { ", cancelled" } else { "" },
             ),
-            None => println!("slot {}: idle{worktree}", slot.name),
+            None if slot.maintaining => println!("slot {}{size}: pruning{worktree}", slot.name),
+            None => println!("slot {}{size}: idle{worktree}", slot.name),
         }
     }
     for (position, build) in queue.iter().enumerate() {

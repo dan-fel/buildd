@@ -103,6 +103,10 @@ pub struct SlotStatus {
     pub name: String,
     /// The worktree the slot last built for.
     pub worktree: Option<PathBuf>,
+    /// Disk its target used after its last build, in bytes, when measured.
+    pub size: Option<u64>,
+    /// Its target is being kept within its disk limit after a build.
+    pub maintaining: bool,
     pub build: Option<RunningBuild>,
 }
 

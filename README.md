@@ -26,6 +26,11 @@ share one CPU budget instead of each assuming it owns the machine.
   ones at their place in the queue.
 - **Cancellation.** Closing the client (Ctrl-C) withdraws the request. A
   build nobody waits for any more is stopped with its whole process group.
+- **Disk limit.** After each build, once its clients have the result, the
+  slot's target is kept within `slot_limit_gib`. Incremental caches go
+  first, least recently compiled first; the whole target goes only when its
+  compiled artifacts alone exceed the limit. Build disk per repository is
+  therefore at most `slots` times the limit, plus what a running build adds.
 
 ## Use
 
@@ -46,7 +51,7 @@ State lives in `$BUILDD_HOME`, by default `buildd` in the user cache
 directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 
 ```text
-config.toml        slots = 2, jobs = <CPUs> by default
+config.toml        slots = 2, jobs = <CPUs>, slot_limit_gib = 20 by default
 sock               the daemon's socket
 daemon.log         output of a daemon a client started
 slots/<repo>-<hash>/<n>/{src,target}
@@ -61,7 +66,8 @@ library's `client` module is what other programs integrate with.
 
 - Memory-aware admission and priorities: builds start first come, first
   served, at most `slots` at once.
-- A size cap on slot targets and pruning of stale incremental sessions.
+- Eviction of stale compiled artifacts (old feature sets and profiles) short
+  of clearing the whole target.
 - A `cargo` shim that routes agents' own Cargo calls to the daemon.
 - Client environment: Cargo runs with the daemon's environment, so a
   client's `RUSTFLAGS` or `RUST_LOG` do not reach the build.

@@ -18,8 +18,8 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 use crate::cargo;
 use crate::config::{self, Config};
 use crate::protocol::{BuildRequest, Message, Outcome, Request, Status};
-use crate::scheduler::{Effect, JobId, Scheduler, Start, Submission, WaiterId};
-use crate::slot::SlotDirectory;
+use crate::scheduler::{Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
+use crate::slot::{Pruning, SlotDirectory, slot_name};
 use crate::snapshot;
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
@@ -50,6 +50,12 @@ enum Event {
         job: JobId,
         outcome: Outcome,
     },
+    /// Slot `key` is within its disk limit again, `size` bytes when
+    /// measured.
+    Maintained {
+        key: SlotKey,
+        size: Option<u64>,
+    },
 }
 
 /// Runs the daemon for `home`. It returns only when it cannot start.
@@ -77,9 +83,10 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     let jobserver = jobserver::Client::new(config.jobs)
         .map_err(|error| format!("could not create the jobserver: {error}"))?;
     eprintln!(
-        "buildd: listening on {} with {} slots and {} jobs",
+        "buildd: listening on {} with {} slots of {} and {} jobs",
         socket.display(),
         config.slots,
+        gib(config.slot_limit),
         config.jobs
     );
 
@@ -289,6 +296,7 @@ impl Daemon {
                     self.runs.remove(&job);
                     self.scheduler.exited(job, &outcome)
                 }
+                Event::Maintained { key, size } => self.scheduler.maintained(key, size),
             };
             for effect in effects {
                 self.apply(effect);
@@ -314,11 +322,12 @@ impl Daemon {
                 let building = Building {
                     slot: SlotDirectory::new(&self.home, &start.repository, start.slot),
                     start,
+                    limit: self.config.slot_limit,
                     jobserver: self.jobserver.clone(),
                     run,
                     events: self.events.clone(),
                 };
-                let job = building.start.job;
+                let (job, key) = (building.start.job, building.start.key);
                 let spawned = std::thread::Builder::new()
                     .name("buildd-build".into())
                     .spawn(move || building.build());
@@ -327,6 +336,7 @@ impl Daemon {
                         reason: format!("could not start the build thread: {error}"),
                     };
                     let _ = self.events.send(Event::Exited { job, outcome });
+                    let _ = self.events.send(Event::Maintained { key, size: None });
                 }
             }
             Effect::Cancel { job } => {
@@ -389,10 +399,23 @@ fn signal_group(group: Pid, signal: Signal) {
     }
 }
 
-/// A build on its own thread.
+/// Kills what remains of the process group of `cargo`, which has exited but
+/// is not reaped yet: processes it started and left behind.
+fn kill_leftovers(group: Pid) {
+    match rustix::process::kill_process_group(group, Signal::KILL) {
+        // No members left, or (macOS) only the unreaped Cargo itself, which
+        // a signal cannot reach.
+        Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => {}
+        Err(error) => eprintln!("buildd: could not kill process group {group:?}: {error}"),
+    }
+}
+
+/// A build on its own thread, followed by keeping its slot within the disk
+/// limit once its waiters have their result.
 struct Building {
     start: Start,
     slot: SlotDirectory,
+    limit: u64,
     jobserver: jobserver::Client,
     run: Arc<Run>,
     events: Sender<Event>,
@@ -404,6 +427,36 @@ impl Building {
         let _ = self.events.send(Event::Exited {
             job: self.start.job,
             outcome,
+        });
+        let name = slot_name(&self.start.repository, self.start.slot);
+        let size = match self.slot.enforce_limit(self.limit) {
+            Ok(pruning) => {
+                match pruning {
+                    Pruning::Within { .. } => {}
+                    Pruning::Incremental {
+                        before,
+                        after,
+                        removed,
+                    } => eprintln!(
+                        "buildd: slot {name} used {}: removed {removed} incremental caches, {} left",
+                        gib(before),
+                        gib(after)
+                    ),
+                    Pruning::Cleared { before } => eprintln!(
+                        "buildd: slot {name} used {} beyond incremental caches: cleared its target",
+                        gib(before)
+                    ),
+                }
+                Some(pruning.size())
+            }
+            Err(error) => {
+                eprintln!("buildd: slot {name} could not be kept within its limit: {error}");
+                None
+            }
+        };
+        let _ = self.events.send(Event::Maintained {
+            key: self.start.key,
+            size,
         });
     }
 
@@ -461,7 +514,7 @@ impl Building {
                 }
             }
         }
-        signal_group(pid, Signal::KILL);
+        kill_leftovers(pid);
         self.run.lock().exited = true;
         let status = child.wait().expect("an exited child can be reaped");
         let deadline = std::time::Instant::now() + OUTPUT_GRACE;
@@ -504,6 +557,11 @@ impl Building {
             eprintln!("buildd: could not read a build's output: {error}");
         }
     }
+}
+
+#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
 }
 
 fn outcome(status: ExitStatus) -> Outcome {
