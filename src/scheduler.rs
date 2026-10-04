@@ -14,10 +14,13 @@
 //!   cancelled; a queued one is dropped.
 //! - **Slots.** At most `capacity` slots are busy: running a build, or being
 //!   kept within their disk limit. A build takes the idle slot of its
-//!   repository whose tree is closest to its own, so Cargo recompiles as
-//!   little as possible: usually the slot that last built its worktree. It
-//!   gets a new slot only when every slot of its repository runs a build, so
-//!   slot directories are created only when builds of a repository run
+//!   repository where Cargo has the least to do: one that already did its
+//!   [`Compilation`] before one that did not, and among those the one whose
+//!   tree is closest to the build's, usually the slot that last built its
+//!   worktree. It never waits for a busy slot while one is idle: measured,
+//!   waiting for a warm slot cost more than warming another. It gets a new
+//!   slot only when every slot of its repository runs a build, so slot
+//!   directories are created only when builds of a repository run
 //!   concurrently.
 //! - **Maintenance.** A slot is kept within its disk limit once it has been
 //!   idle for [`MAINTENANCE_QUIET`], so the measurement does not delay the
@@ -25,13 +28,13 @@
 //!   build once [`MAINTENANCE_DUE`] builds went unmeasured, so the limit
 //!   holds under constant load.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::cargo::Operation;
+use crate::cargo::{Command, Operation};
 use crate::protocol::{Message, Outcome, QueuedBuild, RunningBuild, SlotStatus};
-use crate::slot::slot_name;
+use crate::slot::{Pruning, slot_name};
 use crate::snapshot::{Revision, Source};
 
 /// How long a slot stays idle before it is kept within its disk limit.
@@ -98,6 +101,33 @@ pub(crate) struct Start {
     pub(crate) operation: Operation,
 }
 
+/// What Cargo compiles for a build: its directory, command, and the
+/// arguments before `--` (those after go to the test harness or the
+/// compiler driver). A slot that did a compilation keeps its artifacts until
+/// its target is cleared, so doing it again there is incremental.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct Compilation {
+    prefix: PathBuf,
+    command: Command,
+    args: Vec<String>,
+}
+
+impl Compilation {
+    fn of(job: &Job) -> Self {
+        Self {
+            prefix: job.prefix.clone(),
+            command: job.operation.command,
+            args: job
+                .operation
+                .args
+                .iter()
+                .take_while(|argument| *argument != "--")
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 struct Waiter {
     id: WaiterId,
     worktree: PathBuf,
@@ -146,6 +176,10 @@ struct Slot {
     idle_since: Instant,
     /// Its target's disk usage when last measured.
     size: Option<u64>,
+    /// Its last maintenance took caches in use: its limit is too small.
+    undersized: bool,
+    /// The compilations it did since its target was last cleared.
+    compiled: HashSet<Compilation>,
 }
 
 impl Slot {
@@ -355,7 +389,13 @@ impl<D: Distance> Scheduler<D> {
         let State::Running { slot, started, .. } = job.state else {
             panic!("only running jobs exit");
         };
+        let compilation = Compilation::of(&job);
         let entry = &mut self.slots[slot];
+        // Cargo ran to its end: its artifacts are in the slot, also when the
+        // job's own crates did not compile.
+        if let Outcome::Exited { .. } = outcome {
+            entry.compiled.insert(compilation);
+        }
         entry.job = None;
         entry.unmeasured += 1;
         entry.idle_since = Instant::now();
@@ -415,9 +455,9 @@ impl<D: Distance> Scheduler<D> {
         due.into_iter().map(|index| self.maintain(index)).collect()
     }
 
-    /// Slot `key` is within its disk limit again, `size` bytes when
-    /// measured.
-    pub(crate) fn maintained(&mut self, key: SlotKey, size: Option<u64>) -> Vec<Effect> {
+    /// Slot `key` was kept within its disk limit by `pruning`; None when
+    /// that failed.
+    pub(crate) fn maintained(&mut self, key: SlotKey, pruning: Option<Pruning>) -> Vec<Effect> {
         let slot = &mut self.slots[key.0];
         assert!(
             slot.maintaining,
@@ -425,7 +465,11 @@ impl<D: Distance> Scheduler<D> {
         );
         slot.maintaining = false;
         slot.unmeasured = 0;
-        slot.size = size;
+        slot.size = pruning.map(Pruning::size);
+        slot.undersized = pruning.is_some_and(Pruning::undersized);
+        if let Some(Pruning::Cleared { .. }) = pruning {
+            slot.compiled.clear();
+        }
         self.start_ready()
     }
 
@@ -479,15 +523,15 @@ impl<D: Distance> Scheduler<D> {
         effects
     }
 
-    /// The slot queued job `id` runs in now: the idle slot of its repository
-    /// whose tree is closest to the job's, the most recently used of equally
-    /// close ones; or a new one when every slot of the repository runs a
-    /// build and it has fewer than `capacity`. None while the job must wait.
+    /// The slot queued job `id` runs in now, as the module explains, or None
+    /// while it waits.
     fn choose_slot(&mut self, id: JobId) -> Option<usize> {
         let job = &self.jobs[&id];
         let repository = job.repository.clone();
         let revision = job.revision.clone();
-        let mut closest: Option<(u64, u64, usize)> = None;
+        let compilation = Compilation::of(job);
+        // Ranked by: did the compilation, closeness, recent use.
+        let mut best: Option<(bool, u64, u64, usize)> = None;
         for (index, slot) in self.slots.iter().enumerate() {
             if slot.repository != repository || slot.busy() {
                 continue;
@@ -495,12 +539,17 @@ impl<D: Distance> Scheduler<D> {
             let distance = self
                 .distance
                 .distance(&repository, &slot.revision, &revision);
-            let rank = (distance, u64::MAX - slot.used, index);
-            if closest.is_none_or(|best| rank < best) {
-                closest = Some(rank);
+            let rank = (
+                !slot.compiled.contains(&compilation),
+                distance,
+                u64::MAX - slot.used,
+                index,
+            );
+            if best.is_none_or(|best| rank < best) {
+                best = Some(rank);
             }
         }
-        if let Some((_, _, index)) = closest {
+        if let Some((_, _, _, index)) = best {
             return Some(index);
         }
         let own = || {
@@ -524,6 +573,8 @@ impl<D: Distance> Scheduler<D> {
             unmeasured: 0,
             idle_since: Instant::now(),
             size: None,
+            undersized: false,
+            compiled: HashSet::new(),
         });
         Some(self.slots.len() - 1)
     }
@@ -538,6 +589,7 @@ impl<D: Distance> Scheduler<D> {
                 worktree: Some(slot.worktree.clone()),
                 size: slot.size,
                 maintaining: slot.maintaining,
+                undersized: slot.undersized,
                 build: slot.job.map(|id| {
                     let job = &self.jobs[&id];
                     let State::Running {
@@ -646,6 +698,25 @@ mod tests {
             source: source(worktree),
             revision: revision(tree),
             operation: check(),
+        })
+    }
+
+    fn submit_operation(
+        scheduler: &mut Scheduler<Table>,
+        waiter: u64,
+        worktree: &str,
+        tree: &str,
+        command: Command,
+        args: &[&str],
+    ) -> Vec<Effect> {
+        scheduler.submit(Submission {
+            waiter: WaiterId(waiter),
+            source: source(worktree),
+            revision: revision(tree),
+            operation: Operation {
+                command,
+                args: args.iter().map(|argument| (*argument).to_owned()).collect(),
+            },
         })
     }
 
@@ -802,6 +873,7 @@ mod tests {
         let mut scheduler = scheduler(2);
         assert_eq!(run(&mut scheduler, 1, "/a", "a1"), 0);
         assert_eq!(run(&mut scheduler, 2, "/b", "b1"), 0);
+
         let c = submit(&mut scheduler, 3, "/c", "c1");
         let d = submit(&mut scheduler, 4, "/d", "d1");
         let e = submit(&mut scheduler, 5, "/e", "e1");
@@ -842,7 +914,7 @@ mod tests {
         let (slots, queue) = scheduler.status();
         assert!(slots[0].maintaining && slots[0].build.is_none());
         assert_eq!(queue.len(), 1);
-        let ready = scheduler.maintained(SlotKey(0), Some(5));
+        let ready = scheduler.maintained(SlotKey(0), Some(Pruning::Within { size: 5 }));
         assert!(
             matches!(starts(&ready)[..], [(_, 0, ref tree)] if tree == "a2"),
             "the waiting build takes its warm slot"
@@ -865,5 +937,72 @@ mod tests {
             panic!("{last:?}");
         };
         assert_eq!(maintains(&scheduler.exited(job, &ok())), [0]);
+    }
+
+    /// Two slots: slot 0 did `check` at tree a1, slot 1 did `test` at b1.
+    fn checked_and_tested() -> Scheduler<Table> {
+        let mut scheduler = scheduler(2);
+        let a = submit(&mut scheduler, 1, "/a", "a1");
+        let b = submit_operation(&mut scheduler, 2, "/b", "b1", Command::Test, &[]);
+        let [(job_a, 0, _)] = starts(&a)[..] else {
+            panic!("{a:?}")
+        };
+        let [(job_b, 1, _)] = starts(&b)[..] else {
+            panic!("{b:?}")
+        };
+        scheduler.exited(job_a, &ok());
+        scheduler.exited(job_b, &ok());
+        scheduler
+    }
+
+    #[test]
+    fn a_build_prefers_a_slot_that_did_its_compilation_over_a_closer_one() {
+        let mut scheduler = checked_and_tested();
+        scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
+        assert_eq!(run(&mut scheduler, 3, "/c", "c1"), 0);
+    }
+
+    #[test]
+    fn a_cleared_slot_forgets_its_compilations() {
+        let mut scheduler = checked_and_tested();
+        let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
+        assert_eq!(maintains(&maintain), [0, 1]);
+        scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 9 }));
+        scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }));
+        assert!(scheduler.slots[0].compiled.is_empty());
+        assert!(scheduler.status().0[0].undersized);
+        assert_eq!(scheduler.slots[1].compiled.len(), 1);
+    }
+
+    #[test]
+    fn test_harness_arguments_do_not_change_the_compilation() {
+        let mut scheduler = scheduler(1);
+        let first = submit_operation(
+            &mut scheduler,
+            1,
+            "/a",
+            "a1",
+            Command::Test,
+            &["-p", "x", "--", "one"],
+        );
+        let second = submit_operation(
+            &mut scheduler,
+            2,
+            "/a",
+            "a2",
+            Command::Test,
+            &["-p", "x", "--", "two"],
+        );
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}")
+        };
+        assert!(starts(&second).is_empty());
+        let first = Compilation::of(&scheduler.jobs[&job]);
+        let next = scheduler.exited(job, &ok());
+        let [(next, ..)] = starts(&next)[..] else {
+            panic!("{next:?}")
+        };
+        assert_eq!(Compilation::of(&scheduler.jobs[&next]), first);
+        assert_eq!(first.args, ["-p", "x"]);
     }
 }

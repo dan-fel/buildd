@@ -107,6 +107,9 @@ pub struct SlotStatus {
     pub size: Option<u64>,
     /// Its target is being kept within its disk limit after a build.
     pub maintaining: bool,
+    /// Keeping to the limit last took caches its builds were using: the
+    /// limit is below what they need, and they compile from scratch.
+    pub undersized: bool,
     pub build: Option<RunningBuild>,
 }
 

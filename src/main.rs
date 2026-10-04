@@ -164,7 +164,12 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         let size = slot.size.map_or_else(String::new, |size| {
             #[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
             let gib = size as f64 / f64::from(1 << 30);
-            format!(" [{gib:.1} GiB]")
+            let warning = if slot.undersized {
+                ", limit below what its builds use"
+            } else {
+                ""
+            };
+            format!(" [{gib:.1} GiB{warning}]")
         });
         match slot.build {
             Some(build) => println!(

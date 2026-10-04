@@ -17,9 +17,12 @@ share one CPU budget instead of each assuming it owns the machine.
   repository gets at most `slots` slot directories, created only when its
   builds run concurrently, so build disk depends on the slot count rather
   than the number of sessions or worktrees.
-- **Closest slot.** A build takes the idle slot whose checkout differs from
-  its tree in the fewest paths (`git diff-tree`), usually the slot that last
-  built its worktree, so Cargo recompiles as little as possible.
+- **Best slot.** A build takes the idle slot where Cargo has the least to
+  do: one that already ran the same compilation (directory, command and
+  Cargo arguments) before one that did not, and among those the one whose
+  checkout differs from the build's tree in the fewest paths
+  (`git diff-tree`), usually the slot that last built its worktree. It never
+  waits for a busy slot while another is idle.
 - **One CPU budget.** Every Cargo the daemon runs shares one jobserver with
   `jobs` tokens.
 - **Deduplication and supersession.** A request equal to a queued or running
@@ -35,6 +38,12 @@ share one CPU budget instead of each assuming it owns the machine.
   compiled first; the whole target goes only when its compiled artifacts
   alone exceed the limit. Build disk per repository is therefore at most
   `slots` times the limit, plus what builds add between measurements.
+- **Sizing.** A slot's limit must hold the working set of the builds it
+  serves; below that, keeping to it removes caches in use and those builds
+  compile from scratch, many times slower. `buildd status` and the daemon
+  log flag such a slot. Fewer, larger slots beat more, smaller ones: on
+  Jaide, check and test builds of a few crates need 12–15 GiB per slot, and
+  4 slots of 8 GiB were several times slower than 2 of 15.
 
 ## Use
 

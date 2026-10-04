@@ -10,10 +10,14 @@
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::git;
 use crate::snapshot::Revision;
+
+/// An incremental cache compiled this recently belongs to builds in use:
+/// removing it makes their next compilation start from scratch.
+const IN_USE: Duration = Duration::from_secs(10 * 60);
 
 /// Fixed identity and date for slot commits, so one tree is always one
 /// commit.
@@ -114,6 +118,8 @@ impl SlotDirectory {
         // the cache (object files kept for debug info) stay on disk.
         let mut estimate = usage.total;
         let mut removed = 0;
+        let mut in_use = 0;
+        let recent = SystemTime::now() - IN_USE;
         for index in order {
             if estimate <= limit {
                 break;
@@ -123,6 +129,9 @@ impl SlotDirectory {
                 .map_err(|error| format!("could not remove {}: {error}", cache.path.display()))?;
             estimate = estimate.saturating_sub(usage.freeable[index]);
             removed += 1;
+            if cache.compiled > recent {
+                in_use += 1;
+            }
         }
         let after = disk_usage(&target, &[])?.total;
         if after <= limit {
@@ -130,6 +139,7 @@ impl SlotDirectory {
                 before: usage.total,
                 after,
                 removed,
+                in_use,
             });
         }
         std::fs::remove_dir_all(&target)
@@ -145,11 +155,13 @@ impl SlotDirectory {
 pub(crate) enum Pruning {
     /// The target was within the limit.
     Within { size: u64 },
-    /// `removed` incremental caches went.
+    /// `removed` incremental caches went, `in_use` of them compiled within
+    /// the last ten minutes.
     Incremental {
         before: u64,
         after: u64,
         removed: usize,
+        in_use: usize,
     },
     /// The compiled artifacts alone exceeded the limit; the target went.
     Cleared { before: u64 },
@@ -162,6 +174,15 @@ impl Pruning {
             Self::Within { size } | Self::Incremental { after: size, .. } => size,
             Self::Cleared { .. } => 0,
         }
+    }
+
+    /// Whether the limit is below what the slot's builds use: keeping to it
+    /// took caches in use, or the whole target.
+    pub(crate) fn undersized(self) -> bool {
+        matches!(
+            self,
+            Self::Incremental { in_use: 1.., .. } | Self::Cleared { .. }
+        )
     }
 }
 

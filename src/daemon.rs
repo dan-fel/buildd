@@ -52,11 +52,11 @@ enum Event {
         job: JobId,
         outcome: Outcome,
     },
-    /// Slot `key` is within its disk limit again, `size` bytes when
-    /// measured.
+    /// Slot `key` was kept within its disk limit by `pruning`; None when
+    /// that failed.
     Maintained {
         key: SlotKey,
-        size: Option<u64>,
+        pruning: Option<Pruning>,
     },
 }
 
@@ -312,7 +312,7 @@ impl Daemon {
                     self.runs.remove(&job);
                     self.scheduler.exited(job, &outcome)
                 }
-                Event::Maintained { key, size } => self.scheduler.maintained(key, size),
+                Event::Maintained { key, pruning } => self.scheduler.maintained(key, pruning),
             };
             for effect in effects {
                 self.apply(effect);
@@ -365,12 +365,12 @@ impl Daemon {
                 let spawned = std::thread::Builder::new()
                     .name("buildd-maintain".into())
                     .spawn(move || {
-                        let size = maintain(&directory, &name, limit);
-                        let _ = events.send(Event::Maintained { key, size });
+                        let pruning = maintain(&directory, &name, limit);
+                        let _ = events.send(Event::Maintained { key, pruning });
                     });
                 if let Err(error) = spawned {
                     eprintln!("buildd: could not start maintaining a slot: {error}");
-                    let _ = self.events.send(Event::Maintained { key, size: None });
+                    let _ = self.events.send(Event::Maintained { key, pruning: None });
                 }
             }
             Effect::Cancel { job } => {
@@ -444,9 +444,8 @@ fn kill_leftovers(group: Pid) {
     }
 }
 
-/// Keeps slot `directory` within `limit` and returns its target's size,
-/// when it could be measured.
-fn maintain(directory: &SlotDirectory, name: &str, limit: u64) -> Option<u64> {
+/// Keeps slot `directory` within `limit`; what that did, when it worked.
+fn maintain(directory: &SlotDirectory, name: &str, limit: u64) -> Option<Pruning> {
     match directory.enforce_limit(limit) {
         Ok(pruning) => {
             match pruning {
@@ -455,8 +454,10 @@ fn maintain(directory: &SlotDirectory, name: &str, limit: u64) -> Option<u64> {
                     before,
                     after,
                     removed,
+                    in_use,
                 } => eprintln!(
-                    "buildd: slot {name} used {}: removed {removed} incremental caches, {} left",
+                    "buildd: slot {name} used {}: removed {removed} incremental caches \
+                     ({in_use} in use), {} left",
                     gib(before),
                     gib(after)
                 ),
@@ -465,7 +466,14 @@ fn maintain(directory: &SlotDirectory, name: &str, limit: u64) -> Option<u64> {
                     gib(before)
                 ),
             }
-            Some(pruning.size())
+            if pruning.undersized() {
+                eprintln!(
+                    "buildd: slot {name}'s limit of {} is below what its builds use, so \
+                     they compile from scratch; raise slot_limit_gib or lower slots",
+                    gib(limit)
+                );
+            }
+            Some(pruning)
         }
         Err(error) => {
             eprintln!("buildd: slot {name} could not be kept within its limit: {error}");
