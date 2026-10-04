@@ -10,17 +10,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use crate::cargo;
 use crate::config::{self, Config};
+use crate::git;
 use crate::protocol::{BuildRequest, Message, Outcome, Request, Status};
-use crate::scheduler::{Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
+use crate::scheduler::{Distance, Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
 use crate::slot::{Pruning, SlotDirectory, slot_name};
 use crate::snapshot;
+use crate::snapshot::Revision;
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
 /// process group is killed.
@@ -105,7 +107,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         config,
         jobserver,
         events,
-        scheduler: Scheduler::new(config.slots),
+        scheduler: Scheduler::new(config.slots, GitDistance::default()),
         waiters: HashMap::new(),
         runs: HashMap::new(),
     }
@@ -255,7 +257,7 @@ struct Daemon {
     config: Config,
     jobserver: jobserver::Client,
     events: Sender<Event>,
-    scheduler: Scheduler,
+    scheduler: Scheduler<GitDistance>,
     waiters: HashMap<WaiterId, Sender<Message>>,
     runs: HashMap<JobId, Arc<Run>>,
 }
@@ -263,9 +265,23 @@ struct Daemon {
 impl Daemon {
     fn drive(mut self, received: &Receiver<Event>) -> ! {
         loop {
-            let event = received
-                .recv()
-                .expect("the daemon holds a sender of its own events");
+            let event = match self.scheduler.next_maintenance() {
+                Some(due) => match received.recv_deadline(due) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => {
+                        for effect in self.scheduler.maintenance_due(Instant::now()) {
+                            self.apply(effect);
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        panic!("the daemon holds a sender of its own events")
+                    }
+                },
+                None => received
+                    .recv()
+                    .expect("the daemon holds a sender of its own events"),
+            };
             let effects = match event {
                 Event::Submit {
                     submission,
@@ -322,12 +338,11 @@ impl Daemon {
                 let building = Building {
                     slot: SlotDirectory::new(&self.home, &start.repository, start.slot),
                     start,
-                    limit: self.config.slot_limit,
                     jobserver: self.jobserver.clone(),
                     run,
                     events: self.events.clone(),
                 };
-                let (job, key) = (building.start.job, building.start.key);
+                let job = building.start.job;
                 let spawned = std::thread::Builder::new()
                     .name("buildd-build".into())
                     .spawn(move || building.build());
@@ -336,6 +351,25 @@ impl Daemon {
                         reason: format!("could not start the build thread: {error}"),
                     };
                     let _ = self.events.send(Event::Exited { job, outcome });
+                }
+            }
+            Effect::Maintain {
+                key,
+                repository,
+                slot,
+            } => {
+                let directory = SlotDirectory::new(&self.home, &repository, slot);
+                let name = slot_name(&repository, slot);
+                let limit = self.config.slot_limit;
+                let events = self.events.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("buildd-maintain".into())
+                    .spawn(move || {
+                        let size = maintain(&directory, &name, limit);
+                        let _ = events.send(Event::Maintained { key, size });
+                    });
+                if let Err(error) = spawned {
+                    eprintln!("buildd: could not start maintaining a slot: {error}");
                     let _ = self.events.send(Event::Maintained { key, size: None });
                 }
             }
@@ -410,12 +444,83 @@ fn kill_leftovers(group: Pid) {
     }
 }
 
-/// A build on its own thread, followed by keeping its slot within the disk
-/// limit once its waiters have their result.
+/// Keeps slot `directory` within `limit` and returns its target's size,
+/// when it could be measured.
+fn maintain(directory: &SlotDirectory, name: &str, limit: u64) -> Option<u64> {
+    match directory.enforce_limit(limit) {
+        Ok(pruning) => {
+            match pruning {
+                Pruning::Within { .. } => {}
+                Pruning::Incremental {
+                    before,
+                    after,
+                    removed,
+                } => eprintln!(
+                    "buildd: slot {name} used {}: removed {removed} incremental caches, {} left",
+                    gib(before),
+                    gib(after)
+                ),
+                Pruning::Cleared { before } => eprintln!(
+                    "buildd: slot {name} used {} beyond incremental caches: cleared its target",
+                    gib(before)
+                ),
+            }
+            Some(pruning.size())
+        }
+        Err(error) => {
+            eprintln!("buildd: slot {name} could not be kept within its limit: {error}");
+            None
+        }
+    }
+}
+
+/// Distances between trees from `git diff-tree`: the number of paths that
+/// differ, remembered per pair of trees.
+#[derive(Default)]
+struct GitDistance {
+    known: HashMap<(PathBuf, Revision, Revision), u64>,
+}
+
+/// How many distances [`GitDistance`] remembers before it starts over.
+const KNOWN_DISTANCES: usize = 4096;
+
+impl Distance for GitDistance {
+    fn distance(&mut self, repository: &Path, from: &Revision, to: &Revision) -> u64 {
+        if from == to {
+            return 0;
+        }
+        let (low, high) = if from < to { (from, to) } else { (to, from) };
+        let key = (repository.to_owned(), low.clone(), high.clone());
+        if let Some(distance) = self.known.get(&key) {
+            return *distance;
+        }
+        let mut command = git::command(repository);
+        command
+            .arg("--git-dir")
+            .arg(repository)
+            .args(["diff-tree", "-r", "--name-only", "--no-renames"])
+            .arg(low.to_string())
+            .arg(high.to_string());
+        let distance = match git::run(command) {
+            Ok(paths) => paths.lines().count() as u64,
+            // An unknown distance ranks behind every known one.
+            Err(error) => {
+                eprintln!("buildd: could not compare trees: {error}");
+                return u64::MAX;
+            }
+        };
+        if self.known.len() >= KNOWN_DISTANCES {
+            self.known.clear();
+        }
+        self.known.insert(key, distance);
+        distance
+    }
+}
+
+/// A build on its own thread.
 struct Building {
     start: Start,
     slot: SlotDirectory,
-    limit: u64,
     jobserver: jobserver::Client,
     run: Arc<Run>,
     events: Sender<Event>,
@@ -427,36 +532,6 @@ impl Building {
         let _ = self.events.send(Event::Exited {
             job: self.start.job,
             outcome,
-        });
-        let name = slot_name(&self.start.repository, self.start.slot);
-        let size = match self.slot.enforce_limit(self.limit) {
-            Ok(pruning) => {
-                match pruning {
-                    Pruning::Within { .. } => {}
-                    Pruning::Incremental {
-                        before,
-                        after,
-                        removed,
-                    } => eprintln!(
-                        "buildd: slot {name} used {}: removed {removed} incremental caches, {} left",
-                        gib(before),
-                        gib(after)
-                    ),
-                    Pruning::Cleared { before } => eprintln!(
-                        "buildd: slot {name} used {} beyond incremental caches: cleared its target",
-                        gib(before)
-                    ),
-                }
-                Some(pruning.size())
-            }
-            Err(error) => {
-                eprintln!("buildd: slot {name} could not be kept within its limit: {error}");
-                None
-            }
-        };
-        let _ = self.events.send(Event::Maintained {
-            key: self.start.key,
-            size,
         });
     }
 

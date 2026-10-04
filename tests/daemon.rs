@@ -342,21 +342,18 @@ fn requests_outside_a_worktree_or_taking_over_the_slot_are_rejected() {
 }
 
 #[test]
-fn a_slot_over_its_disk_limit_is_pruned_after_each_build() {
+fn a_slot_over_its_disk_limit_is_pruned_once_it_is_quiet() {
     // About 10 kB, less than any build leaves behind.
     let daemon = Daemon::configured("slots = 1\njobs = 4\nslot_limit_gib = 0.00001\n");
     let repository = crate_repository(None);
-    let target = std::fs::read_dir(daemon.home.0.join("slots"));
-    assert!(target.is_err(), "no slot before the first build");
-    for _ in 0..2 {
-        let messages = daemon.build(&repository.0, Command::Check, &[]);
-        assert!(outcome(&messages).success(), "{messages:#?}");
-        wait_until("the slot is pruned", || {
-            !daemon.status().slots[0].maintaining
-        });
-        let size = daemon.status().slots[0]
-            .size
-            .expect("the slot was measured");
-        assert!(size <= 10_738, "{size}");
-    }
+    let messages = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&messages).success(), "{messages:#?}");
+    wait_until("the slot is measured", || {
+        let slot = &daemon.status().slots[0];
+        !slot.maintaining && slot.size.is_some()
+    });
+    let size = daemon.status().slots[0].size.expect("measured above");
+    assert!(size <= 10_738, "{size}");
+    let again = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&again).success(), "{again:#?}");
 }

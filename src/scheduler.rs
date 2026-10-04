@@ -13,20 +13,38 @@
 //! - **Cancellation.** A running build nobody waits for any more is
 //!   cancelled; a queued one is dropped.
 //! - **Slots.** At most `capacity` slots are busy: running a build, or being
-//!   kept within their disk limit right after one. A build prefers the idle
-//!   slot that last built its worktree, then the least recently used idle
-//!   slot of its repository. It gets a new slot only when every slot of its
-//!   repository runs a build, so slot directories are created only when
-//!   builds of a repository run concurrently.
+//!   kept within their disk limit. A build takes the idle slot of its
+//!   repository whose tree is closest to its own, so Cargo recompiles as
+//!   little as possible: usually the slot that last built its worktree. It
+//!   gets a new slot only when every slot of its repository runs a build, so
+//!   slot directories are created only when builds of a repository run
+//!   concurrently.
+//! - **Maintenance.** A slot is kept within its disk limit once it has been
+//!   idle for [`MAINTENANCE_QUIET`], so the measurement does not delay the
+//!   next build of a session that runs several in a row, and right after a
+//!   build once [`MAINTENANCE_DUE`] builds went unmeasured, so the limit
+//!   holds under constant load.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::cargo::Operation;
 use crate::protocol::{Message, Outcome, QueuedBuild, RunningBuild, SlotStatus};
 use crate::slot::slot_name;
 use crate::snapshot::{Revision, Source};
+
+/// How long a slot stays idle before it is kept within its disk limit.
+pub(crate) const MAINTENANCE_QUIET: Duration = Duration::from_secs(2);
+/// After this many unmeasured builds a slot is kept within its limit right
+/// after its build, idle or not.
+pub(crate) const MAINTENANCE_DUE: u32 = 8;
+
+/// How far apart two trees of a repository are, as the work Cargo redoes
+/// when a slot holding one is checked out to the other.
+pub(crate) trait Distance {
+    fn distance(&mut self, repository: &Path, from: &Revision, to: &Revision) -> u64;
+}
 
 /// A build the scheduler tracks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -51,9 +69,20 @@ pub(crate) struct Submission {
 /// What the daemon must do.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Effect {
-    Send { waiter: WaiterId, message: Message },
+    Send {
+        waiter: WaiterId,
+        message: Message,
+    },
     Start(Start),
-    Cancel { job: JobId },
+    Cancel {
+        job: JobId,
+    },
+    /// Keep slot `slot` of `repository` within its disk limit.
+    Maintain {
+        key: SlotKey,
+        repository: PathBuf,
+        slot: usize,
+    },
 }
 
 /// A build to start in slot `slot` of `repository`.
@@ -103,13 +132,20 @@ struct Slot {
     /// The slot's index among its repository's slots.
     index: usize,
     job: Option<JobId>,
-    /// Its target is being kept within its disk limit after a build.
-    maintaining: bool,
-    /// Its target's disk usage after its last build, when measured.
-    size: Option<u64>,
-    worktree: Option<PathBuf>,
+    /// The tree its checkout holds: that of its latest build.
+    revision: Revision,
+    /// The worktree its latest build was for.
+    worktree: PathBuf,
     /// When it last started a build, on the scheduler's clock.
     used: u64,
+    /// Its target is being kept within its disk limit.
+    maintaining: bool,
+    /// Builds since its target was last measured.
+    unmeasured: u32,
+    /// When its latest build ended.
+    idle_since: Instant,
+    /// Its target's disk usage when last measured.
+    size: Option<u64>,
 }
 
 impl Slot {
@@ -118,8 +154,9 @@ impl Slot {
     }
 }
 
-pub(crate) struct Scheduler {
+pub(crate) struct Scheduler<D> {
     capacity: usize,
+    distance: D,
     clock: u64,
     next_job: u64,
     jobs: BTreeMap<JobId, Job>,
@@ -157,11 +194,12 @@ impl Job {
     }
 }
 
-impl Scheduler {
-    pub(crate) fn new(capacity: usize) -> Self {
+impl<D: Distance> Scheduler<D> {
+    pub(crate) fn new(capacity: usize, distance: D) -> Self {
         assert!(capacity > 0, "a scheduler runs at least one build");
         Self {
             capacity,
+            distance,
             clock: 0,
             next_job: 0,
             jobs: BTreeMap::new(),
@@ -317,10 +355,15 @@ impl Scheduler {
         let State::Running { slot, started, .. } = job.state else {
             panic!("only running jobs exit");
         };
-        self.slots[slot].job = None;
-        self.slots[slot].maintaining = true;
-        let build_ms = millis(started.elapsed());
+        let entry = &mut self.slots[slot];
+        entry.job = None;
+        entry.unmeasured += 1;
+        entry.idle_since = Instant::now();
         let mut effects = Vec::new();
+        if entry.unmeasured >= MAINTENANCE_DUE {
+            effects.push(self.maintain(slot));
+        }
+        let build_ms = millis(started.elapsed());
         for waiter in job.waiters {
             self.waiting.remove(&waiter.id);
             effects.push(Effect::Send {
@@ -337,15 +380,51 @@ impl Scheduler {
         effects
     }
 
+    fn maintain(&mut self, index: usize) -> Effect {
+        let slot = &mut self.slots[index];
+        assert!(!slot.busy(), "only an idle slot is maintained");
+        slot.maintaining = true;
+        Effect::Maintain {
+            key: SlotKey(index),
+            repository: slot.repository.clone(),
+            slot: slot.index,
+        }
+    }
+
+    /// When the next idle slot is due for maintenance, if one will be.
+    pub(crate) fn next_maintenance(&self) -> Option<Instant> {
+        self.slots
+            .iter()
+            .filter(|slot| !slot.busy() && slot.unmeasured > 0)
+            .map(|slot| slot.idle_since + MAINTENANCE_QUIET)
+            .min()
+    }
+
+    /// Maintains the slots that have been idle for [`MAINTENANCE_QUIET`] by
+    /// `now`.
+    pub(crate) fn maintenance_due(&mut self, now: Instant) -> Vec<Effect> {
+        let due = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                !slot.busy() && slot.unmeasured > 0 && slot.idle_since + MAINTENANCE_QUIET <= now
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        due.into_iter().map(|index| self.maintain(index)).collect()
+    }
+
     /// Slot `key` is within its disk limit again, `size` bytes when
     /// measured.
     pub(crate) fn maintained(&mut self, key: SlotKey, size: Option<u64>) -> Vec<Effect> {
         let slot = &mut self.slots[key.0];
         assert!(
             slot.maintaining,
-            "only a slot that ran a build is maintained"
+            "only a slot being maintained is maintained"
         );
         slot.maintaining = false;
+        slot.unmeasured = 0;
         slot.size = size;
         self.start_ready()
     }
@@ -366,15 +445,15 @@ impl Scheduler {
             if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
                 break;
             }
-            let job = &self.jobs[&id];
-            let worktree = job.waiters[0].worktree.clone();
-            let Some(slot) = self.choose_slot(&job.repository.clone(), &worktree) else {
+            let Some(slot) = self.choose_slot(id) else {
                 continue;
             };
             self.clock += 1;
+            let job = &self.jobs[&id];
             let entry = &mut self.slots[slot];
             entry.job = Some(id);
-            entry.worktree = Some(worktree);
+            entry.revision = job.revision.clone();
+            entry.worktree = job.waiters[0].worktree.clone();
             entry.used = self.clock;
             let job = self.jobs.get_mut(&id).expect("chosen above");
             job.state = State::Running {
@@ -400,30 +479,34 @@ impl Scheduler {
         effects
     }
 
-    /// The slot a build of `repository` for `worktree` runs in now: an idle
-    /// one, or a new one when every slot of the repository runs a build and
-    /// it has fewer than `capacity`. None while the build must wait.
-    fn choose_slot(&mut self, repository: &PathBuf, worktree: &PathBuf) -> Option<usize> {
-        let idle = |slot: &&Slot| slot.repository == *repository && !slot.busy();
-        let affine = self
-            .slots
-            .iter()
-            .enumerate()
-            .find(|(_, slot)| idle(slot) && slot.worktree.as_ref() == Some(worktree));
-        let least_recent = || {
-            self.slots
-                .iter()
-                .enumerate()
-                .filter(|(_, slot)| idle(slot))
-                .min_by_key(|(_, slot)| slot.used)
-        };
-        if let Some((index, _)) = affine.or_else(least_recent) {
+    /// The slot queued job `id` runs in now: the idle slot of its repository
+    /// whose tree is closest to the job's, the most recently used of equally
+    /// close ones; or a new one when every slot of the repository runs a
+    /// build and it has fewer than `capacity`. None while the job must wait.
+    fn choose_slot(&mut self, id: JobId) -> Option<usize> {
+        let job = &self.jobs[&id];
+        let repository = job.repository.clone();
+        let revision = job.revision.clone();
+        let mut closest: Option<(u64, u64, usize)> = None;
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.repository != repository || slot.busy() {
+                continue;
+            }
+            let distance = self
+                .distance
+                .distance(&repository, &slot.revision, &revision);
+            let rank = (distance, u64::MAX - slot.used, index);
+            if closest.is_none_or(|best| rank < best) {
+                closest = Some(rank);
+            }
+        }
+        if let Some((_, _, index)) = closest {
             return Some(index);
         }
         let own = || {
             self.slots
                 .iter()
-                .filter(|slot| slot.repository == *repository)
+                .filter(|slot| slot.repository == repository)
         };
         // A slot being maintained is free again soon, and warm.
         if own().any(|slot| slot.maintaining) || own().count() >= self.capacity {
@@ -431,13 +514,16 @@ impl Scheduler {
         }
         let index = own().count();
         self.slots.push(Slot {
-            repository: repository.clone(),
+            repository,
             index,
             job: None,
-            maintaining: false,
-            size: None,
-            worktree: None,
+            revision,
+            worktree: job.waiters[0].worktree.clone(),
             used: 0,
+            maintaining: false,
+            unmeasured: 0,
+            idle_since: Instant::now(),
+            size: None,
         });
         Some(self.slots.len() - 1)
     }
@@ -449,7 +535,7 @@ impl Scheduler {
             .iter()
             .map(|slot| SlotStatus {
                 name: slot_name(&slot.repository, slot.index),
-                worktree: slot.worktree.clone(),
+                worktree: Some(slot.worktree.clone()),
                 size: slot.size,
                 maintaining: slot.maintaining,
                 build: slot.job.map(|id| {
@@ -507,6 +593,28 @@ mod tests {
     use super::*;
     use crate::cargo::Command;
 
+    /// Distances from a table; trees not in it are equal or 10 apart.
+    #[derive(Default)]
+    struct Table(HashMap<(String, String), u64>);
+
+    impl Distance for Table {
+        fn distance(&mut self, _: &Path, from: &Revision, to: &Revision) -> u64 {
+            let (from, to) = (from.to_string(), to.to_string());
+            if from == to {
+                return 0;
+            }
+            self.0
+                .get(&(from.clone(), to.clone()))
+                .or_else(|| self.0.get(&(to, from)))
+                .copied()
+                .unwrap_or(10)
+        }
+    }
+
+    fn scheduler(capacity: usize) -> Scheduler<Table> {
+        Scheduler::new(capacity, Table::default())
+    }
+
     fn source(worktree: &str) -> Source {
         Source {
             repository: "/repo/.git".into(),
@@ -527,7 +635,12 @@ mod tests {
         serde_json::from_value(serde_json::Value::String(name.into())).unwrap()
     }
 
-    fn submit(scheduler: &mut Scheduler, waiter: u64, worktree: &str, tree: &str) -> Vec<Effect> {
+    fn submit(
+        scheduler: &mut Scheduler<Table>,
+        waiter: u64,
+        worktree: &str,
+        tree: &str,
+    ) -> Vec<Effect> {
         scheduler.submit(Submission {
             waiter: WaiterId(waiter),
             source: source(worktree),
@@ -541,6 +654,16 @@ mod tests {
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Start(start) => Some((start.job, start.slot, start.revision.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn maintains(effects: &[Effect]) -> Vec<usize> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Maintain { slot, .. } => Some(*slot),
                 _ => None,
             })
             .collect()
@@ -563,9 +686,19 @@ mod tests {
         Outcome::Exited { code: 0 }
     }
 
+    /// Runs `tree` for `worktree` to its end and returns the slot it ran in.
+    fn run(scheduler: &mut Scheduler<Table>, waiter: u64, worktree: &str, tree: &str) -> usize {
+        let effects = submit(scheduler, waiter, worktree, tree);
+        let [(job, slot, _)] = starts(&effects)[..] else {
+            panic!("{tree} starts at once: {effects:?}");
+        };
+        scheduler.exited(job, &ok());
+        slot
+    }
+
     #[test]
     fn equal_requests_share_one_build_and_a_late_joiner_gets_the_output_so_far() {
-        let mut scheduler = Scheduler::new(1);
+        let mut scheduler = scheduler(1);
         let first = submit(&mut scheduler, 1, "/a", "t1");
         let [(job, 0, _)] = starts(&first)[..] else {
             panic!("{first:?}");
@@ -582,21 +715,117 @@ mod tests {
         assert!(matches!(sent(&finished, 2)[..], [Message::Finished { .. }]));
     }
 
-    /// Ends running job `job` in slot `slot` and maintains the slot.
-    fn finish(scheduler: &mut Scheduler, job: JobId, slot: usize) -> Vec<Effect> {
-        let mut effects = scheduler.exited(job, &ok());
-        effects.extend(scheduler.maintained(SlotKey(slot), Some(1)));
-        effects
+    #[test]
+    fn a_newer_request_supersedes_its_worktrees_queued_ones_and_keeps_their_place() {
+        let mut scheduler = scheduler(1);
+        let busy = submit(&mut scheduler, 1, "/busy", "t0");
+        let [(running, ..)] = starts(&busy)[..] else {
+            panic!("{busy:?}");
+        };
+        submit(&mut scheduler, 2, "/a", "t1");
+        submit(&mut scheduler, 3, "/b", "t1");
+        submit(&mut scheduler, 4, "/c", "u1");
+        let newer = submit(&mut scheduler, 5, "/a", "t2");
+        // /a's waiter moves to t2; /b's keeps t1, which is still its content.
+        assert!(
+            matches!(sent(&newer, 2)[..], [Message::Queued { revision }] if revision.to_string() == "t2")
+        );
+        let (_, queue) = scheduler.status();
+        let order = queue
+            .iter()
+            .map(|build| (build.revision.to_string(), build.worktrees.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [("t1".into(), 1), ("t2".into(), 2), ("u1".into(), 1)]
+        );
+
+        let next = scheduler.exited(running, &ok());
+        assert_eq!(
+            starts(&next)
+                .iter()
+                .map(|s| s.2.clone())
+                .collect::<Vec<_>>(),
+            ["t1"]
+        );
     }
 
     #[test]
-    fn a_slot_being_maintained_is_waited_for_rather_than_replaced() {
-        let mut scheduler = Scheduler::new(2);
+    fn a_build_nobody_waits_for_is_dropped_or_cancelled_and_not_joined() {
+        let mut scheduler = scheduler(1);
+        let first = submit(&mut scheduler, 1, "/a", "t1");
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}");
+        };
+        submit(&mut scheduler, 2, "/b", "t2");
+        assert!(scheduler.withdraw(WaiterId(2)).is_empty());
+        assert!(scheduler.status().1.is_empty());
+
+        assert_eq!(scheduler.withdraw(WaiterId(1)), [Effect::Cancel { job }]);
+        // An equal request does not join the build being stopped.
+        let again = submit(&mut scheduler, 3, "/a", "t1");
+        assert!(matches!(sent(&again, 3)[..], [Message::Queued { .. }]));
+        let next = scheduler.exited(job, &Outcome::Signaled { signal: 15 });
+        assert!(sent(&next, 1).is_empty());
+        assert_eq!(starts(&next).len(), 1);
+        assert!(scheduler.withdraw(WaiterId(1)).is_empty());
+    }
+
+    #[test]
+    fn a_build_takes_the_idle_slot_whose_tree_is_closest() {
+        let mut scheduler = scheduler(2);
+        // Two concurrent builds create two slots.
+        let a = submit(&mut scheduler, 1, "/a", "a1");
+        let b = submit(&mut scheduler, 2, "/b", "b1");
+        let [(job_a, 0, _)] = starts(&a)[..] else {
+            panic!("{a:?}")
+        };
+        let [(job_b, 1, _)] = starts(&b)[..] else {
+            panic!("{b:?}")
+        };
+        scheduler.exited(job_a, &ok());
+        scheduler.exited(job_b, &ok());
+
+        // A worktree's next tree is closest to its previous one.
+        scheduler.distance.0.insert(("b1".into(), "b2".into()), 1);
+        assert_eq!(run(&mut scheduler, 3, "/b", "b2"), 1);
+        // A new worktree goes to the slot closest to its tree, whoever used it.
+        scheduler.distance.0.insert(("a1".into(), "c1".into()), 2);
+        scheduler.distance.0.insert(("b2".into(), "c1".into()), 7);
+        assert_eq!(run(&mut scheduler, 4, "/c", "c1"), 0);
+        // Equally close slots: the most recently used one.
+        assert_eq!(run(&mut scheduler, 5, "/d", "d1"), 0);
+    }
+
+    #[test]
+    fn slots_grow_only_while_every_slot_runs_a_build() {
+        let mut scheduler = scheduler(2);
+        assert_eq!(run(&mut scheduler, 1, "/a", "a1"), 0);
+        assert_eq!(run(&mut scheduler, 2, "/b", "b1"), 0);
+        let c = submit(&mut scheduler, 3, "/c", "c1");
+        let d = submit(&mut scheduler, 4, "/d", "d1");
+        let e = submit(&mut scheduler, 5, "/e", "e1");
+        assert!(matches!(starts(&c)[..], [(_, 0, _)]));
+        assert!(matches!(starts(&d)[..], [(_, 1, _)]));
+        assert!(starts(&e).is_empty());
+        assert_eq!(scheduler.status().0.len(), 2);
+    }
+
+    #[test]
+    fn an_idle_slot_is_maintained_after_a_quiet_period_and_waited_for_meanwhile() {
+        let mut scheduler = scheduler(2);
         let first = submit(&mut scheduler, 1, "/a", "a1");
         let [(job, 0, _)] = starts(&first)[..] else {
             panic!("{first:?}");
         };
-        assert!(starts(&scheduler.exited(job, &ok())).is_empty());
+        let ended = Instant::now();
+        assert!(maintains(&scheduler.exited(job, &ok())).is_empty());
+        let due = scheduler.next_maintenance().expect("the slot is due");
+        assert!(due >= ended + MAINTENANCE_QUIET);
+        assert!(scheduler.maintenance_due(ended).is_empty());
+        assert_eq!(maintains(&scheduler.maintenance_due(due)), [0]);
+        assert_eq!(scheduler.next_maintenance(), None);
+
         let waiting = submit(&mut scheduler, 2, "/a", "a2");
         assert!(starts(&waiting).is_empty(), "no second, cold slot");
         // Another repository's build does not wait behind it.
@@ -622,92 +851,19 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_request_supersedes_its_worktrees_queued_ones_and_keeps_their_place() {
-        let mut scheduler = Scheduler::new(1);
-        let busy = submit(&mut scheduler, 1, "/busy", "t0");
-        let [(running, ..)] = starts(&busy)[..] else {
-            panic!("{busy:?}");
+    fn a_slot_busy_without_pause_is_maintained_after_enough_builds() {
+        let mut scheduler = scheduler(1);
+        for build in 1..MAINTENANCE_DUE {
+            let effects = submit(&mut scheduler, u64::from(build), "/a", &format!("a{build}"));
+            let [(job, ..)] = starts(&effects)[..] else {
+                panic!("{effects:?}");
+            };
+            assert!(maintains(&scheduler.exited(job, &ok())).is_empty());
+        }
+        let last = submit(&mut scheduler, 99, "/a", "last");
+        let [(job, ..)] = starts(&last)[..] else {
+            panic!("{last:?}");
         };
-        submit(&mut scheduler, 2, "/a", "t1");
-        submit(&mut scheduler, 3, "/b", "t1");
-        submit(&mut scheduler, 4, "/c", "u1");
-        let newer = submit(&mut scheduler, 5, "/a", "t2");
-        // /a's waiter moves to t2; /b's keeps t1, which is still its content.
-        assert!(
-            matches!(sent(&newer, 2)[..], [Message::Queued { revision }] if revision.to_string() == "t2")
-        );
-        let (_, queue) = scheduler.status();
-        let order = queue
-            .iter()
-            .map(|build| (build.revision.to_string(), build.worktrees.len()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            order,
-            [("t1".into(), 1), ("t2".into(), 2), ("u1".into(), 1)]
-        );
-
-        let next = finish(&mut scheduler, running, 0);
-        assert_eq!(
-            starts(&next)
-                .iter()
-                .map(|s| s.2.clone())
-                .collect::<Vec<_>>(),
-            ["t1"]
-        );
-    }
-
-    #[test]
-    fn a_build_nobody_waits_for_is_dropped_or_cancelled_and_not_joined() {
-        let mut scheduler = Scheduler::new(1);
-        let first = submit(&mut scheduler, 1, "/a", "t1");
-        let [(job, ..)] = starts(&first)[..] else {
-            panic!("{first:?}");
-        };
-        submit(&mut scheduler, 2, "/b", "t2");
-        assert!(scheduler.withdraw(WaiterId(2)).is_empty());
-        assert!(scheduler.status().1.is_empty());
-
-        assert_eq!(scheduler.withdraw(WaiterId(1)), [Effect::Cancel { job }]);
-        // An equal request does not join the build being stopped.
-        let again = submit(&mut scheduler, 3, "/a", "t1");
-        assert!(matches!(sent(&again, 3)[..], [Message::Queued { .. }]));
-        let mut next = scheduler.exited(job, &Outcome::Signaled { signal: 15 });
-        next.extend(scheduler.maintained(SlotKey(0), None));
-        assert!(sent(&next, 1).is_empty());
-        assert_eq!(starts(&next).len(), 1);
-        assert!(scheduler.withdraw(WaiterId(1)).is_empty());
-    }
-
-    #[test]
-    fn builds_return_to_their_worktrees_slot_and_slots_grow_only_with_concurrency() {
-        let mut scheduler = Scheduler::new(2);
-        let a = submit(&mut scheduler, 1, "/a", "a1");
-        let b = submit(&mut scheduler, 2, "/b", "b1");
-        let [(job_a, 0, _)] = starts(&a)[..] else {
-            panic!("{a:?}")
-        };
-        let [(job_b, 1, _)] = starts(&b)[..] else {
-            panic!("{b:?}")
-        };
-        finish(&mut scheduler, job_a, 0);
-        finish(&mut scheduler, job_b, 1);
-
-        let b = submit(&mut scheduler, 3, "/b", "b2");
-        let [(job_b, 1, _)] = starts(&b)[..] else {
-            panic!("{b:?}")
-        };
-        finish(&mut scheduler, job_b, 1);
-        // A new worktree takes the least recently used slot, not a third one.
-        let c = submit(&mut scheduler, 4, "/c", "c1");
-        let [(_, 0, _)] = starts(&c)[..] else {
-            panic!("{c:?}")
-        };
-        let d = submit(&mut scheduler, 5, "/d", "d1");
-        let [(_, 1, _)] = starts(&d)[..] else {
-            panic!("{d:?}")
-        };
-        let e = submit(&mut scheduler, 6, "/e", "e1");
-        assert!(starts(&e).is_empty());
-        assert_eq!(scheduler.status().0.len(), 2);
+        assert_eq!(maintains(&scheduler.exited(job, &ok())), [0]);
     }
 }

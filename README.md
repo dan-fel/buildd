@@ -17,7 +17,9 @@ share one CPU budget instead of each assuming it owns the machine.
   repository gets at most `slots` slot directories, created only when its
   builds run concurrently, so build disk depends on the slot count rather
   than the number of sessions or worktrees.
-- **Affinity.** A build prefers the slot that last built its worktree.
+- **Closest slot.** A build takes the idle slot whose checkout differs from
+  its tree in the fewest paths (`git diff-tree`), usually the slot that last
+  built its worktree, so Cargo recompiles as little as possible.
 - **One CPU budget.** Every Cargo the daemon runs shares one jobserver with
   `jobs` tokens.
 - **Deduplication and supersession.** A request equal to a queued or running
@@ -26,11 +28,13 @@ share one CPU budget instead of each assuming it owns the machine.
   ones at their place in the queue.
 - **Cancellation.** Closing the client (Ctrl-C) withdraws the request. A
   build nobody waits for any more is stopped with its whole process group.
-- **Disk limit.** After each build, once its clients have the result, the
-  slot's target is kept within `slot_limit_gib`. Incremental caches go
-  first, least recently compiled first; the whole target goes only when its
-  compiled artifacts alone exceed the limit. Build disk per repository is
-  therefore at most `slots` times the limit, plus what a running build adds.
+- **Disk limit.** A slot's target is kept within `slot_limit_gib` once the
+  slot has been idle for two seconds, so measuring it never delays the next
+  build of a session running several in a row, and right after a build once
+  eight builds went unmeasured. Incremental caches go first, least recently
+  compiled first; the whole target goes only when its compiled artifacts
+  alone exceed the limit. Build disk per repository is therefore at most
+  `slots` times the limit, plus what builds add between measurements.
 
 ## Use
 
