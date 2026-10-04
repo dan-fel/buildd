@@ -57,6 +57,19 @@ daemon.log         output of a daemon a client started
 slots/<repo>-<hash>/<n>/{src,target}
 ```
 
+## Load test
+
+`bench/load.py` runs many sessions against one Cargo workspace, each in its
+own worktree editing one crate and asking for `check` and `test --no-run`,
+either through a buildd daemon it starts or with plain Cargo and one target
+per worktree. It reports time to finish, latency, queue time and peak disk.
+
+```sh
+bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
+  --mode buildd --buildd-home ~/Library/Caches/buildd-load --sessions 15 \
+  --crates crate-a,crate-b --think 45-120 --report load.json
+```
+
 ## Protocol
 
 One JSON object per line over the Unix socket; see `src/protocol.rs`. The
