@@ -7,7 +7,7 @@
 //! checkout. Cargo then sees ordinary edits, and the slot's path, and with it
 //! every fingerprint in its target, never changes.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -103,33 +103,40 @@ impl SlotDirectory {
         if !target.exists() {
             return Ok(Pruning::Within { size: 0 });
         }
-        let before = disk_usage(&target)?;
-        if before <= limit {
-            return Ok(Pruning::Within { size: before });
-        }
         let mut caches = incremental_caches(&target)?;
-        caches.sort_by_key(|cache| cache.compiled);
-        let mut size = before;
+        let usage = disk_usage(&target, &caches)?;
+        if usage.total <= limit {
+            return Ok(Pruning::Within { size: usage.total });
+        }
+        let mut order = (0..caches.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| caches[index].compiled);
+        // Space a removal frees for certain: files hard-linked from outside
+        // the cache (object files kept for debug info) stay on disk.
+        let mut estimate = usage.total;
         let mut removed = 0;
-        for cache in caches {
-            if size <= limit {
+        for index in order {
+            if estimate <= limit {
                 break;
             }
+            let cache = &mut caches[index];
             std::fs::remove_dir_all(&cache.path)
                 .map_err(|error| format!("could not remove {}: {error}", cache.path.display()))?;
-            size = size.saturating_sub(cache.size);
+            estimate = estimate.saturating_sub(usage.freeable[index]);
             removed += 1;
         }
-        if size <= limit {
+        let after = disk_usage(&target, &[])?.total;
+        if after <= limit {
             return Ok(Pruning::Incremental {
-                before,
-                after: size,
+                before: usage.total,
+                after,
                 removed,
             });
         }
         std::fs::remove_dir_all(&target)
             .map_err(|error| format!("could not remove {}: {error}", target.display()))?;
-        Ok(Pruning::Cleared { before })
+        Ok(Pruning::Cleared {
+            before: usage.total,
+        })
     }
 }
 
@@ -161,7 +168,6 @@ impl Pruning {
 /// One compilation unit's incremental cache.
 struct IncrementalCache {
     path: PathBuf,
-    size: u64,
     /// When rustc last compiled the unit: it replaces the cache's session
     /// directory on every incremental compilation.
     compiled: SystemTime,
@@ -170,7 +176,6 @@ struct IncrementalCache {
 /// The incremental caches of every profile, for the host and each target
 /// triple: `<target>/[<triple>/]<profile>/incremental/<unit>`.
 fn incremental_caches(target: &Path) -> Result<Vec<IncrementalCache>, String> {
-    let mut caches = Vec::new();
     let mut profiles = Vec::new();
     for entry in read_directory(target)? {
         if entry.join("incremental").is_dir() {
@@ -183,19 +188,97 @@ fn incremental_caches(target: &Path) -> Result<Vec<IncrementalCache>, String> {
             );
         }
     }
+    let mut caches = Vec::new();
     for profile in profiles {
         for path in read_directory(&profile.join("incremental"))? {
             let compiled = std::fs::symlink_metadata(&path)
                 .and_then(|metadata| metadata.modified())
                 .map_err(|error| format!("{}: {error}", path.display()))?;
-            caches.push(IncrementalCache {
-                size: disk_usage(&path)?,
-                path,
-                compiled,
-            });
+            caches.push(IncrementalCache { path, compiled });
         }
     }
     Ok(caches)
+}
+
+/// The disk space under a directory.
+struct DiskUsage {
+    /// Every file counted once, however many hard links it has.
+    total: u64,
+    /// For each of the caches asked about, what removing it frees: its
+    /// directories and the files with no hard link outside it.
+    freeable: Vec<u64>,
+}
+
+/// One file's blocks and where its hard links were found.
+struct Inode {
+    bytes: u64,
+    links: u64,
+    seen: u64,
+    /// The cache holding every link seen so far, if one does.
+    cache: Option<usize>,
+}
+
+/// The disk space under `path`, not following symbolic links. rustc's
+/// incremental sessions and Cargo's artifacts are hard links, so each file
+/// counts once.
+fn disk_usage(path: &Path, caches: &[IncrementalCache]) -> Result<DiskUsage, String> {
+    fn walk(
+        path: &Path,
+        cache: Option<usize>,
+        caches: &HashMap<&Path, usize>,
+        inodes: &mut HashMap<(u64, u64), Inode>,
+        usage: &mut DiskUsage,
+    ) -> Result<(), String> {
+        let cache = caches.get(path).copied().or(cache);
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let bytes = metadata.blocks() * 512;
+        if metadata.is_dir() {
+            usage.total += bytes;
+            if let Some(cache) = cache {
+                usage.freeable[cache] += bytes;
+            }
+            for child in read_directory(path)? {
+                walk(&child, cache, caches, inodes, usage)?;
+            }
+            return Ok(());
+        }
+        let inode = inodes
+            .entry((metadata.dev(), metadata.ino()))
+            .or_insert_with(|| {
+                usage.total += bytes;
+                Inode {
+                    bytes,
+                    links: metadata.nlink(),
+                    seen: 0,
+                    cache,
+                }
+            });
+        inode.seen += 1;
+        if inode.cache != cache {
+            inode.cache = None;
+        }
+        Ok(())
+    }
+    let index = caches
+        .iter()
+        .enumerate()
+        .map(|(index, cache)| (cache.path.as_path(), index))
+        .collect::<HashMap<_, _>>();
+    let mut inodes = HashMap::new();
+    let mut usage = DiskUsage {
+        total: 0,
+        freeable: vec![0; caches.len()],
+    };
+    walk(path, None, &index, &mut inodes, &mut usage)?;
+    for inode in inodes.values() {
+        if let Some(cache) = inode.cache
+            && inode.seen == inode.links
+        {
+            usage.freeable[cache] += inode.bytes;
+        }
+    }
+    Ok(usage)
 }
 
 fn read_directory(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -206,30 +289,6 @@ fn read_directory(path: &Path) -> Result<Vec<PathBuf>, String> {
                 .collect()
         })
         .map_err(|error| format!("could not read {}: {error}", path.display()))
-}
-
-/// The disk space the files under `path` occupy, not following symbolic
-/// links and counting each hard-linked file once: rustc's incremental
-/// sessions and Cargo's uplifted artifacts are hard links.
-fn disk_usage(path: &Path) -> Result<u64, String> {
-    fn walk(path: &Path, seen: &mut HashSet<(u64, u64)>) -> Result<u64, String> {
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        if metadata.nlink() > 1
-            && !metadata.is_dir()
-            && !seen.insert((metadata.dev(), metadata.ino()))
-        {
-            return Ok(0);
-        }
-        let own = metadata.blocks() * 512;
-        if !metadata.is_dir() {
-            return Ok(own);
-        }
-        read_directory(path)?
-            .iter()
-            .try_fold(own, |total, child| Ok(total + walk(child, seen)?))
-    }
-    walk(path, &mut HashSet::new())
 }
 
 /// A slot's display name: its project and index.
@@ -364,7 +423,7 @@ mod tests {
             400,
         );
 
-        let size = disk_usage(&target).unwrap();
+        let size = disk_usage(&target, &[]).unwrap().total;
         assert_eq!(slot.enforce_limit(size), Ok(Pruning::Within { size }));
         // Two caches of about 200 kB must go: the cross-compiled one and old-1.
         let Pruning::Incremental {
@@ -391,13 +450,47 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_whose_files_are_linked_elsewhere_frees_less_and_more_caches_go() {
+        let home = TempDir::new();
+        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+        let target = slot.target();
+        // The oldest cache's object file is also linked into deps, as rustc
+        // does for debug info: removing that cache frees almost nothing.
+        file(&target.join("debug/incremental/old-1/s-1/cgu.o"), 400_000);
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::hard_link(
+            target.join("debug/incremental/old-1/s-1/cgu.o"),
+            target.join("debug/deps/cgu.o"),
+        )
+        .unwrap();
+        file(
+            &target.join("debug/incremental/new-2/s-1/query.bin"),
+            200_000,
+        );
+        set_modified(&target.join("debug/incremental/old-1"), 200);
+        set_modified(&target.join("debug/incremental/new-2"), 100);
+        let size = disk_usage(&target, &[]).unwrap().total;
+
+        let limit = size - 150_000;
+        let Pruning::Incremental {
+            removed: 2, after, ..
+        } = slot.enforce_limit(limit).unwrap()
+        else {
+            panic!("both caches go");
+        };
+        assert!(after <= limit, "{after} > {limit}");
+        assert_eq!(after, disk_usage(&target, &[]).unwrap().total);
+        assert!(target.join("debug/deps/cgu.o").exists());
+    }
+
+    #[test]
     fn hard_linked_files_count_once() {
         let directory = TempDir::new();
         file(&directory.0.join("a/data"), 100_000);
-        let single = disk_usage(&directory.0).unwrap();
+        let single = disk_usage(&directory.0, &[]).unwrap().total;
         std::fs::create_dir(directory.0.join("b")).unwrap();
         std::fs::hard_link(directory.0.join("a/data"), directory.0.join("b/data")).unwrap();
-        let linked = disk_usage(&directory.0).unwrap();
+        let linked = disk_usage(&directory.0, &[]).unwrap().total;
         assert!(linked < single + 50_000, "{single} then {linked}");
     }
 
