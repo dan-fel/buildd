@@ -8,7 +8,7 @@
 //! every fingerprint in its target, never changes.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -125,8 +125,7 @@ impl SlotDirectory {
                 break;
             }
             let cache = &mut caches[index];
-            std::fs::remove_dir_all(&cache.path)
-                .map_err(|error| format!("could not remove {}: {error}", cache.path.display()))?;
+            remove_tree(&cache.path)?;
             estimate = estimate.saturating_sub(usage.freeable[index]);
             removed += 1;
             if cache.compiled > recent {
@@ -142,8 +141,7 @@ impl SlotDirectory {
                 in_use,
             });
         }
-        std::fs::remove_dir_all(&target)
-            .map_err(|error| format!("could not remove {}: {error}", target.display()))?;
+        remove_tree(&target)?;
         Ok(Pruning::Cleared {
             before: usage.total,
         })
@@ -300,6 +298,30 @@ fn disk_usage(path: &Path, caches: &[IncrementalCache]) -> Result<DiskUsage, Str
         }
     }
     Ok(usage)
+}
+
+/// Removes `path` and everything under it. Builds can leave directories
+/// without write permission behind, such as a test's read-only install of a
+/// tool, which would make the removal fail: they are made writable first.
+fn remove_tree(path: &Path) -> Result<(), String> {
+    fn writable(path: &Path) -> std::io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o700 != 0o700 {
+            permissions.set_mode(permissions.mode() | 0o700);
+            std::fs::set_permissions(path, permissions)?;
+        }
+        for entry in std::fs::read_dir(path)? {
+            writable(&entry?.path())?;
+        }
+        Ok(())
+    }
+    writable(path)
+        .and_then(|()| std::fs::remove_dir_all(path))
+        .map_err(|error| format!("could not remove {}: {error}", path.display()))
 }
 
 fn read_directory(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -502,6 +524,24 @@ mod tests {
         assert!(after <= limit, "{after} > {limit}");
         assert_eq!(after, disk_usage(&target, &[]).unwrap().total);
         assert!(target.join("debug/deps/cgu.o").exists());
+    }
+
+    #[test]
+    fn a_target_with_read_only_directories_is_still_cleared() {
+        let home = TempDir::new();
+        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+        let target = slot.target();
+        let locked = target.join("tmp/test-data/runtime");
+        file(&locked.join("bin/tool"), 1000);
+        file(&target.join("debug/deps/libbig.rlib"), 100_000);
+        for directory in [locked.join("bin"), locked.clone()] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        assert!(matches!(
+            slot.enforce_limit(1000),
+            Ok(Pruning::Cleared { .. })
+        ));
+        assert!(!target.exists());
     }
 
     #[test]
