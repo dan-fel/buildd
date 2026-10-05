@@ -18,9 +18,13 @@ share one CPU budget instead of each assuming it owns the machine.
   builds run concurrently, so build disk depends on the slot count rather
   than the number of sessions or worktrees.
 - **Best slot.** A build takes the idle slot where Cargo has the least to
-  do: one that already ran the same compilation (directory, command and
-  Cargo arguments) before one that did not, and among those the one whose
-  checkout is closest to the build's tree. Closeness is the packages Cargo
+  do: the fewest compiled units it needs and the slot lacks, plus how far
+  the slot's checkout is from the build's tree. What a build needs is what
+  the latest build of the same compilation (directory, command and Cargo
+  arguments) used, in any slot, learned from Cargo's reports; unit hashes
+  are the same in every slot. A compilation that never ran is assumed to
+  need what builds of the same command used, so a single crate's tests go
+  to the slot that ran the whole suite. Distance is the packages Cargo
   compiles again: the paths that differ (`git diff-tree`), each changed
   package counted with every workspace package that depends on it, learned
   from `cargo metadata`, and a lockfile or build-configuration change

@@ -15,13 +15,15 @@
 //!   cancelled; a queued one is dropped.
 //! - **Slots.** At most `capacity` slots are busy: running a build, or being
 //!   kept within their disk limit. A build takes the idle slot of its
-//!   repository where Cargo has the least to do: one that already did its
-//!   [`Compilation`] before one that did not, and among those the one whose
-//!   tree is closest to the build's, usually the slot that last built its
-//!   worktree. It never waits for a busy slot while one is idle: measured,
-//!   waiting for a warm slot cost more than warming another. It gets a new
-//!   slot only when every slot of its repository runs a build, so slot
-//!   directories are created only when builds of a repository run
+//!   repository where Cargo has the least to do: the fewest compiled units
+//!   the build needs and the slot lacks, plus the distance between the
+//!   slot's tree and the build's. A build needs what the latest build of its
+//!   [`Compilation`] used, in any slot; a compilation no build ran yet needs,
+//!   as far as anyone knows, what the latest builds of the same command in
+//!   the same directory used. It never waits for a busy slot while one is
+//!   idle: measured, waiting for a warm slot cost more than warming another.
+//!   It gets a new slot only when every slot of its repository runs a build,
+//!   so slot directories are created only when builds of a repository run
 //!   concurrently.
 //! - **Maintenance.** A slot is kept within its disk limit once it has been
 //!   idle for [`MAINTENANCE_QUIET`], so the measurement does not delay the
@@ -35,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cargo::{Compilation, Operation};
 use crate::protocol::{EventKind, Message, Outcome, QueuedBuild, RunningBuild, SlotStatus, Usage};
-use crate::slot::{Pruning, SlotRecord, slot_name};
+use crate::slot::{CompilationRun, Pruning, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
 
 /// How long a slot stays idle before it is kept within its disk limit.
@@ -142,6 +144,8 @@ struct Job {
     /// Crates Cargo compiled so far, and crates it found up to date.
     compiled: u64,
     fresh: u64,
+    /// The compiled units it used so far.
+    units: HashSet<String>,
 }
 
 enum State {
@@ -175,8 +179,8 @@ struct Slot {
     size: Option<u64>,
     /// Its last maintenance took caches in use: its limit is too small.
     undersized: bool,
-    /// The compilations it did since its target was last cleared.
-    compiled: HashSet<Compilation>,
+    /// What its latest build of each compilation used.
+    compilations: Vec<CompilationRun>,
     /// When a build last used each compiled unit, in seconds since the Unix
     /// epoch.
     units: HashMap<String, u64>,
@@ -187,16 +191,47 @@ impl Slot {
         self.job.is_some() || self.maintaining
     }
 
+    /// Its build of `compilation` used `units`: everything the compilation
+    /// needs when the build `succeeded`. A failed build may have stopped
+    /// early, so what earlier builds used stays.
+    fn ran(&mut self, compilation: Compilation, units: HashSet<String>, succeeded: bool) {
+        // A build that used no units says nothing about what it needs.
+        if units.is_empty() {
+            return;
+        }
+        let at = now();
+        match self
+            .compilations
+            .iter_mut()
+            .find(|run| run.compilation == compilation)
+        {
+            Some(run) => {
+                if succeeded {
+                    run.units.clear();
+                }
+                run.units.extend(units);
+                run.at = at;
+            }
+            None => self.compilations.push(CompilationRun {
+                compilation,
+                at,
+                units: units.into_iter().collect(),
+            }),
+        }
+    }
+
     fn persist(&self) -> Effect {
-        let mut compiled = self.compiled.iter().cloned().collect::<Vec<_>>();
-        compiled
-            .sort_by(|a, b| (&a.prefix, a.command, &a.args).cmp(&(&b.prefix, b.command, &b.args)));
+        let mut compilations = self.compilations.clone();
+        compilations.sort_by(|a, b| {
+            let (a, b) = (&a.compilation, &b.compilation);
+            (&a.prefix, a.command, &a.args).cmp(&(&b.prefix, b.command, &b.args))
+        });
         Effect::Persist {
             repository: self.repository.clone(),
             slot: self.index,
             record: SlotRecord {
                 worktree: self.worktree.clone(),
-                compiled,
+                compilations,
                 units: self
                     .units
                     .iter()
@@ -309,7 +344,7 @@ impl<D: Distance> Scheduler<D> {
             idle_since: Instant::now(),
             size: None,
             undersized: false,
-            compiled: record.compiled.into_iter().collect(),
+            compilations: record.compilations,
             units: record.units.into_iter().collect(),
         });
     }
@@ -400,6 +435,7 @@ impl<D: Distance> Scheduler<D> {
                     output: Vec::new(),
                     compiled: 0,
                     fresh: 0,
+                    units: HashSet::new(),
                 },
             );
             id
@@ -513,18 +549,15 @@ impl<D: Distance> Scheduler<D> {
 
     /// Running job `id` used compiled `unit`, such as a build script's output.
     pub(crate) fn unit_used(&mut self, id: JobId, unit: String) {
-        let Some(Job {
-            state: State::Running { slot, .. },
-            ..
-        }) = self.jobs.get(&id)
-        else {
+        // Like output, a report can arrive after the build ended.
+        let Some(job) = self.jobs.get_mut(&id) else {
             return;
         };
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("the clock is past 1970")
-            .as_secs();
-        self.slots[*slot].units.insert(unit, now);
+        let State::Running { slot, .. } = job.state else {
+            panic!("only running jobs use units");
+        };
+        job.units.insert(unit.clone());
+        self.slots[slot].units.insert(unit, now());
     }
 
     /// Running job `id` ended with `outcome`, having used `usage` when Cargo
@@ -535,16 +568,16 @@ impl<D: Distance> Scheduler<D> {
         outcome: &Outcome,
         usage: Option<Usage>,
     ) -> Vec<Effect> {
-        let job = self.jobs.remove(&id).expect("only tracked jobs run");
+        let mut job = self.jobs.remove(&id).expect("only tracked jobs run");
         let State::Running { slot, started, .. } = job.state else {
             panic!("only running jobs exit");
         };
         let compilation = Compilation::of(&job);
         let entry = &mut self.slots[slot];
-        // Cargo ran to its end: its artifacts are in the slot, also when the
-        // job's own crates did not compile.
-        if let Outcome::Exited { .. } = outcome {
-            entry.compiled.insert(compilation);
+        // Cargo ran to its end, also when the job's own crates did not
+        // compile; a cancelled or killed build tells less.
+        if let Outcome::Exited { code } = outcome {
+            entry.ran(compilation, std::mem::take(&mut job.units), *code == 0);
         }
         let persist = entry.persist();
         entry.job = None;
@@ -639,8 +672,8 @@ impl<D: Distance> Scheduler<D> {
         for unit in evicted {
             slot.units.remove(unit);
         }
+        // What compilations need stays known: it holds for every slot.
         if let Some(Pruning::Cleared { .. }) = pruning {
-            slot.compiled.clear();
             slot.units.clear();
         }
         if !evicted.is_empty() || matches!(pruning, Some(Pruning::Cleared { .. })) {
@@ -695,12 +728,11 @@ impl<D: Distance> Scheduler<D> {
             if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
                 break;
             }
-            let Some(slot) = self.choose_slot(id) else {
+            let Some((slot, warm)) = self.choose_slot(id) else {
                 continue;
             };
             self.clock += 1;
             let job = &self.jobs[&id];
-            let warm = self.slots[slot].compiled.contains(&Compilation::of(job));
             let first = self.built_worktrees.insert(job.waiters[0].worktree.clone());
             let entry = &mut self.slots[slot];
             entry.job = Some(id);
@@ -740,34 +772,38 @@ impl<D: Distance> Scheduler<D> {
         effects
     }
 
-    /// The slot queued job `id` runs in now, as the module explains, or None
-    /// while it waits.
-    fn choose_slot(&mut self, id: JobId) -> Option<usize> {
+    /// The slot queued job `id` runs in now, as the module explains, and
+    /// whether that slot holds everything the build needs; None while it
+    /// waits.
+    fn choose_slot(&mut self, id: JobId) -> Option<(usize, bool)> {
         let job = &self.jobs[&id];
         let repository = job.repository.clone();
         let revision = job.revision.clone();
-        let compilation = Compilation::of(job);
-        // Ranked by: did the compilation, closeness, recent use.
-        let mut best: Option<(bool, u64, u64, usize)> = None;
+        let (needed, known) = needed(&self.slots, &repository, &Compilation::of(job));
+        // Ranked by the work Cargo has, then by recent use.
+        let mut best: Option<((u64, u64, usize), bool)> = None;
         for (index, slot) in self.slots.iter().enumerate() {
             if slot.repository != repository || slot.busy() {
                 continue;
             }
+            let missing = needed
+                .iter()
+                .filter(|unit| !slot.units.contains_key(**unit))
+                .count() as u64;
             let distance = self
                 .distance
                 .distance(&repository, &slot.revision, &revision);
             let rank = (
-                !slot.compiled.contains(&compilation),
-                distance,
+                missing.saturating_add(distance),
                 u64::MAX - slot.used,
                 index,
             );
-            if best.is_none_or(|best| rank < best) {
-                best = Some(rank);
+            if best.is_none_or(|(best, _)| rank < best) {
+                best = Some((rank, known && missing == 0));
             }
         }
-        if let Some((_, _, _, index)) = best {
-            return Some(index);
+        if let Some(((_, _, index), warm)) = best {
+            return Some((index, warm));
         }
         let own = || {
             self.slots
@@ -794,10 +830,10 @@ impl<D: Distance> Scheduler<D> {
             idle_since: Instant::now(),
             size: None,
             undersized: false,
-            compiled: HashSet::new(),
+            compilations: Vec::new(),
             units: HashMap::new(),
         });
-        Some(self.slots.len() - 1)
+        Some((self.slots.len() - 1, false))
     }
 
     /// The slots and the queue, next build first.
@@ -853,6 +889,46 @@ impl<D: Distance> Scheduler<D> {
             .collect();
         (slots, queue)
     }
+}
+
+/// The compiled units a build of `compilation` in `repository` needs, as the
+/// module explains, and whether a build of it ran before.
+fn needed<'a>(
+    slots: &'a [Slot],
+    repository: &Path,
+    compilation: &Compilation,
+) -> (HashSet<&'a str>, bool) {
+    let mut latest = HashMap::<&Compilation, &CompilationRun>::new();
+    for run in slots
+        .iter()
+        .filter(|slot| slot.repository == repository)
+        .flat_map(|slot| &slot.compilations)
+    {
+        let kept = latest.entry(&run.compilation).or_insert(run);
+        if run.at > kept.at {
+            *kept = run;
+        }
+    }
+    if let Some(run) = latest.get(compilation) {
+        return (run.units.iter().map(String::as_str).collect(), true);
+    }
+    let alike = latest
+        .values()
+        .filter(|run| {
+            run.compilation.prefix == compilation.prefix
+                && run.compilation.command == compilation.command
+        })
+        .flat_map(|run| run.units.iter().map(String::as_str))
+        .collect();
+    (alike, false)
+}
+
+/// Now, in seconds since the Unix epoch.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_secs()
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -1180,6 +1256,22 @@ mod tests {
     }
 
     /// Two slots: slot 0 did `check` at tree a1, slot 1 did `test` at b1.
+    /// `count` unit keys starting with `prefix`.
+    fn units(prefix: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|unit| format!("debug/{prefix}{unit:015}"))
+            .collect()
+    }
+
+    /// Reports that running job `job` used `units`.
+    fn used(scheduler: &mut Scheduler<Table>, job: JobId, units: &[String]) {
+        for unit in units {
+            scheduler.crate_built(job, true, Some(unit.clone()));
+        }
+    }
+
+    /// Slot 0 checked tree a1, using 12 units, and slot 1 tested tree b1,
+    /// using 12 others.
     fn checked_and_tested() -> Scheduler<Table> {
         let mut scheduler = scheduler(2);
         let a = submit(&mut scheduler, 1, "/a", "a1");
@@ -1190,28 +1282,106 @@ mod tests {
         let [(job_b, 1, _)] = starts(&b)[..] else {
             panic!("{b:?}")
         };
+        used(&mut scheduler, job_a, &units("c", 12));
+        used(&mut scheduler, job_b, &units("t", 12));
         scheduler.exited(job_a, &ok(), None);
         scheduler.exited(job_b, &ok(), None);
         scheduler
     }
 
     #[test]
-    fn a_build_prefers_a_slot_that_did_its_compilation_over_a_closer_one() {
+    fn a_build_takes_the_slot_where_cargo_has_least_to_do() {
+        // Slot 1 is 1 package away but lacks the 12 units `check` needs;
+        // slot 0 holds them, 10 packages away.
         let mut scheduler = checked_and_tested();
         scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
         assert_eq!(run(&mut scheduler, 3, "/c", "c1"), 0);
+        // Nearer still, slot 1 wins: 12 units to compile beat 15 packages.
+        let mut scheduler = checked_and_tested();
+        scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
+        scheduler.distance.0.insert(("a1".into(), "c1".into()), 15);
+        assert_eq!(run(&mut scheduler, 3, "/c", "c1"), 1);
     }
 
     #[test]
-    fn a_cleared_slot_forgets_its_compilations() {
+    fn a_new_compilation_goes_where_builds_of_its_command_left_the_most() {
+        // `test -p x --lib` never ran: it likely needs what `test` used, which
+        // slot 1 holds, although slot 0 is closer.
+        let mut scheduler = checked_and_tested();
+        scheduler.distance.0.insert(("a1".into(), "c1".into()), 1);
+        let effects = submit_operation(
+            &mut scheduler,
+            3,
+            "/c",
+            "c1",
+            Command::Test,
+            &["-p", "x", "--lib"],
+        );
+        assert!(matches!(starts(&effects)[..], [(_, 1, _)]), "{effects:?}");
+        // Only a build of the compilation itself makes a slot warm.
+        assert!(matches!(
+            reports(&effects)[..],
+            [_, EventKind::Started { warm: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn evicted_units_count_as_missing() {
+        let mut scheduler = checked_and_tested();
+        scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
+        let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
+        assert_eq!(maintains(&maintain), [0, 1]);
+        let pruning = Pruning::Evicted {
+            before: 2,
+            after: 1,
+            caches: 0,
+            units: 12,
+            in_use: 0,
+        };
+        scheduler.maintained(SlotKey(0), Some(pruning), &units("c", 12));
+        scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }), &[]);
+        // Both slots lack what `check` needs; slot 1 is closer.
+        assert_eq!(run(&mut scheduler, 3, "/c", "c1"), 1);
+    }
+
+    #[test]
+    fn a_cleared_slot_forgets_its_units_but_not_what_compilations_need() {
         let mut scheduler = checked_and_tested();
         let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
         assert_eq!(maintains(&maintain), [0, 1]);
         scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 9 }), &[]);
         scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }), &[]);
-        assert!(scheduler.slots[0].compiled.is_empty());
+        assert!(scheduler.slots[0].units.is_empty());
         assert!(scheduler.status().0[0].undersized);
-        assert_eq!(scheduler.slots[1].compiled.len(), 1);
+        assert_eq!(scheduler.slots[0].compilations.len(), 1);
+        assert_eq!(scheduler.slots[1].units.len(), 12);
+    }
+
+    #[test]
+    fn a_failed_build_adds_to_what_its_compilation_needs_and_a_successful_one_replaces_it() {
+        let mut scheduler = scheduler(1);
+        let mut build = |waiter: u64, tree: &str, units: &[String], code: i32| {
+            let effects = submit(&mut scheduler, waiter, "/a", tree);
+            let [(job, ..)] = starts(&effects)[..] else {
+                panic!("{effects:?}");
+            };
+            used(&mut scheduler, job, units);
+            scheduler.exited(job, &Outcome::Exited { code }, None);
+            scheduler.slots[0].compilations[0].units.len()
+        };
+        let all = units("u", 6);
+        assert_eq!(build(1, "a1", &all, 0), 6);
+        // Cargo stopped at a compile error after 2 units, one of them new.
+        assert_eq!(
+            build(
+                2,
+                "a2",
+                &[all[0].clone(), "debug/ffffffffffffffff".into()],
+                101
+            ),
+            7
+        );
+        assert_eq!(build(3, "a3", &all[..4], 0), 4);
     }
 
     #[test]
@@ -1282,8 +1452,8 @@ mod tests {
             ] if who == "c" && from.to_string() == "c1" && to.to_string() == "c2"
         ));
 
-        scheduler.crate_built(job, false, None);
-        scheduler.crate_built(job, true, None);
+        scheduler.crate_built(job, false, Some("debug/0000000000000001".into()));
+        scheduler.crate_built(job, true, Some("debug/0000000000000002".into()));
         scheduler.crate_built(job, true, None);
         let (slots, _) = scheduler.status();
         let running = slots[0].build.as_ref().expect("t1 runs");
@@ -1322,16 +1492,25 @@ mod tests {
         let [(job, ..)] = starts(&first)[..] else {
             panic!("{first:?}");
         };
+        used(&mut scheduler, job, &units("a", 3));
         let finished = scheduler.exited(job, &ok(), None);
         let [(0, record)] = persisted(&finished)[..] else {
             panic!("{finished:?}");
         };
         assert_eq!(record.worktree.as_deref(), Some(Path::new("/work/a")));
-        assert_eq!(record.compiled, [Compilation::new(Path::new(""), &check())]);
-        // A cleared target forgets them, and that is persisted too.
+        let [run] = &record.compilations[..] else {
+            panic!("{record:?}");
+        };
+        assert_eq!(run.compilation, Compilation::new(Path::new(""), &check()));
+        assert_eq!(run.units.len(), 3);
+        assert_eq!(record.units.len(), 3);
+        // A cleared target forgets its units, and that is persisted too.
         scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
         let cleared = scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 1 }), &[]);
-        assert!(matches!(persisted(&cleared)[..], [(0, record)] if record.compiled.is_empty()));
+        assert!(matches!(
+            persisted(&cleared)[..],
+            [(0, record)] if record.units.is_empty() && record.compilations.len() == 1
+        ));
     }
 
     #[test]
@@ -1339,8 +1518,12 @@ mod tests {
         let mut scheduler = scheduler(3);
         let record = SlotRecord {
             worktree: Some("/work/a".into()),
-            compiled: vec![Compilation::new(Path::new(""), &check())],
-            ..SlotRecord::default()
+            compilations: vec![CompilationRun {
+                compilation: Compilation::new(Path::new(""), &check()),
+                at: 1,
+                units: units("c", 12).into_iter().collect(),
+            }],
+            units: units("c", 12).into_iter().map(|unit| (unit, 1)).collect(),
         };
         scheduler.restore(
             "/repo/.git".into(),
@@ -1352,7 +1535,8 @@ mod tests {
         let (slots, _) = scheduler.status();
         assert_eq!(slots.len(), 2);
         assert!(slots.iter().all(|slot| slot.size.is_none()));
-        // Slot 2 ran `check` before, so it wins over slot 0, which is closer.
+        // Slot 2 holds what `check` needs, so it wins over slot 0, which is
+        // closer.
         scheduler.distance.0.insert(("x1".into(), "a2".into()), 1);
         let first = submit(&mut scheduler, 1, "/work/a", "a2");
         assert!(matches!(starts(&first)[..], [(_, 2, _)]));

@@ -174,7 +174,7 @@ fn restore_slots(
             Ok((revision, record)) => {
                 eprintln!(
                     "buildd: restored slot {name} with {} compilations",
-                    record.compiled.len()
+                    record.compilations.len()
                 );
                 scheduler.restore(existing.repository, existing.index, revision, record);
             }

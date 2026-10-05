@@ -7,7 +7,7 @@
 //! checkout. Cargo then sees ordinary edits, and the slot's path, and with it
 //! every fingerprint in its target, never changes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -35,16 +35,29 @@ const COMMIT_ENVIRONMENT: [(&str, &str); 6] = [
 ];
 
 /// What a slot keeps on disk that its checkout and target do not tell: the
-/// compilations it ran since its target was last cleared, and the worktree
-/// it last built for. A daemon reads it back when it starts.
+/// worktree it last built for, what its builds of each compilation used, and
+/// the compiled units its target holds. A daemon reads it back when it
+/// starts.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SlotRecord {
     pub(crate) worktree: Option<PathBuf>,
-    pub(crate) compiled: Vec<Compilation>,
+    #[serde(default)]
+    pub(crate) compilations: Vec<CompilationRun>,
     /// When a build last used each compiled unit, by [`unit_key`], in
     /// seconds since the Unix epoch.
     #[serde(default)]
     pub(crate) units: BTreeMap<String, u64>,
+}
+
+/// The compiled units, by [`unit_key`], that a slot's latest build of
+/// `compilation` used, `at` seconds since the Unix epoch. Unit keys name the
+/// same unit in every slot of a repository, so this is what the compilation
+/// needs wherever it runs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CompilationRun {
+    pub(crate) compilation: Compilation,
+    pub(crate) at: u64,
+    pub(crate) units: BTreeSet<String>,
 }
 
 /// A slot directory a daemon left behind.
@@ -932,7 +945,17 @@ mod tests {
         slot.materialize(&source.repository, &tree).unwrap();
         let record = SlotRecord {
             worktree: Some(repository.0.clone()),
-            compiled: Vec::new(),
+            compilations: vec![CompilationRun {
+                compilation: Compilation::new(
+                    Path::new("crates/x"),
+                    &crate::cargo::Operation {
+                        command: crate::cargo::Command::Test,
+                        args: vec!["--lib".into()],
+                    },
+                ),
+                at: 7,
+                units: ["debug/0123456789abcdef".to_owned()].into(),
+            }],
             units: [("debug/0123456789abcdef".to_owned(), 7)].into(),
         };
         slot.write_record(&record).unwrap();

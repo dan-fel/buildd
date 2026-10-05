@@ -63,8 +63,8 @@ const RESERVED_OPTIONS: [&str; 8] = [
 /// less those that only change what runs afterwards: for `test`, the
 /// arguments after `--` (they go to the test harness) and `--no-run`. For
 /// Clippy the arguments after `--` stay: they are lint settings that change
-/// what Clippy checks. A slot that did a compilation keeps its artifacts
-/// until its target is cleared, so doing it again there is incremental.
+/// what Clippy checks. Builds of a compilation use the same compiled units,
+/// so the scheduler learns from each build what the next one needs.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub(crate) struct Compilation {
     pub(crate) prefix: PathBuf,
