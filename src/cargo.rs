@@ -61,7 +61,8 @@ const RESERVED_OPTIONS: [&str; 8] = [
 
 /// What Cargo compiles for a build: its directory, command and arguments,
 /// less those that only change what runs afterwards: for `test`, the
-/// arguments after `--` (they go to the test harness) and `--no-run`. For
+/// positional test name, arguments after `--` (they go to the test harness),
+/// `--no-run` and `--no-fail-fast`. For
 /// Clippy the arguments after `--` stay: they are lint settings that change
 /// what Clippy checks. Builds of a compilation use the same compiled units,
 /// so the scheduler learns from each build what the next one needs.
@@ -75,13 +76,7 @@ pub(crate) struct Compilation {
 impl Compilation {
     pub(crate) fn new(prefix: &Path, operation: &Operation) -> Self {
         let args = match operation.command {
-            Command::Test => operation
-                .args
-                .iter()
-                .take_while(|argument| *argument != "--")
-                .filter(|argument| *argument != "--no-run")
-                .cloned()
-                .collect(),
+            Command::Test => test_compilation_args(&operation.args),
             Command::Check | Command::Clippy | Command::Build => operation.args.clone(),
         };
         Self {
@@ -90,6 +85,65 @@ impl Compilation {
             args,
         }
     }
+}
+
+/// Strip execution-only test arguments without mistaking an option's value
+/// for a test name. Unknown options keep the original selection: Cargo owns
+/// its argument language, and an uncertain reuse estimate must stay distinct.
+fn test_compilation_args(args: &[String]) -> Vec<String> {
+    let original: Vec<_> = args
+        .iter()
+        .take_while(|argument| *argument != "--")
+        .filter(|argument| !matches!(argument.as_str(), "--no-run" | "--no-fail-fast"))
+        .cloned()
+        .collect();
+    let mut compiled = Vec::new();
+    let mut arguments = original.iter();
+    while let Some(argument) = arguments.next() {
+        if !argument.starts_with('-') {
+            // Cargo's only free argument before `--` is TESTNAME.
+            continue;
+        }
+        compiled.push(argument.clone());
+        match argument.as_str() {
+            "-p" | "--package" | "--exclude" | "--bin" | "--example" | "--test" | "--bench"
+            | "-F" | "--features" | "--profile" | "--target" | "--color" => {
+                if let Some(value) = arguments.next() {
+                    compiled.push(value.clone());
+                }
+            }
+            "--workspace"
+            | "--all"
+            | "--lib"
+            | "--bins"
+            | "--examples"
+            | "--tests"
+            | "--benches"
+            | "--all-targets"
+            | "--doc"
+            | "--all-features"
+            | "--no-default-features"
+            | "-r"
+            | "--release"
+            | "--ignore-rust-version"
+            | "--locked"
+            | "--offline"
+            | "--frozen"
+            | "--timings"
+            | "--future-incompat-report"
+            | "-q"
+            | "--quiet"
+            | "-v"
+            | "-vv"
+            | "--verbose" => {}
+            // These spellings contain their own value.
+            _ if argument.contains('=')
+                || argument.starts_with("-p") && !argument.starts_with("--")
+                || argument.starts_with("-F") => {}
+            _ => return original,
+        }
+    }
+    compiled
 }
 
 /// A Cargo command and its arguments as the client gave them. Two equal
@@ -302,6 +356,34 @@ mod tests {
         assert_ne!(
             of(Command::Clippy, &["-p", "x", "--", "-D", "warnings"]),
             of(Command::Clippy, &["-p", "x"])
+        );
+    }
+
+    #[test]
+    fn test_names_share_compilation_but_option_values_keep_their_identity() {
+        let of = |args: &[&str]| Compilation::new(Path::new(""), &operation(args));
+        for selection in [
+            vec!["-p", "engine", "--test", "serve"],
+            vec!["--features", "a,b", "--target", "aarch64-apple-darwin"],
+            vec!["-pengine", "-Fa,b", "--profile=dev"],
+            vec!["--workspace", "--exclude", "app", "--all-targets"],
+        ] {
+            let expected = of(&selection);
+            let mut filtered = selection.clone();
+            filtered.extend(["some::test", "--no-run", "--no-fail-fast", "--", "--exact"]);
+            assert_eq!(of(&filtered), expected);
+            let mut prefixed = vec!["other::test"];
+            prefixed.extend(selection);
+            assert_eq!(of(&prefixed), expected);
+        }
+        assert_ne!(of(&["--test", "first"]), of(&["--test", "second"]));
+        assert_ne!(of(&["-F", "first"]), of(&["-F", "second"]));
+        assert_ne!(of(&["--profile", "dev"]), of(&["--profile", "release"]));
+        assert_ne!(of(&["--doc"]), of(&["--lib"]));
+        // A future option could consume the following word as a value.
+        assert_ne!(
+            of(&["--new-option", "first"]),
+            of(&["--new-option", "second"])
         );
     }
 
