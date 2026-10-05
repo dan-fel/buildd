@@ -43,7 +43,10 @@ share one CPU budget instead of each assuming it owns the machine.
   compile from scratch, many times slower. `buildd status` and the daemon
   log flag such a slot. Fewer, larger slots beat more, smaller ones: on
   Jaide, check and test builds of a few crates need 12–15 GiB per slot, and
-  4 slots of 8 GiB were several times slower than 2 of 15.
+  4 slots of 8 GiB were several times slower than 2 of 15. Full-workspace
+  `test` and `clippy --all-targets` from several worktrees, as Jaide's
+  agents run them, need about 30 GiB per slot: at 20 GiB a slot's compiled
+  artifacts alone outgrew the limit and its target was cleared.
 
 ## Snapshots, trees and slots
 
