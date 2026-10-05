@@ -59,10 +59,12 @@ const RESERVED_OPTIONS: [&str; 8] = [
     "--jobs",
 ];
 
-/// What Cargo compiles for a build: its directory, command, and the
-/// arguments before `--` (those after go to the test harness or the
-/// compiler driver). A slot that did a compilation keeps its artifacts until
-/// its target is cleared, so doing it again there is incremental.
+/// What Cargo compiles for a build: its directory, command and arguments,
+/// less those that only change what runs afterwards: for `test`, the
+/// arguments after `--` (they go to the test harness) and `--no-run`. For
+/// Clippy the arguments after `--` stay: they are lint settings that change
+/// what Clippy checks. A slot that did a compilation keeps its artifacts
+/// until its target is cleared, so doing it again there is incremental.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub(crate) struct Compilation {
     pub(crate) prefix: PathBuf,
@@ -72,15 +74,20 @@ pub(crate) struct Compilation {
 
 impl Compilation {
     pub(crate) fn new(prefix: &Path, operation: &Operation) -> Self {
-        Self {
-            prefix: prefix.to_owned(),
-            command: operation.command,
-            args: operation
+        let args = match operation.command {
+            Command::Test => operation
                 .args
                 .iter()
                 .take_while(|argument| *argument != "--")
+                .filter(|argument| *argument != "--no-run")
                 .cloned()
                 .collect(),
+            Command::Check | Command::Clippy | Command::Build => operation.args.clone(),
+        };
+        Self {
+            prefix: prefix.to_owned(),
+            command: operation.command,
+            args,
         }
     }
 }
@@ -271,6 +278,31 @@ mod tests {
         ] {
             assert_eq!(Line::of(forwarded), Line::Forward, "{forwarded}");
         }
+    }
+
+    #[test]
+    fn a_compilation_ignores_only_what_changes_what_runs() {
+        let of = |command: Command, args: &[&str]| {
+            Compilation::new(
+                Path::new(""),
+                &Operation {
+                    command,
+                    args: args.iter().map(|argument| (*argument).to_owned()).collect(),
+                },
+            )
+        };
+        assert_eq!(
+            of(Command::Test, &["-p", "x", "--", "filter"]),
+            of(Command::Test, &["-p", "x"])
+        );
+        assert_eq!(
+            of(Command::Test, &["-p", "x", "--no-run"]),
+            of(Command::Test, &["-p", "x"])
+        );
+        assert_ne!(
+            of(Command::Clippy, &["-p", "x", "--", "-D", "warnings"]),
+            of(Command::Clippy, &["-p", "x"])
+        );
     }
 
     #[test]
