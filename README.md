@@ -45,6 +45,114 @@ share one CPU budget instead of each assuming it owns the machine.
   Jaide, check and test builds of a few crates need 12–15 GiB per slot, and
   4 slots of 8 GiB were several times slower than 2 of 15.
 
+## Snapshots, trees and slots
+
+Every build is named by a git tree: a snapshot of a directory whose id is a
+hash of its content. buildd uses it as an exact, cheap name for "this
+worktree's files, right now".
+
+### What a tree is
+
+Git stores each file's content as a blob named by the hash of its bytes. A
+tree lists names and the blob or subtree each points to, and is itself
+named by the hash of that list.
+
+```text
+tree 7f3a…                         ← one id names the whole snapshot
+├── Cargo.toml   → blob 1c2d…
+├── Cargo.lock   → blob 88e0…
+└── crates/      → tree 4b91…
+    ├── domain/  → tree a0f3…
+    │   └── src/lib.rs → blob 5e77…
+    └── gui/     → tree c2d8…
+        └── src/lib.rs → blob 9b14…
+```
+
+Identical content gives an identical id in any worktree. Editing one file
+changes its blob id, its folder's tree id, and so on up to the top.
+
+### Snapshotting a worktree
+
+For each request the daemon writes the worktree's current content as a tree
+(about 0.1 s on a 600k-line workspace):
+
+```text
+worktree on disk          private copy of           git objects
+(committed + uncommitted  the worktree's index      (shared by all worktrees
+ + new files)             ($BUILDD_HOME/tmp)         of the repository)
+
+  crates/gui/src/lib.rs ─┐
+  (edited, not staged)   │  git add --all  ┌──────────┐  a new blob only for
+                         ├────────────────▶│ temp     │──▶ each changed file
+  new_file.rs ───────────┘                 │ index    │
+  target/, ignored files ✗ skipped         └────┬─────┘
+                                                │ git write-tree
+                                                ▼
+                                        tree 7f3a…  = the revision
+```
+
+- The copy starts from the worktree's own index, whose cached file sizes and
+  times let git rehash only the files that changed.
+- Unchanged files keep their blob ids, so a snapshot stores only the new
+  versions of edited files.
+- The worktree's own index, and anything staged in it, are never touched,
+  so the agents sharing a worktree see no change.
+
+### What the tree id gives
+
+- **Deduplication.** Two requests for the same repository, tree, directory,
+  command and arguments are one build.
+- **Honest results.** Every result names the tree that was compiled, never
+  "whatever was on disk".
+- **Cheap distances.** `git diff-tree` compares two trees by id and skips
+  every folder whose id matches, so finding the few paths that differ
+  between two snapshots of a large workspace takes milliseconds. The
+  scheduler uses that count to choose the slot with the least to recompile.
+
+```text
+tree 7f3a (slot holds)        tree 3d2e (request)
+crates/ → 4b91           vs   crates/ → 6e02        differ: descend
+  domain/ → a0f3                domain/ → a0f3      same id: skip
+  gui/    → c2d8                gui/    → f417      differ: descend
+     src/lib.rs → 9b14             src/lib.rs → 0c55   changed file
+```
+
+### Checking a tree out into a slot
+
+A slot's checkout is a small git repository of its own whose objects come
+from the source repository, so checking out copies nothing up front and
+writes only what differs:
+
+```text
+slots/<repo>-<hash>/<n>/src
+  .git/objects/info/alternates ──▶ the source repository's objects
+                                   (every blob readable, nothing copied)
+
+  1. git commit-tree <tree>   wrap the tree in a commit (fixed author and
+                              date, so one tree is always one commit)
+  2. git reset --hard <commit>
+                              compare with what the checkout holds:
+                                same blob id    → file untouched
+                                different id    → file rewritten
+                                not in the tree → file deleted
+  3. git clean -ffdx          remove anything a build left behind
+```
+
+Only rewritten files get new modification times, which is what Cargo's
+fingerprints look at, so Cargo sees an ordinary small edit and recompiles
+only what depends on those files. The checkout's path never changes, and
+neither does the target directory next to it
+(`slots/<repo>-<hash>/<n>/target`), so its incremental state stays valid.
+A target directory never sees a second path: sharing one between paths
+lets Cargo judge stale artifacts fresh.
+
+### One caveat
+
+Snapshot trees are not referenced by any branch, so git's garbage
+collection may delete them, by default once they are two weeks old. A
+build needs its tree for seconds, so this is harmless; it does mean a
+revision id is a short-lived build handle, not a name to keep.
+
 ## Use
 
 ```sh
