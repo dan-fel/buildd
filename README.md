@@ -189,7 +189,7 @@ worktree's folder.
 
 ## Watching it: `buildd top`
 
-![buildd top in real use: three 40 GiB slots running full-workspace tests and Clippy for agent worktrees, two builds queued, and recent events](docs/top.svg)
+![buildd top in real use: three 40 GiB slots running full-workspace tests and Clippy for agent worktrees, two builds queued, and recent events](assets/top.svg)
 
 From real use, with names changed: eleven agent worktrees of one
 workspace shared three 40 GiB slots for 1 h 38 min. All three slots run

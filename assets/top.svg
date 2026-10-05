@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1195" height="792" viewBox="0 0 1195 792">
+<title>buildd top during real use, names changed</title>
+<rect width="1195" height="792" rx="10" fill="#1b1d23"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f57"/><circle cx="40" cy="17" r="6" fill="#febc2e"/><circle cx="60" cy="17" r="6" fill="#28c840"/>
+<g font-family="SF Mono, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" fill="#d7dae0" xml:space="preserve">
+<rect x="22.2" y="80.5" width="1150.8" height="133.0" fill="none" stroke="#7f848e" stroke-width="1"/>
+<rect x="26.4" y="77.5" width="58.8" height="6" fill="#1b1d23"/>
+<rect x="22.2" y="232.5" width="1150.8" height="57.0" fill="none" stroke="#7f848e" stroke-width="1"/>
+<rect x="26.4" y="229.5" width="58.8" height="6" fill="#1b1d23"/>
+<rect x="22.2" y="308.5" width="1150.8" height="114.0" fill="none" stroke="#7f848e" stroke-width="1"/>
+<rect x="26.4" y="305.5" width="109.2" height="6" fill="#1b1d23"/>
+<rect x="22.2" y="441.5" width="1150.8" height="304.0" fill="none" stroke="#7f848e" stroke-width="1"/>
+<rect x="26.4" y="438.5" width="67.2" height="6" fill="#1b1d23"/>
+<rect x="18.0" y="52" width="67.2" height="19" fill="#d7dae0"/>
+<text x="18.0" y="66" textLength="67.2" lengthAdjust="spacingAndGlyphs" fill="#1b1d23" font-weight="bold"> buildd </text>
+<text x="85.2" y="66" textLength="571.2" lengthAdjust="spacingAndGlyphs" >  up 1h38m · 3 slots × 40.0 GiB · jobs 12/12 in use · disk 117.4 GiB</text>
+<text x="26.4" y="85" textLength="58.8" lengthAdjust="spacingAndGlyphs" > slots </text>
+<text x="26.4" y="104" textLength="226.8" lengthAdjust="spacingAndGlyphs" font-weight="bold">app-9e41c07d2b5a8f36/0     </text>
+<text x="253.2" y="104" textLength="193.2" lengthAdjust="spacingAndGlyphs" fill="#56b6c2">[███████████░] 39.1 GiB</text>
+<text x="463.2" y="104" textLength="571.2" lengthAdjust="spacingAndGlyphs" fill="#e5c07b">clippy --workspace --all-targets -- -D warnings @ 4c8e2a91f0  20.4 s</text>
+<text x="26.4" y="123" textLength="126.0" lengthAdjust="spacingAndGlyphs" >    for agent-2</text>
+<text x="152.4" y="123" textLength="218.4" lengthAdjust="spacingAndGlyphs" >  compiled 65 · reused 484</text>
+<text x="26.4" y="142" textLength="226.8" lengthAdjust="spacingAndGlyphs" font-weight="bold">app-9e41c07d2b5a8f36/1     </text>
+<text x="253.2" y="142" textLength="193.2" lengthAdjust="spacingAndGlyphs" fill="#56b6c2">[███████████░] 39.1 GiB</text>
+<text x="463.2" y="142" textLength="445.2" lengthAdjust="spacingAndGlyphs" fill="#e5c07b">test --workspace --no-fail-fast @ b07d5e3a12  731.2 s</text>
+<text x="26.4" y="161" textLength="126.0" lengthAdjust="spacingAndGlyphs" >    for agent-1</text>
+<text x="152.4" y="161" textLength="226.8" lengthAdjust="spacingAndGlyphs" >  compiled 145 · reused 471</text>
+<text x="26.4" y="180" textLength="226.8" lengthAdjust="spacingAndGlyphs" font-weight="bold">app-9e41c07d2b5a8f36/2     </text>
+<text x="253.2" y="180" textLength="193.2" lengthAdjust="spacingAndGlyphs" fill="#56b6c2">[███████████░] 39.3 GiB</text>
+<text x="463.2" y="180" textLength="310.8" lengthAdjust="spacingAndGlyphs" fill="#e5c07b">test --workspace @ 4c8e2a91f0  19.3 s</text>
+<text x="26.4" y="199" textLength="126.0" lengthAdjust="spacingAndGlyphs" >    for agent-2</text>
+<text x="152.4" y="199" textLength="218.4" lengthAdjust="spacingAndGlyphs" >  compiled 26 · reused 356</text>
+<text x="26.4" y="237" textLength="58.8" lengthAdjust="spacingAndGlyphs" > queue </text>
+<text x="26.4" y="256" textLength="739.2" lengthAdjust="spacingAndGlyphs" >1. agent-4  test -p app-ui --lib -- scroll_keeps_its_anchor @ 7a19c4e6d3  waiting 68.5 s</text>
+<text x="26.4" y="275" textLength="596.4" lengthAdjust="spacingAndGlyphs" >2. agent-1  test -p app-server --test load @ b07d5e3a12  waiting 30.9 s</text>
+<text x="26.4" y="313" textLength="109.2" lengthAdjust="spacingAndGlyphs" > since start </text>
+<text x="26.4" y="332" textLength="243.6" lengthAdjust="spacingAndGlyphs" font-weight="bold">requests 129 → Cargo runs 120</text>
+<text x="270.0" y="332" textLength="428.4" lengthAdjust="spacingAndGlyphs" >    shared 0 · replaced 5 · dropped 2 · cancelled 1</text>
+<text x="26.4" y="351" textLength="159.6" lengthAdjust="spacingAndGlyphs" fill="#98c379">crates reused 77.0%</text>
+<text x="186.0" y="351" textLength="285.6" lengthAdjust="spacingAndGlyphs" >  (36197 of 47031; compiled 10834)</text>
+<text x="26.4" y="370" textLength="294.0" lengthAdjust="spacingAndGlyphs" >CPU 30310.1 s across 120 Cargo runs</text>
+<text x="26.4" y="389" textLength="386.4" lengthAdjust="spacingAndGlyphs" >new worktrees starting on a warm slot: 2 of 11</text>
+<text x="26.4" y="408" textLength="747.6" lengthAdjust="spacingAndGlyphs" >disk 117.4 GiB for 11 worktrees · separate targets ≈ 11 × 39.1 GiB = 430.5 GiB (estimate)</text>
+<text x="26.4" y="446" textLength="67.2" lengthAdjust="spacingAndGlyphs" > events </text>
+<text x="26.4" y="465" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e"> 19s  </text>
+<text x="76.8" y="465" textLength="604.8" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 started test --workspace @ 4c8e2a91f0 for agent-2</text>
+<text x="26.4" y="484" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e"> 19s  </text>
+<text x="76.8" y="484" textLength="949.2" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 finished test -p app-core -- cache session in 49.4 s: compiled 57, reused 265, CPU 209.9 s</text>
+<text x="26.4" y="503" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e"> 20s  </text>
+<text x="76.8" y="503" textLength="865.2" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/0 started clippy --workspace --all-targets -- -D warnings @ 4c8e2a91f0 for agent-2</text>
+<text x="26.4" y="522" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e"> 20s  </text>
+<text x="76.8" y="522" textLength="814.8" lengthAdjust="spacingAndGlyphs" fill="#e06c75">app-9e41c07d2b5a8f36/0 failed test --workspace in 378.9 s: compiled 138, reused 478, CPU 1368.0 s</text>
+<text x="26.4" y="541" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  1m  </text>
+<text x="76.8" y="541" textLength="722.4" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 started test -p app-core -- cache session @ e5f2083b9c for main</text>
+<text x="26.4" y="560" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  1m  </text>
+<text x="76.8" y="560" textLength="1058.4" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 finished test -p app-ui --lib -- scroll_keeps_its_anchor in 54.8 s: compiled 21, reused 381, CPU 66.5 s</text>
+<text x="26.4" y="579" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  2m  </text>
+<text x="76.8" y="579" textLength="1083.6" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 started test -p app-ui --lib -- scroll_keeps_its_anchor @ 7a19c4e6d3 for agent-4 (first time in this slot)</text>
+<text x="26.4" y="598" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  3m  </text>
+<text x="76.8" y="598" textLength="1075.2" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 finished clippy --workspace --all-targets -- -D warnings in 49.0 s: compiled 123, reused 506, CPU 148.8 s</text>
+<text x="26.4" y="617" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  3m  </text>
+<text x="76.8" y="617" textLength="865.2" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 started clippy --workspace --all-targets -- -D warnings @ 7a19c4e6d3 for agent-4</text>
+<text x="26.4" y="636" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  5m  </text>
+<text x="76.8" y="636" textLength="604.8" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 started test --workspace @ 31ad97f4be for agent-2</text>
+<text x="26.4" y="655" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  6m  </text>
+<text x="76.8" y="655" textLength="747.6" lengthAdjust="spacingAndGlyphs" fill="#61afef">app-9e41c07d2b5a8f36/2 pruned 42.6 GiB → 39.3 GiB: 55 old caches, 77 stale compiled units</text>
+<text x="26.4" y="674" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  6m  </text>
+<text x="76.8" y="674" textLength="579.6" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/0 started test --workspace @ e5f2083b9c for main</text>
+<text x="26.4" y="693" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  6m  </text>
+<text x="76.8" y="693" textLength="882.0" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 finished test -p app-store -- index:: in 16.1 s: compiled 5, reused 91, CPU 25.6 s</text>
+<text x="26.4" y="712" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  8m  </text>
+<text x="76.8" y="712" textLength="613.2" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 started test -p app-store @ 7a19c4e6d3 for agent-4</text>
+<text x="26.4" y="731" textLength="50.4" lengthAdjust="spacingAndGlyphs" fill="#7f848e">  8m  </text>
+<text x="76.8" y="731" textLength="1075.2" lengthAdjust="spacingAndGlyphs" >app-9e41c07d2b5a8f36/2 finished clippy --workspace --all-targets -- -D warnings in 49.6 s: compiled 145, reused 484, CPU 179.4 s</text>
+<text x="18.0" y="769" textLength="58.8" lengthAdjust="spacingAndGlyphs" fill="#7f848e"> q quit</text>
+</g></svg>
