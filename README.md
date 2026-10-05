@@ -37,10 +37,15 @@ share one CPU budget instead of each assuming it owns the machine.
 - **Disk limit.** A slot's target is kept within `slot_limit_gib` once the
   slot has been idle for two seconds, so measuring it never delays the next
   build of a session running several in a row, and right after a build once
-  eight builds went unmeasured. Incremental caches go first, least recently
-  compiled first; the whole target goes only when its compiled artifacts
-  alone exceed the limit. Build disk per repository is therefore at most
-  `slots` times the limit, plus what builds add between measurements.
+  eight builds went unmeasured. It removes what builds used longest ago
+  first: incremental caches, and compiled units (a crate's outputs,
+  fingerprint and build-script directory, all named by its hash). The daemon
+  records when builds use each unit from Cargo's own reports, so units of
+  old feature sets, profiles and dependency versions go before ones in use;
+  Cargo just recompiles a removed unit if a build needs it again. The whole
+  target goes only when nothing else is left. Build disk per repository is
+  therefore at most `slots` times the limit, plus what builds add between
+  measurements.
 - **Sizing.** A slot's limit must hold the working set of the builds it
   serves; below that, keeping to it removes caches in use and those builds
   compile from scratch, many times slower. `buildd status` and the daemon
@@ -257,8 +262,6 @@ library's `client` module is what other programs integrate with.
 
 - Memory-aware admission and priorities: builds start first come, first
   served, at most `slots` at once.
-- Eviction of stale compiled artifacts (old feature sets and profiles) short
-  of clearing the whole target.
 - A `cargo` shim that routes agents' own Cargo calls to the daemon.
 - Client environment: Cargo runs with the daemon's environment, so a
   client's `RUSTFLAGS` or `RUST_LOG` do not reach the build.

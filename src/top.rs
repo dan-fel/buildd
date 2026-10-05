@@ -381,7 +381,8 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             slot,
             before,
             after,
-            removed,
+            caches,
+            units,
             in_use,
             cleared,
         } => {
@@ -396,7 +397,8 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             } else if *in_use > 0 {
                 (
                     format!(
-                        "{slot} pruned {} → {}, {removed} caches, {in_use} in use: limit too small",
+                        "{slot} pruned {} → {}: {caches} caches, {units} compiled units, \
+                         {in_use} in use: limit too small",
                         gib(*before),
                         gib(*after)
                     ),
@@ -405,7 +407,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             } else {
                 (
                     format!(
-                        "{slot} pruned {} → {}, {removed} old caches",
+                        "{slot} pruned {} → {}: {caches} old caches, {units} stale compiled units",
                         gib(*before),
                         gib(*after)
                     ),

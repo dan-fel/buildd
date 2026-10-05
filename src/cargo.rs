@@ -160,13 +160,15 @@ pub(crate) fn command(
 }
 
 /// A line of Cargo's standard output, as the daemon treats it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Line {
-    /// A crate Cargo compiled, or found up to date when `fresh`. Its message
-    /// names paths inside the slot, which mean nothing to a client.
-    Crate { fresh: bool },
-    /// A build script's report, also naming paths inside the slot.
-    BuildScript,
+    /// A crate Cargo compiled, or found up to date when `fresh`, with the
+    /// files it produced. Its message names paths inside the slot, which
+    /// mean nothing to a client.
+    Crate { fresh: bool, outputs: Vec<PathBuf> },
+    /// A build script's report, with the directory it wrote; also inside the
+    /// slot.
+    BuildScript { out_dir: PathBuf },
     /// Diagnostics, the final build message and every other line (test
     /// output): for the client.
     Forward,
@@ -179,16 +181,25 @@ impl Line {
             reason: &'a str,
             #[serde(default)]
             fresh: bool,
+            #[serde(default)]
+            filenames: Vec<PathBuf>,
+            out_dir: Option<PathBuf>,
         }
         match serde_json::from_str::<Message<'_>>(line) {
             Ok(Message {
                 reason: "compiler-artifact",
                 fresh,
-            }) => Self::Crate { fresh },
+                filenames,
+                ..
+            }) => Self::Crate {
+                fresh,
+                outputs: filenames,
+            },
             Ok(Message {
                 reason: "build-script-executed",
+                out_dir: Some(out_dir),
                 ..
-            }) => Self::BuildScript,
+            }) => Self::BuildScript { out_dir },
             _ => Self::Forward,
         }
     }
@@ -234,15 +245,23 @@ mod tests {
     fn crates_are_counted_and_slot_paths_held_back() {
         assert_eq!(
             Line::of(r#"{"reason":"compiler-artifact","filenames":["/slot/x"],"fresh":true}"#),
-            Line::Crate { fresh: true }
+            Line::Crate {
+                fresh: true,
+                outputs: vec!["/slot/x".into()]
+            }
         );
         assert_eq!(
             Line::of(r#"{"reason":"compiler-artifact","fresh":false}"#),
-            Line::Crate { fresh: false }
+            Line::Crate {
+                fresh: false,
+                outputs: Vec::new()
+            }
         );
         assert_eq!(
             Line::of(r#"{"reason":"build-script-executed","out_dir":"/slot/x"}"#),
-            Line::BuildScript
+            Line::BuildScript {
+                out_dir: "/slot/x".into()
+            }
         );
         for forwarded in [
             r#"{"reason":"compiler-message","message":{"rendered":"x"}}"#,

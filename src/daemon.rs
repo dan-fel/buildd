@@ -53,10 +53,17 @@ enum Event {
         job: JobId,
         message: Message,
     },
-    /// Cargo reported a crate of `job`, up to date when `fresh`.
+    /// Cargo reported a crate of `job`, up to date when `fresh`, as
+    /// compiled `unit` when its files name one.
     Crate {
         job: JobId,
         fresh: bool,
+        unit: Option<String>,
+    },
+    /// A build script of `job` ran, writing into compiled `unit`.
+    BuildScript {
+        job: JobId,
+        unit: String,
     },
     /// Cargo ended, having used `usage` when it ran.
     Exited {
@@ -64,11 +71,12 @@ enum Event {
         outcome: Outcome,
         usage: Option<Usage>,
     },
-    /// Slot `key` was kept within its disk limit by `pruning`; None when
-    /// that failed.
+    /// Slot `key` was kept within its disk limit by `pruning`, removing
+    /// compiled units `evicted`; None when that failed.
     Maintained {
         key: SlotKey,
         pruning: Option<Pruning>,
+        evicted: Vec<String>,
     },
 }
 
@@ -374,8 +382,12 @@ impl Daemon {
                     Vec::new()
                 }
                 Event::Output { job, message } => self.scheduler.output(job, message),
-                Event::Crate { job, fresh } => {
-                    self.scheduler.crate_built(job, fresh);
+                Event::Crate { job, fresh, unit } => {
+                    self.scheduler.crate_built(job, fresh, unit);
+                    Vec::new()
+                }
+                Event::BuildScript { job, unit } => {
+                    self.scheduler.unit_used(job, unit);
                     Vec::new()
                 }
                 Event::Exited {
@@ -386,7 +398,11 @@ impl Daemon {
                     self.runs.remove(&job);
                     self.scheduler.exited(job, &outcome, usage)
                 }
-                Event::Maintained { key, pruning } => self.scheduler.maintained(key, pruning),
+                Event::Maintained {
+                    key,
+                    pruning,
+                    evicted,
+                } => self.scheduler.maintained(key, pruning, &evicted),
             };
             for effect in effects {
                 self.apply(effect);
@@ -461,6 +477,7 @@ impl Daemon {
                 key,
                 repository,
                 slot,
+                used,
             } => {
                 let directory = SlotDirectory::new(&self.home, &repository, slot);
                 let name = slot_name(&repository, slot);
@@ -469,12 +486,20 @@ impl Daemon {
                 let spawned = std::thread::Builder::new()
                     .name("buildd-maintain".into())
                     .spawn(move || {
-                        let pruning = maintain(&directory, &name, limit);
-                        let _ = events.send(Event::Maintained { key, pruning });
+                        let (pruning, evicted) = maintain(&directory, &name, limit, &used);
+                        let _ = events.send(Event::Maintained {
+                            key,
+                            pruning,
+                            evicted,
+                        });
                     });
                 if let Err(error) = spawned {
                     eprintln!("buildd: could not start maintaining a slot: {error}");
-                    let _ = self.events.send(Event::Maintained { key, pruning: None });
+                    let _ = self.events.send(Event::Maintained {
+                        key,
+                        pruning: None,
+                        evicted: Vec::new(),
+                    });
                 }
             }
             Effect::Cancel { job } => {
@@ -548,25 +573,32 @@ fn kill_leftovers(group: Pid) {
     }
 }
 
-/// Keeps slot `directory` within `limit`; what that did, when it worked.
-fn maintain(directory: &SlotDirectory, name: &str, limit: u64) -> Option<Pruning> {
-    match directory.enforce_limit(limit) {
-        Ok(pruning) => {
+/// Keeps slot `directory` within `limit`, knowing when builds last `used`
+/// each compiled unit: what that did when it worked, and the units it removed.
+fn maintain(
+    directory: &SlotDirectory,
+    name: &str,
+    limit: u64,
+    used: &HashMap<String, u64>,
+) -> (Option<Pruning>, Vec<String>) {
+    match directory.enforce_limit(limit, used) {
+        Ok((pruning, evicted)) => {
             match pruning {
                 Pruning::Within { .. } => {}
-                Pruning::Incremental {
+                Pruning::Evicted {
                     before,
                     after,
-                    removed,
+                    caches,
+                    units,
                     in_use,
                 } => eprintln!(
-                    "buildd: slot {name} used {}: removed {removed} incremental caches \
-                     ({in_use} in use), {} left",
+                    "buildd: slot {name} used {}: removed {caches} incremental caches and \
+                     {units} compiled units ({in_use} in use), {} left",
                     gib(before),
                     gib(after)
                 ),
                 Pruning::Cleared { before } => eprintln!(
-                    "buildd: slot {name} used {} beyond incremental caches: cleared its target",
+                    "buildd: slot {name} used {} with nothing left to remove: cleared its target",
                     gib(before)
                 ),
             }
@@ -577,11 +609,11 @@ fn maintain(directory: &SlotDirectory, name: &str, limit: u64) -> Option<Pruning
                     gib(limit)
                 );
             }
-            Some(pruning)
+            (Some(pruning), evicted)
         }
         Err(error) => {
             eprintln!("buildd: slot {name} could not be kept within its limit: {error}");
-            None
+            (None, Vec::new())
         }
     }
 }
@@ -684,8 +716,9 @@ impl Building {
         let (done, finished) = crossbeam_channel::bounded(2);
         let stdout = child.stdout.take().expect("cargo's output is piped");
         let stderr = child.stderr.take().expect("cargo's errors are piped");
-        self.forward(stdout, true, done.clone());
-        self.forward(stderr, false, done);
+        let target = self.slot.target();
+        self.forward(stdout, Some(target), done.clone());
+        self.forward(stderr, None, done);
 
         let pid = Pid::from_child(&child);
         // Wait without reaping, so Cargo's process group id cannot be reused
@@ -715,8 +748,15 @@ impl Building {
         (outcome(status), Some(usage))
     }
 
-    /// Sends each line of `output` to the scheduler on a thread of its own.
-    fn forward(&self, output: impl std::io::Read + Send + 'static, stdout: bool, done: Sender<()>) {
+    /// Sends each line of `output` to the scheduler on a thread of its own:
+    /// Cargo's standard output, whose messages name files in `target`, or
+    /// its standard error when `target` is None.
+    fn forward(
+        &self,
+        output: impl std::io::Read + Send + 'static,
+        target: Option<PathBuf>,
+        done: Sender<()>,
+    ) {
         let events = self.events.clone();
         let job = self.start.job;
         let spawned = std::thread::Builder::new()
@@ -729,20 +769,27 @@ impl Building {
                         .trim_end_matches(['\n', '\r'])
                         .to_owned();
                     bytes.clear();
-                    let event = if !stdout {
-                        Event::Output {
+                    let event = match &target {
+                        None => Event::Output {
                             job,
                             message: Message::Stderr { line },
-                        }
-                    } else {
-                        match Line::of(&line) {
-                            Line::Crate { fresh } => Event::Crate { job, fresh },
-                            Line::BuildScript => continue,
+                        },
+                        Some(target) => match Line::of(&line) {
+                            Line::Crate { fresh, outputs } => Event::Crate {
+                                job,
+                                fresh,
+                                unit: outputs.iter().find_map(|path| slot::unit_key(target, path)),
+                            },
+                            Line::BuildScript { out_dir } => match slot::unit_key(target, &out_dir)
+                            {
+                                Some(unit) => Event::BuildScript { job, unit },
+                                None => continue,
+                            },
                             Line::Forward => Event::Output {
                                 job,
                                 message: Message::Stdout { line },
                             },
-                        }
+                        },
                     };
                     if events.send(event).is_err() {
                         break;

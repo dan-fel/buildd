@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::cargo::{Compilation, Operation};
 use crate::protocol::{EventKind, Message, Outcome, QueuedBuild, RunningBuild, SlotStatus, Usage};
@@ -83,11 +83,13 @@ pub(crate) enum Effect {
     Cancel {
         job: JobId,
     },
-    /// Keep slot `slot` of `repository` within its disk limit.
+    /// Keep slot `slot` of `repository` within its disk limit, knowing when
+    /// builds last `used` each compiled unit.
     Maintain {
         key: SlotKey,
         repository: PathBuf,
         slot: usize,
+        used: HashMap<String, u64>,
     },
     /// Something happened, for people watching.
     Report(EventKind),
@@ -175,6 +177,9 @@ struct Slot {
     undersized: bool,
     /// The compilations it did since its target was last cleared.
     compiled: HashSet<Compilation>,
+    /// When a build last used each compiled unit, in seconds since the Unix
+    /// epoch.
+    units: HashMap<String, u64>,
 }
 
 impl Slot {
@@ -192,6 +197,11 @@ impl Slot {
             record: SlotRecord {
                 worktree: self.worktree.clone(),
                 compiled,
+                units: self
+                    .units
+                    .iter()
+                    .map(|(unit, used)| (unit.clone(), *used))
+                    .collect(),
             },
         }
     }
@@ -295,6 +305,7 @@ impl<D: Distance> Scheduler<D> {
             size: None,
             undersized: false,
             compiled: record.compiled.into_iter().collect(),
+            units: record.units.into_iter().collect(),
         });
     }
 
@@ -480,8 +491,8 @@ impl<D: Distance> Scheduler<D> {
     }
 
     /// Cargo reported a crate of running job `id`: compiled, or up to date
-    /// when `fresh`.
-    pub(crate) fn crate_built(&mut self, id: JobId, fresh: bool) {
+    /// when `fresh`, as compiled `unit` when its files name one.
+    pub(crate) fn crate_built(&mut self, id: JobId, fresh: bool, unit: Option<String>) {
         // Like output, a report can arrive after the build ended.
         if let Some(job) = self.jobs.get_mut(&id) {
             if fresh {
@@ -490,6 +501,25 @@ impl<D: Distance> Scheduler<D> {
                 job.compiled += 1;
             }
         }
+        if let Some(unit) = unit {
+            self.unit_used(id, unit);
+        }
+    }
+
+    /// Running job `id` used compiled `unit`, such as a build script's output.
+    pub(crate) fn unit_used(&mut self, id: JobId, unit: String) {
+        let Some(Job {
+            state: State::Running { slot, .. },
+            ..
+        }) = self.jobs.get(&id)
+        else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_secs();
+        self.slots[*slot].units.insert(unit, now);
     }
 
     /// Running job `id` ended with `outcome`, having used `usage` when Cargo
@@ -555,6 +585,7 @@ impl<D: Distance> Scheduler<D> {
             key: SlotKey(index),
             repository: slot.repository.clone(),
             slot: slot.index,
+            used: slot.units.clone(),
         }
     }
 
@@ -582,9 +613,14 @@ impl<D: Distance> Scheduler<D> {
         due.into_iter().map(|index| self.maintain(index)).collect()
     }
 
-    /// Slot `key` was kept within its disk limit by `pruning`; None when
-    /// that failed.
-    pub(crate) fn maintained(&mut self, key: SlotKey, pruning: Option<Pruning>) -> Vec<Effect> {
+    /// Slot `key` was kept within its disk limit by `pruning`, which removed
+    /// compiled units `evicted`; None when that failed.
+    pub(crate) fn maintained(
+        &mut self,
+        key: SlotKey,
+        pruning: Option<Pruning>,
+        evicted: &[String],
+    ) -> Vec<Effect> {
         let slot = &mut self.slots[key.0];
         assert!(
             slot.maintaining,
@@ -595,23 +631,31 @@ impl<D: Distance> Scheduler<D> {
         slot.size = pruning.map(Pruning::size);
         slot.undersized = pruning.is_some_and(Pruning::undersized);
         let mut effects = Vec::new();
+        for unit in evicted {
+            slot.units.remove(unit);
+        }
         if let Some(Pruning::Cleared { .. }) = pruning {
             slot.compiled.clear();
+            slot.units.clear();
+        }
+        if !evicted.is_empty() || matches!(pruning, Some(Pruning::Cleared { .. })) {
             effects.push(slot.persist());
         }
         let name = slot_name(&slot.repository, slot.index);
         let report = match pruning {
             None | Some(Pruning::Within { .. }) => None,
-            Some(Pruning::Incremental {
+            Some(Pruning::Evicted {
                 before,
                 after,
-                removed,
+                caches,
+                units,
                 in_use,
             }) => Some(EventKind::Pruned {
                 slot: name,
                 before,
                 after,
-                removed,
+                caches,
+                units,
                 in_use,
                 cleared: false,
             }),
@@ -619,7 +663,8 @@ impl<D: Distance> Scheduler<D> {
                 slot: name,
                 before,
                 after: 0,
-                removed: 0,
+                caches: 0,
+                units: 0,
                 in_use: 0,
                 cleared: true,
             }),
@@ -745,6 +790,7 @@ impl<D: Distance> Scheduler<D> {
             size: None,
             undersized: false,
             compiled: HashSet::new(),
+            units: HashMap::new(),
         });
         Some(self.slots.len() - 1)
     }
@@ -1103,7 +1149,7 @@ mod tests {
         let (slots, queue) = scheduler.status();
         assert!(slots[0].maintaining && slots[0].build.is_none());
         assert_eq!(queue.len(), 1);
-        let ready = scheduler.maintained(SlotKey(0), Some(Pruning::Within { size: 5 }));
+        let ready = scheduler.maintained(SlotKey(0), Some(Pruning::Within { size: 5 }), &[]);
         assert!(
             matches!(starts(&ready)[..], [(_, 0, ref tree)] if tree == "a2"),
             "the waiting build takes its warm slot"
@@ -1156,8 +1202,8 @@ mod tests {
         let mut scheduler = checked_and_tested();
         let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
         assert_eq!(maintains(&maintain), [0, 1]);
-        scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 9 }));
-        scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }));
+        scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 9 }), &[]);
+        scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }), &[]);
         assert!(scheduler.slots[0].compiled.is_empty());
         assert!(scheduler.status().0[0].undersized);
         assert_eq!(scheduler.slots[1].compiled.len(), 1);
@@ -1231,9 +1277,9 @@ mod tests {
             ] if who == "c" && from.to_string() == "c1" && to.to_string() == "c2"
         ));
 
-        scheduler.crate_built(job, false);
-        scheduler.crate_built(job, true);
-        scheduler.crate_built(job, true);
+        scheduler.crate_built(job, false, None);
+        scheduler.crate_built(job, true, None);
+        scheduler.crate_built(job, true, None);
         let (slots, _) = scheduler.status();
         let running = slots[0].build.as_ref().expect("t1 runs");
         assert_eq!((running.compiled, running.fresh), (1, 2));
@@ -1279,7 +1325,7 @@ mod tests {
         assert_eq!(record.compiled, [Compilation::new(Path::new(""), &check())]);
         // A cleared target forgets them, and that is persisted too.
         scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
-        let cleared = scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 1 }));
+        let cleared = scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 1 }), &[]);
         assert!(matches!(persisted(&cleared)[..], [(0, record)] if record.compiled.is_empty()));
     }
 
@@ -1289,6 +1335,7 @@ mod tests {
         let record = SlotRecord {
             worktree: Some("/work/a".into()),
             compiled: vec![Compilation::new(Path::new(""), &check())],
+            ..SlotRecord::default()
         };
         scheduler.restore(
             "/repo/.git".into(),
@@ -1316,5 +1363,46 @@ mod tests {
         // Both restored slots are busy: the new one takes the free index 1.
         let third = submit(&mut scheduler, 3, "/work/c", "c1");
         assert!(matches!(starts(&third)[..], [(_, 1, _)]));
+    }
+
+    #[test]
+    fn units_builds_use_are_recorded_handed_to_maintenance_and_forgotten_when_evicted() {
+        let mut scheduler = scheduler(1);
+        let first = submit(&mut scheduler, 1, "/work/a", "a1");
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}");
+        };
+        scheduler.crate_built(job, true, Some("debug/aaaaaaaaaaaaaaaa".into()));
+        scheduler.unit_used(job, "debug/bbbbbbbbbbbbbbbb".into());
+        let finished = scheduler.exited(job, &ok(), None);
+        let [(0, record)] = persisted(&finished)[..] else {
+            panic!("{finished:?}");
+        };
+        assert_eq!(
+            record.units.keys().collect::<Vec<_>>(),
+            ["debug/aaaaaaaaaaaaaaaa", "debug/bbbbbbbbbbbbbbbb"]
+        );
+        let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
+        let [Effect::Maintain { used, .. }] = &maintain[..] else {
+            panic!("{maintain:?}");
+        };
+        assert_eq!(used.len(), 2);
+        let pruning = Pruning::Evicted {
+            before: 2,
+            after: 1,
+            caches: 0,
+            units: 1,
+            in_use: 0,
+        };
+        let done = scheduler.maintained(
+            SlotKey(0),
+            Some(pruning),
+            &["debug/aaaaaaaaaaaaaaaa".into()],
+        );
+        assert!(matches!(persisted(&done)[..], [(0, record)] if record.units.len() == 1));
+        assert!(matches!(
+            reports(&done)[..],
+            [EventKind::Pruned { units: 1, .. }]
+        ));
     }
 }

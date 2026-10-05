@@ -251,14 +251,15 @@ pub enum EventKind {
         operation: Operation,
         revision: Revision,
     },
-    /// A slot was kept within its limit: `removed` incremental caches went,
-    /// `in_use` of them compiled in the last ten minutes, or the whole target
-    /// when `cleared`.
+    /// A slot was kept within its limit: `caches` incremental caches and
+    /// `units` compiled units went, `in_use` of them used in the last ten
+    /// minutes, or the whole target when `cleared`.
     Pruned {
         slot: String,
         before: u64,
         after: u64,
-        removed: usize,
+        caches: usize,
+        units: usize,
         in_use: usize,
         cleared: bool,
     },
