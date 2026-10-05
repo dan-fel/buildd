@@ -239,7 +239,7 @@ mod tests {
         }
         for args in [
             &[][..],
-            &["-p", "jaide-gui", "--lib"],
+            &["-p", "app-ui", "--lib"],
             &["--release", "--features", "x"],
             &["--", "--nocapture", "-Zunstable-options", "--target-dir"],
             &["--target-dirs"],

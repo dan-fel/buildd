@@ -493,14 +493,14 @@ mod tests {
                 slot_limit: 20 << 30,
                 slots: vec![
                     SlotStatus {
-                        name: "jaide-c716/0".into(),
+                        name: "app-c716/0".into(),
                         worktree: Some("/work/agent-1".into()),
                         size: Some(14 << 30),
                         maintaining: false,
                         undersized: false,
                         build: Some(RunningBuild {
                             revision: tree("7f3a9c0d1e2f"),
-                            operation: check("jaide-gui"),
+                            operation: check("app-ui"),
                             who: vec!["agent-1".into(), "agent-7".into()],
                             elapsed_ms: 4200,
                             compiled: 3,
@@ -509,7 +509,7 @@ mod tests {
                         }),
                     },
                     SlotStatus {
-                        name: "jaide-c716/1".into(),
+                        name: "app-c716/1".into(),
                         worktree: Some("/work/agent-2".into()),
                         size: Some(10 << 30),
                         maintaining: false,
@@ -519,7 +519,7 @@ mod tests {
                 ],
                 queue: vec![QueuedBuild {
                     revision: tree("3d2e00000000"),
-                    operation: check("jaide-mcp"),
+                    operation: check("app-protocol"),
                     who: vec!["agent-5".into()],
                     waited_ms: 2100,
                 }],
@@ -545,7 +545,7 @@ mod tests {
                     kind: EventKind::Requested {
                         who: "agent-3".into(),
                         worktree: "/work/agent-3".into(),
-                        operation: check("jaide-domain"),
+                        operation: check("app-model"),
                         revision: tree("aaaa"),
                         shared: false,
                     },
@@ -553,9 +553,9 @@ mod tests {
                 Event {
                     at_ms: at(5),
                     kind: EventKind::Finished {
-                        slot: "jaide-c716/1".into(),
+                        slot: "app-c716/1".into(),
                         who: vec!["agent-2".into()],
-                        operation: check("jaide-engine"),
+                        operation: check("app-core"),
                         revision: tree("91c0"),
                         outcome: Outcome::Exited { code: 0 },
                         build_ms: 2100,
@@ -572,7 +572,7 @@ mod tests {
                     kind: EventKind::Requested {
                         who: "agent-7".into(),
                         worktree: "/work/agent-1".into(),
-                        operation: check("jaide-gui"),
+                        operation: check("app-ui"),
                         revision: tree("7f3a9c0d1e2f"),
                         shared: true,
                     },
@@ -601,16 +601,16 @@ mod tests {
         let text = screen(&Ok(sample(now)), now);
         for expected in [
             "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · disk 24.0 GiB",
-            "check -p jaide-gui @ 7f3a9c0d1e",
+            "check -p app-ui @ 7f3a9c0d1e",
             "for agent-1, agent-7  shared by 2  compiled 3 · reused 412",
             "last for agent-2  limit below what its builds use",
-            "1. agent-5  check -p jaide-mcp @ 3d2e000000  waiting 2.1 s",
+            "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",
             "new worktrees starting on a warm slot: 6 of 6",
             "separate targets ≈ 15 × 12.0 GiB = 180.0 GiB (estimate)",
-            "agent-7 joined check -p jaide-gui @ 7f3a9c0d1e: no extra Cargo run",
-            "jaide-c716/1 finished check -p jaide-engine in 2.1 s: compiled 2, reused 233, CPU 3.4 s",
+            "agent-7 joined check -p app-ui @ 7f3a9c0d1e: no extra Cargo run",
+            "app-c716/1 finished check -p app-core in 2.1 s: compiled 2, reused 233, CPU 3.4 s",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }

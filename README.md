@@ -57,10 +57,11 @@ share one CPU budget instead of each assuming it owns the machine.
   serves; below that, keeping to it removes caches in use and those builds
   compile from scratch, many times slower. `buildd status` and the daemon
   log flag such a slot. Fewer, larger slots beat more, smaller ones: on
-  Jaide, check and test builds of a few crates need 12–15 GiB per slot, and
-  4 slots of 8 GiB were several times slower than 2 of 15. Full-workspace
-  `test` and `clippy --all-targets` from several worktrees, as Jaide's
-  agents run them, need about 30 GiB per slot: at 20 GiB a slot's compiled
+  the 60-crate workspace buildd was built for, check and test builds of a
+  few crates need 12–15 GiB per slot, and 4 slots of 8 GiB were several
+  times slower than 2 of 15. Full-workspace `test` and
+  `clippy --all-targets` from several worktrees, as agents run them before
+  each commit, need about 30 GiB per slot: at 20 GiB a slot's compiled
   artifacts alone outgrew the limit and its target was cleared.
 
 ## Snapshots, trees and slots
@@ -188,30 +189,14 @@ worktree's folder.
 
 ## Watching it: `buildd top`
 
-```text
- buildd   up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · disk 24.0 GiB
-┌ slots ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│jaide-c716/0               [████████░░░░] 14.0 GiB  check -p jaide-gui @ 7f3a9c0d1e  4.2 s                            │
-│    for agent-1, agent-7  shared by 2  compiled 3 · reused 412                                                        │
-│jaide-c716/1               [██████░░░░░░] 10.0 GiB  idle                                                              │
-│    last for agent-2  limit below what its builds use                                                                 │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ queue ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│1. agent-5  check -p jaide-mcp @ 3d2e000000  waiting 2.1 s                                                            │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ since start ─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│requests 96 → Cargo runs 61    shared 21 · replaced 9 · dropped 1 · cancelled 5                                       │
-│crates reused 97.8%  (54106 of 55310; compiled 1204)                                                                  │
-│CPU 412.0 s across 61 Cargo runs                                                                                      │
-│new worktrees starting on a warm slot: 6 of 6                                                                         │
-│disk 24.0 GiB for 15 worktrees · separate targets ≈ 15 × 12.0 GiB = 180.0 GiB (estimate)                              │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ events ──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  2s  agent-7 joined check -p jaide-gui @ 7f3a9c0d1e: no extra Cargo run                                              │
-│  5s  jaide-c716/1 finished check -p jaide-engine in 2.1 s: compiled 2, reused 233, CPU 3.4 s                         │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- q quit
-```
+![buildd top in real use: three 40 GiB slots running full-workspace tests and Clippy for agent worktrees, two builds queued, and recent events](docs/top.svg)
+
+From real use, with names changed: eleven agent worktrees of one
+workspace shared three 40 GiB slots for 1 h 38 min. All three slots run
+full-workspace tests or Clippy while two builds wait, a pruning pass removed
+stale compiled units instead of clearing a target, and the daemon estimates
+that one target per worktree would have taken 430 GiB against the slots'
+117 GiB.
 
 What the numbers mean, all measured by the daemon since it started:
 

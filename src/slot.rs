@@ -792,11 +792,11 @@ mod tests {
         let target = Path::new("/slot/target");
         for (path, key) in [
             (
-                "debug/deps/libjaide_domain-0123456789abcdef.rlib",
+                "debug/deps/libapp_model-0123456789abcdef.rlib",
                 Some("debug/0123456789abcdef"),
             ),
             (
-                "debug/deps/jaide-fedcba9876543210",
+                "debug/deps/app-fedcba9876543210",
                 Some("debug/fedcba9876543210"),
             ),
             (
@@ -811,7 +811,7 @@ mod tests {
                 "aarch64-apple-darwin/release/deps/libx-0123456789abcdef.rmeta",
                 Some("aarch64-apple-darwin/release/0123456789abcdef"),
             ),
-            ("debug/jaide", None),
+            ("debug/app", None),
             ("debug/deps/libnohash.rlib", None),
             ("debug/deps/libshort-0123.rlib", None),
         ] {
@@ -973,10 +973,10 @@ mod tests {
 
     #[test]
     fn repositories_get_distinct_readable_slot_directories() {
-        let a = slot_name(Path::new("/work/jaide/.git"), 0);
-        let b = slot_name(Path::new("/other/jaide/.git"), 1);
-        assert!(a.starts_with("jaide-") && a.ends_with("/0"), "{a}");
-        assert!(b.starts_with("jaide-") && b.ends_with("/1"), "{b}");
+        let a = slot_name(Path::new("/work/app/.git"), 0);
+        let b = slot_name(Path::new("/other/app/.git"), 1);
+        assert!(a.starts_with("app-") && a.ends_with("/0"), "{a}");
+        assert!(b.starts_with("app-") && b.ends_with("/1"), "{b}");
         assert_ne!(a.trim_end_matches("/0"), b.trim_end_matches("/1"));
         assert!(slot_name(Path::new("/srv/bare.git"), 0).starts_with("bare.git-"));
     }
