@@ -4,7 +4,8 @@
 //! with [`Message`]s ending in [`Message::Finished`] or
 //! [`Message::Rejected`]. Closing the connection earlier withdraws the
 //! request; a build nobody waits for any more is cancelled. For
-//! [`Request::Status`] it answers with one [`Status`].
+//! [`Request::Status`] it answers with one [`Status`], for
+//! [`Request::Activity`] with one [`Activity`].
 
 use std::path::PathBuf;
 
@@ -21,6 +22,9 @@ pub enum Request {
     Build(BuildRequest),
     /// Describe the slots and the queue.
     Status,
+    /// Describe the slots and the queue, what the daemon did since it
+    /// started, and its recent events.
+    Activity,
 }
 
 /// A build of a worktree's current content.
@@ -30,6 +34,10 @@ pub struct BuildRequest {
     /// of the snapshot.
     pub directory: PathBuf,
     pub operation: Operation,
+    /// Who asks, for people watching: an agent's or a task's name. The
+    /// worktree's folder name when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// What the daemon tells a client about its build.
@@ -92,6 +100,10 @@ pub struct Status {
     pub jobs: usize,
     /// Of those, the ones no build holds now.
     pub idle_jobs: usize,
+    /// Builds that run at once, and slots per repository.
+    pub capacity: usize,
+    /// Disk a slot's target may keep between builds, in bytes.
+    pub slot_limit: u64,
     pub slots: Vec<SlotStatus>,
     /// Waiting builds, next first.
     pub queue: Vec<QueuedBuild>,
@@ -118,8 +130,12 @@ pub struct SlotStatus {
 pub struct RunningBuild {
     pub revision: Revision,
     pub operation: Operation,
-    pub waiters: usize,
+    /// Who waits for it, one entry per request it serves.
+    pub who: Vec<String>,
     pub elapsed_ms: u64,
+    /// Crates Cargo compiled so far, and crates it found up to date.
+    pub compiled: u64,
+    pub fresh: u64,
     /// Nobody waits for it any more; it is being stopped.
     pub cancelled: bool,
 }
@@ -129,9 +145,131 @@ pub struct RunningBuild {
 pub struct QueuedBuild {
     pub revision: Revision,
     pub operation: Operation,
-    /// The worktrees of its waiters.
-    pub worktrees: Vec<PathBuf>,
+    /// Who waits for it, one entry per request it serves.
+    pub who: Vec<String>,
     pub waited_ms: u64,
+}
+
+/// What `buildd top` shows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Activity {
+    pub status: Status,
+    /// When the daemon started, in milliseconds since the Unix epoch.
+    pub started_at_ms: u64,
+    /// Everything the daemon did since it started.
+    pub totals: Totals,
+    /// Its most recent events, oldest first.
+    pub events: Vec<Event>,
+}
+
+/// Counts since the daemon started, derived from its events.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Totals {
+    /// Build requests accepted.
+    pub requests: u64,
+    /// Of those, the ones served by a build another request started.
+    pub shared: u64,
+    /// Queued requests moved to a newer tree of their own worktree.
+    pub replaced: u64,
+    /// Cargo runs started.
+    pub builds: u64,
+    /// Queued builds nobody waited for any more.
+    pub dropped: u64,
+    /// Running builds stopped because nobody waited for them any more.
+    pub cancelled: u64,
+    /// Crates Cargo compiled, and crates it found up to date.
+    pub compiled: u64,
+    pub fresh: u64,
+    /// CPU time of every Cargo run and the compilers it started.
+    pub cpu_ms: u64,
+    /// Worktrees that asked for a build.
+    pub worktrees: u64,
+    /// Builds that were the first of their worktree, and of those, the ones
+    /// that ran in a slot that had already done their compilation.
+    pub first_builds: u64,
+    pub warm_first_builds: u64,
+}
+
+/// Something the daemon did.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    /// When, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
+    pub kind: EventKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventKind {
+    /// `who` asked for a build of their worktree; `shared` when an equal
+    /// build was already queued or running and serves it too.
+    Requested {
+        who: String,
+        worktree: PathBuf,
+        operation: Operation,
+        revision: Revision,
+        shared: bool,
+    },
+    /// `who`'s queued request now waits for a newer tree of its worktree.
+    Replaced {
+        who: String,
+        operation: Operation,
+        from: Revision,
+        to: Revision,
+    },
+    /// Cargo started. `warm` when the slot had done this compilation before;
+    /// `first` when this is the first build of its worktree.
+    Started {
+        slot: String,
+        who: Vec<String>,
+        operation: Operation,
+        revision: Revision,
+        warm: bool,
+        first: bool,
+    },
+    /// Cargo ended.
+    Finished {
+        slot: String,
+        who: Vec<String>,
+        operation: Operation,
+        revision: Revision,
+        outcome: Outcome,
+        build_ms: u64,
+        compiled: u64,
+        fresh: u64,
+        /// What Cargo and its compilers used, when it ran.
+        usage: Option<Usage>,
+    },
+    /// A queued build nobody waited for any more was dropped.
+    Dropped {
+        operation: Operation,
+        revision: Revision,
+    },
+    /// A running build nobody waited for any more was stopped.
+    Cancelled {
+        slot: String,
+        operation: Operation,
+        revision: Revision,
+    },
+    /// A slot was kept within its limit: `removed` incremental caches went,
+    /// `in_use` of them compiled in the last ten minutes, or the whole target
+    /// when `cleared`.
+    Pruned {
+        slot: String,
+        before: u64,
+        after: u64,
+        removed: usize,
+        in_use: usize,
+        cleared: bool,
+    },
+}
+
+/// What a Cargo run and the compilers it started used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub cpu_ms: u64,
+    /// The largest resident memory of any one of its processes, in bytes.
+    pub peak_memory: u64,
 }
 
 #[cfg(test)]
@@ -147,6 +285,7 @@ mod tests {
                 command: Command::Check,
                 args: vec!["-p".into(), "a".into()],
             },
+            label: None,
         });
         let text = serde_json::to_string(&request).unwrap();
         assert_eq!(

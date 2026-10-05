@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use buildd::cargo::{Command, Operation};
 use buildd::client;
-use buildd::protocol::{BuildRequest, Message, Outcome, Status};
+use buildd::protocol::{Activity, BuildRequest, EventKind, Message, Outcome, Status};
 
 /// A temporary directory, removed when dropped. Its path is short: socket
 /// paths are limited to about a hundred bytes.
@@ -69,6 +69,10 @@ impl Daemon {
         client::status(self.connect()).unwrap()
     }
 
+    fn activity(&self) -> Activity {
+        client::activity(self.connect()).unwrap()
+    }
+
     /// Builds and collects every message.
     fn build(&self, directory: &Path, command: Command, args: &[&str]) -> Vec<Message> {
         let mut messages = Vec::new();
@@ -98,6 +102,7 @@ fn request(directory: &Path, command: Command, args: &[&str]) -> BuildRequest {
             command,
             args: args.iter().map(|argument| (*argument).to_owned()).collect(),
         },
+        label: None,
     }
 }
 
@@ -265,6 +270,22 @@ fn equal_requests_share_one_cargo_run() {
     );
     // The second request never needed a second slot.
     assert_eq!(daemon.status().slots.len(), 1);
+
+    // The daemon tells people watching what it did.
+    let activity = daemon.activity();
+    let totals = &activity.totals;
+    assert_eq!((totals.requests, totals.shared, totals.builds), (2, 1, 1));
+    assert_eq!((totals.worktrees, totals.first_builds), (1, 1));
+    assert!(
+        totals.compiled >= 2,
+        "the build script and the library: {totals:?}"
+    );
+    assert!(totals.cpu_ms > 0, "{totals:?}");
+    let finished = activity.events.iter().find_map(|event| match &event.kind {
+        EventKind::Finished { who, usage, .. } => Some((who.len(), usage.is_some())),
+        _ => None,
+    });
+    assert_eq!(finished, Some((2, true)));
 }
 
 #[test]

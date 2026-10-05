@@ -133,21 +133,39 @@ pub(crate) fn command(
     command
 }
 
-/// Whether a line of Cargo's standard output goes to clients. Artifact and
-/// build-script messages name paths inside the slot, which mean nothing to a
-/// client; diagnostics, the final build message and every other line (test
-/// output) go through.
-pub(crate) fn forwarded(line: &str) -> bool {
-    #[derive(Deserialize)]
-    struct Message<'a> {
-        reason: &'a str,
+/// A line of Cargo's standard output, as the daemon treats it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Line {
+    /// A crate Cargo compiled, or found up to date when `fresh`. Its message
+    /// names paths inside the slot, which mean nothing to a client.
+    Crate { fresh: bool },
+    /// A build script's report, also naming paths inside the slot.
+    BuildScript,
+    /// Diagnostics, the final build message and every other line (test
+    /// output): for the client.
+    Forward,
+}
+
+impl Line {
+    pub(crate) fn of(line: &str) -> Self {
+        #[derive(Deserialize)]
+        struct Message<'a> {
+            reason: &'a str,
+            #[serde(default)]
+            fresh: bool,
+        }
+        match serde_json::from_str::<Message<'_>>(line) {
+            Ok(Message {
+                reason: "compiler-artifact",
+                fresh,
+            }) => Self::Crate { fresh },
+            Ok(Message {
+                reason: "build-script-executed",
+                ..
+            }) => Self::BuildScript,
+            _ => Self::Forward,
+        }
     }
-    serde_json::from_str::<Message<'_>>(line).map_or(true, |message| {
-        !matches!(
-            message.reason,
-            "compiler-artifact" | "build-script-executed"
-        )
-    })
 }
 
 #[cfg(test)]
@@ -187,19 +205,27 @@ mod tests {
     }
 
     #[test]
-    fn only_slot_paths_are_held_back() {
-        assert!(!forwarded(
-            r#"{"reason":"compiler-artifact","filenames":["/slot/x"]}"#
-        ));
-        assert!(!forwarded(
-            r#"{"reason":"build-script-executed","out_dir":"/slot/x"}"#
-        ));
-        assert!(forwarded(
-            r#"{"reason":"compiler-message","message":{"rendered":"x"}}"#
-        ));
-        assert!(forwarded(r#"{"reason":"build-finished","success":true}"#));
-        assert!(forwarded("test tests::it_works ... ok"));
-        assert!(forwarded("{ not json"));
+    fn crates_are_counted_and_slot_paths_held_back() {
+        assert_eq!(
+            Line::of(r#"{"reason":"compiler-artifact","filenames":["/slot/x"],"fresh":true}"#),
+            Line::Crate { fresh: true }
+        );
+        assert_eq!(
+            Line::of(r#"{"reason":"compiler-artifact","fresh":false}"#),
+            Line::Crate { fresh: false }
+        );
+        assert_eq!(
+            Line::of(r#"{"reason":"build-script-executed","out_dir":"/slot/x"}"#),
+            Line::BuildScript
+        );
+        for forwarded in [
+            r#"{"reason":"compiler-message","message":{"rendered":"x"}}"#,
+            r#"{"reason":"build-finished","success":true}"#,
+            "test tests::it_works ... ok",
+            "{ not json",
+        ] {
+            assert_eq!(Line::of(forwarded), Line::Forward, "{forwarded}");
+        }
     }
 
     #[test]

@@ -161,7 +161,55 @@ cd some/worktree
 buildd check -p my-crate        # starts the daemon on first use
 buildd test -p my-crate -- some_test
 buildd status
+buildd top                      # watch it work; q quits
 ```
+
+Set `BUILDD_LABEL` (an agent's or task's name) so `buildd top` and
+`buildd status` show who asked; otherwise a request is named by its
+worktree's folder.
+
+## Watching it: `buildd top`
+
+```text
+ buildd   up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · disk 24.0 GiB
+┌ slots ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│jaide-c716/0               [████████░░░░] 14.0 GiB  check -p jaide-gui @ 7f3a9c0d1e  4.2 s                            │
+│    for agent-1, agent-7  shared by 2  compiled 3 · reused 412                                                        │
+│jaide-c716/1               [██████░░░░░░] 10.0 GiB  idle                                                              │
+│    last for agent-2  limit below what its builds use                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ queue ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│1. agent-5  check -p jaide-mcp @ 3d2e000000  waiting 2.1 s                                                            │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ since start ─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│requests 96 → Cargo runs 61    shared 21 · replaced 9 · dropped 1 · cancelled 5                                       │
+│crates reused 97.8%  (54106 of 55310; compiled 1204)                                                                  │
+│CPU 412.0 s across 61 Cargo runs                                                                                      │
+│new worktrees starting on a warm slot: 6 of 6                                                                         │
+│disk 24.0 GiB for 15 worktrees · separate targets ≈ 15 × 12.0 GiB = 180.0 GiB (estimate)                              │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ events ──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  2s  agent-7 joined check -p jaide-gui @ 7f3a9c0d1e: no extra Cargo run                                              │
+│  5s  jaide-c716/1 finished check -p jaide-engine in 2.1 s: compiled 2, reused 233, CPU 3.4 s                         │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ q quit
+```
+
+What the numbers mean, all measured by the daemon since it started:
+
+- **requests → Cargo runs.** The difference is work that never ran: requests
+  that joined an equal build (shared), queued requests that moved to a newer
+  tree of their worktree (replaced), and builds nobody waited for any more
+  (dropped before starting, cancelled while running).
+- **crates reused.** Cargo reports every crate of a build as compiled or up
+  to date; the share up to date is what incremental state in the slots saved.
+- **CPU.** User and system time of each Cargo run and every compiler it
+  started.
+- **new worktrees starting on a warm slot.** The first build of a worktree
+  that ran in a slot which had already done its compilation, instead of a
+  cold build in a fresh target.
+- **separate targets.** Worktrees served times the average measured slot
+  size: an estimate of the disk one target per worktree would take.
 
 Arguments are passed to Cargo unchanged, except those that would take the
 slot's target directory, checkout, output format or parallelism away from
@@ -193,7 +241,9 @@ bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
 
 ## Protocol
 
-One JSON object per line over the Unix socket; see `src/protocol.rs`. The
+One JSON object per line over the Unix socket; see `src/protocol.rs`.
+`build` streams a build's messages, `status` describes the slots and queue,
+and `activity` adds the totals and recent events `buildd top` shows. The
 library's `client` module is what other programs integrate with.
 
 ## Not yet
@@ -207,5 +257,9 @@ library's `client` module is what other programs integrate with.
   client's `RUSTFLAGS` or `RUST_LOG` do not reach the build.
 - Ignored files are not part of a snapshot; a build that needs a generated,
   ignored file fails in a slot.
+- A slot's record of the compilations it did lives in the daemon's memory:
+  after a restart, slot choice cannot prefer the slot that did a compilation
+  until it does it again, and `buildd top` counts those first builds as cold.
+- A timeline of recent builds per slot in `buildd top`.
 
 Unix only (Unix sockets, process groups).

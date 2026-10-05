@@ -137,6 +137,7 @@ def main():
 
     def session(index, worktree):
         rng = random.Random(options.seed * 1000 + index)
+        session_environment = dict(environment, BUILDD_LABEL=f"session-{index + 1:02}")
         crate = crates[index % len(crates)]
         root = worktree / roots[crate]
         for iteration in range(options.iterations):
@@ -147,7 +148,7 @@ def main():
             for operation in (["check", "-p", crate], ["test", "-p", crate, "--no-run"]):
                 command = [options.buildd, *operation] if options.mode == "buildd" else ["cargo", *operation]
                 started = time.time()
-                completed = subprocess.run(command, cwd=worktree, env=environment, capture_output=True, text=True)
+                completed = subprocess.run(command, cwd=worktree, env=session_environment, capture_output=True, text=True)
                 wall = time.time() - started
                 times = BUILDD_TIMES.search(completed.stderr)
                 with lock:

@@ -1,7 +1,8 @@
 //! Which build runs where and who hears about it.
 //!
 //! The scheduler is pure state: the daemon feeds it requests, withdrawals,
-//! output and exits, and carries out the [`Effect`]s it returns.
+//! output and exits, and carries out the [`Effect`]s it returns, including
+//! a report of every decision for people watching.
 //!
 //! - **Deduplication.** A request equal to a queued or running build (same
 //!   repository, revision, directory and operation) waits for that build.
@@ -33,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::cargo::{Command, Operation};
-use crate::protocol::{Message, Outcome, QueuedBuild, RunningBuild, SlotStatus};
+use crate::protocol::{EventKind, Message, Outcome, QueuedBuild, RunningBuild, SlotStatus, Usage};
 use crate::slot::{Pruning, slot_name};
 use crate::snapshot::{Revision, Source};
 
@@ -67,6 +68,8 @@ pub(crate) struct Submission {
     pub(crate) source: Source,
     pub(crate) revision: Revision,
     pub(crate) operation: Operation,
+    /// Who asks; the worktree's folder name when None.
+    pub(crate) label: Option<String>,
 }
 
 /// What the daemon must do.
@@ -86,6 +89,8 @@ pub(crate) enum Effect {
         repository: PathBuf,
         slot: usize,
     },
+    /// Something happened, for people watching.
+    Report(EventKind),
 }
 
 /// A build to start in slot `slot` of `repository`.
@@ -131,6 +136,8 @@ impl Compilation {
 struct Waiter {
     id: WaiterId,
     worktree: PathBuf,
+    /// Who asked, for people watching.
+    who: String,
     since: Instant,
 }
 
@@ -145,6 +152,9 @@ struct Job {
     state: State,
     /// Output so far, replayed to waiters who join while it runs.
     output: Vec<Message>,
+    /// Crates Cargo compiled so far, and crates it found up to date.
+    compiled: u64,
+    fresh: u64,
 }
 
 enum State {
@@ -191,6 +201,8 @@ impl Slot {
 pub(crate) struct Scheduler<D> {
     capacity: usize,
     distance: D,
+    /// Worktrees a build has started for.
+    built_worktrees: HashSet<PathBuf>,
     clock: u64,
     next_job: u64,
     jobs: BTreeMap<JobId, Job>,
@@ -220,6 +232,13 @@ impl Job {
         )
     }
 
+    fn who(&self) -> Vec<String> {
+        self.waiters
+            .iter()
+            .map(|waiter| waiter.who.clone())
+            .collect()
+    }
+
     fn send_all(&self, message: &Message) -> impl Iterator<Item = Effect> {
         self.waiters.iter().map(move |waiter| Effect::Send {
             waiter: waiter.id,
@@ -234,6 +253,7 @@ impl<D: Distance> Scheduler<D> {
         Self {
             capacity,
             distance,
+            built_worktrees: HashSet::new(),
             clock: 0,
             next_job: 0,
             jobs: BTreeMap::new(),
@@ -248,15 +268,24 @@ impl<D: Distance> Scheduler<D> {
             source,
             revision,
             operation,
+            label,
         } = submission;
         assert!(!self.waiting.contains_key(&waiter), "a waiter submits once");
         self.clock += 1;
         let mut order = self.clock;
+        let who = label.unwrap_or_else(|| {
+            source.worktree.file_name().map_or_else(
+                || source.worktree.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        });
         let mut joining = vec![Waiter {
             id: waiter,
             worktree: source.worktree.clone(),
+            who: who.clone(),
             since: Instant::now(),
         }];
+        let mut reports = Vec::new();
 
         let superseded = self
             .jobs
@@ -278,6 +307,12 @@ impl<D: Distance> Scheduler<D> {
             job.waiters = others;
             if !mine.is_empty() {
                 order = order.min(job.order);
+                reports.extend(mine.iter().map(|moved| EventKind::Replaced {
+                    who: moved.who.clone(),
+                    operation: job.operation.clone(),
+                    from: job.revision.clone(),
+                    to: revision.clone(),
+                }));
                 joining.extend(mine);
             }
             if job.waiters.is_empty() {
@@ -290,6 +325,13 @@ impl<D: Distance> Scheduler<D> {
             .iter()
             .find(|(_, job)| job.same_build(&source, &revision, &operation) && !job.cancelled())
             .map(|(id, _)| *id);
+        let requested = EventKind::Requested {
+            who,
+            worktree: source.worktree.clone(),
+            operation: operation.clone(),
+            revision: revision.clone(),
+            shared: existing.is_some(),
+        };
         let id = existing.unwrap_or_else(|| {
             let id = JobId(self.next_job);
             self.next_job += 1;
@@ -304,12 +346,17 @@ impl<D: Distance> Scheduler<D> {
                     order,
                     state: State::Queued,
                     output: Vec::new(),
+                    compiled: 0,
+                    fresh: 0,
                 },
             );
             id
         });
 
-        let mut effects = Vec::new();
+        let mut effects = std::iter::once(requested)
+            .chain(reports)
+            .map(Effect::Report)
+            .collect::<Vec<_>>();
         let job = self.jobs.get_mut(&id).expect("found or inserted above");
         job.order = job.order.min(order);
         for waiter in joining {
@@ -361,12 +408,25 @@ impl<D: Distance> Scheduler<D> {
         }
         match &mut job.state {
             State::Queued => {
-                self.jobs.remove(&id);
-                Vec::new()
+                let job = self.jobs.remove(&id).expect("found above");
+                vec![Effect::Report(EventKind::Dropped {
+                    operation: job.operation,
+                    revision: job.revision,
+                })]
             }
-            State::Running { cancelled, .. } => {
+            State::Running {
+                cancelled, slot, ..
+            } => {
                 *cancelled = true;
-                vec![Effect::Cancel { job: id }]
+                let slot = &self.slots[*slot];
+                vec![
+                    Effect::Cancel { job: id },
+                    Effect::Report(EventKind::Cancelled {
+                        slot: slot_name(&slot.repository, slot.index),
+                        operation: job.operation.clone(),
+                        revision: job.revision.clone(),
+                    }),
+                ]
             }
         }
     }
@@ -383,8 +443,27 @@ impl<D: Distance> Scheduler<D> {
         effects
     }
 
-    /// Running job `id` ended with `outcome`.
-    pub(crate) fn exited(&mut self, id: JobId, outcome: &Outcome) -> Vec<Effect> {
+    /// Cargo reported a crate of running job `id`: compiled, or up to date
+    /// when `fresh`.
+    pub(crate) fn crate_built(&mut self, id: JobId, fresh: bool) {
+        // Like output, a report can arrive after the build ended.
+        if let Some(job) = self.jobs.get_mut(&id) {
+            if fresh {
+                job.fresh += 1;
+            } else {
+                job.compiled += 1;
+            }
+        }
+    }
+
+    /// Running job `id` ended with `outcome`, having used `usage` when Cargo
+    /// ran.
+    pub(crate) fn exited(
+        &mut self,
+        id: JobId,
+        outcome: &Outcome,
+        usage: Option<Usage>,
+    ) -> Vec<Effect> {
         let job = self.jobs.remove(&id).expect("only tracked jobs run");
         let State::Running { slot, started, .. } = job.state else {
             panic!("only running jobs exit");
@@ -399,11 +478,21 @@ impl<D: Distance> Scheduler<D> {
         entry.job = None;
         entry.unmeasured += 1;
         entry.idle_since = Instant::now();
-        let mut effects = Vec::new();
+        let build_ms = millis(started.elapsed());
+        let mut effects = vec![Effect::Report(EventKind::Finished {
+            slot: slot_name(&entry.repository, entry.index),
+            who: job.who(),
+            operation: job.operation.clone(),
+            revision: job.revision.clone(),
+            outcome: outcome.clone(),
+            build_ms,
+            compiled: job.compiled,
+            fresh: job.fresh,
+            usage,
+        })];
         if entry.unmeasured >= MAINTENANCE_DUE {
             effects.push(self.maintain(slot));
         }
-        let build_ms = millis(started.elapsed());
         for waiter in job.waiters {
             self.waiting.remove(&waiter.id);
             effects.push(Effect::Send {
@@ -470,7 +559,34 @@ impl<D: Distance> Scheduler<D> {
         if let Some(Pruning::Cleared { .. }) = pruning {
             slot.compiled.clear();
         }
-        self.start_ready()
+        let name = slot_name(&slot.repository, slot.index);
+        let report = match pruning {
+            None | Some(Pruning::Within { .. }) => None,
+            Some(Pruning::Incremental {
+                before,
+                after,
+                removed,
+                in_use,
+            }) => Some(EventKind::Pruned {
+                slot: name,
+                before,
+                after,
+                removed,
+                in_use,
+                cleared: false,
+            }),
+            Some(Pruning::Cleared { before }) => Some(EventKind::Pruned {
+                slot: name,
+                before,
+                after: 0,
+                removed: 0,
+                in_use: 0,
+                cleared: true,
+            }),
+        };
+        let mut effects = report.map(Effect::Report).into_iter().collect::<Vec<_>>();
+        effects.extend(self.start_ready());
+        effects
     }
 
     /// Starts queued builds, next first, while slots are free. A build that
@@ -494,6 +610,8 @@ impl<D: Distance> Scheduler<D> {
             };
             self.clock += 1;
             let job = &self.jobs[&id];
+            let warm = self.slots[slot].compiled.contains(&Compilation::of(job));
+            let first = self.built_worktrees.insert(job.waiters[0].worktree.clone());
             let entry = &mut self.slots[slot];
             entry.job = Some(id);
             entry.revision = job.revision.clone();
@@ -505,11 +623,20 @@ impl<D: Distance> Scheduler<D> {
                 started: Instant::now(),
                 cancelled: false,
             };
+            let name = slot_name(&self.slots[slot].repository, self.slots[slot].index);
             let started = Message::Started {
                 revision: job.revision.clone(),
-                slot: slot_name(&self.slots[slot].repository, self.slots[slot].index),
+                slot: name.clone(),
             };
             effects.extend(job.send_all(&started));
+            effects.push(Effect::Report(EventKind::Started {
+                slot: name,
+                who: job.who(),
+                operation: job.operation.clone(),
+                revision: job.revision.clone(),
+                warm,
+                first,
+            }));
             effects.push(Effect::Start(Start {
                 job: id,
                 key: SlotKey(slot),
@@ -601,8 +728,10 @@ impl<D: Distance> Scheduler<D> {
                     RunningBuild {
                         revision: job.revision.clone(),
                         operation: job.operation.clone(),
-                        waiters: job.waiters.len(),
+                        who: job.who(),
                         elapsed_ms: millis(started.elapsed()),
+                        compiled: job.compiled,
+                        fresh: job.fresh,
                         cancelled,
                     }
                 }),
@@ -619,17 +748,13 @@ impl<D: Distance> Scheduler<D> {
             .map(|(_, job)| QueuedBuild {
                 revision: job.revision.clone(),
                 operation: job.operation.clone(),
-                worktrees: job
-                    .waiters
-                    .iter()
-                    .map(|waiter| waiter.worktree.clone())
-                    .collect(),
+                who: job.who(),
                 waited_ms: job
                     .waiters
                     .iter()
                     .map(|waiter| millis(waiter.since.elapsed()))
                     .max()
-                    .unwrap_or(0),
+                    .expect("a queued job has waiters"),
             })
             .collect();
         (slots, queue)
@@ -698,6 +823,7 @@ mod tests {
             source: source(worktree),
             revision: revision(tree),
             operation: check(),
+            label: None,
         })
     }
 
@@ -717,6 +843,7 @@ mod tests {
                 command,
                 args: args.iter().map(|argument| (*argument).to_owned()).collect(),
             },
+            label: None,
         })
     }
 
@@ -753,6 +880,16 @@ mod tests {
             .collect()
     }
 
+    fn reports(effects: &[Effect]) -> Vec<&EventKind> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Report(kind) => Some(kind),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn ok() -> Outcome {
         Outcome::Exited { code: 0 }
     }
@@ -763,7 +900,7 @@ mod tests {
         let [(job, slot, _)] = starts(&effects)[..] else {
             panic!("{tree} starts at once: {effects:?}");
         };
-        scheduler.exited(job, &ok());
+        scheduler.exited(job, &ok(), None);
         slot
     }
 
@@ -781,7 +918,7 @@ mod tests {
         assert!(starts(&second).is_empty());
         assert!(matches!(sent(&second, 2)[..], [Message::Started { .. }, m] if *m == line));
 
-        let finished = scheduler.exited(job, &ok());
+        let finished = scheduler.exited(job, &ok(), None);
         assert!(matches!(sent(&finished, 1)[..], [Message::Finished { .. }]));
         assert!(matches!(sent(&finished, 2)[..], [Message::Finished { .. }]));
     }
@@ -804,14 +941,14 @@ mod tests {
         let (_, queue) = scheduler.status();
         let order = queue
             .iter()
-            .map(|build| (build.revision.to_string(), build.worktrees.len()))
+            .map(|build| (build.revision.to_string(), build.who.len()))
             .collect::<Vec<_>>();
         assert_eq!(
             order,
             [("t1".into(), 1), ("t2".into(), 2), ("u1".into(), 1)]
         );
 
-        let next = scheduler.exited(running, &ok());
+        let next = scheduler.exited(running, &ok(), None);
         assert_eq!(
             starts(&next)
                 .iter()
@@ -829,14 +966,22 @@ mod tests {
             panic!("{first:?}");
         };
         submit(&mut scheduler, 2, "/b", "t2");
-        assert!(scheduler.withdraw(WaiterId(2)).is_empty());
+        let dropped = scheduler.withdraw(WaiterId(2));
+        assert!(
+            matches!(reports(&dropped)[..], [EventKind::Dropped { revision, .. }] if revision.to_string() == "t2")
+        );
         assert!(scheduler.status().1.is_empty());
 
-        assert_eq!(scheduler.withdraw(WaiterId(1)), [Effect::Cancel { job }]);
+        let cancelled = scheduler.withdraw(WaiterId(1));
+        assert_eq!(cancelled[0], Effect::Cancel { job });
+        assert!(matches!(
+            reports(&cancelled)[..],
+            [EventKind::Cancelled { .. }]
+        ));
         // An equal request does not join the build being stopped.
         let again = submit(&mut scheduler, 3, "/a", "t1");
         assert!(matches!(sent(&again, 3)[..], [Message::Queued { .. }]));
-        let next = scheduler.exited(job, &Outcome::Signaled { signal: 15 });
+        let next = scheduler.exited(job, &Outcome::Signaled { signal: 15 }, None);
         assert!(sent(&next, 1).is_empty());
         assert_eq!(starts(&next).len(), 1);
         assert!(scheduler.withdraw(WaiterId(1)).is_empty());
@@ -854,8 +999,8 @@ mod tests {
         let [(job_b, 1, _)] = starts(&b)[..] else {
             panic!("{b:?}")
         };
-        scheduler.exited(job_a, &ok());
-        scheduler.exited(job_b, &ok());
+        scheduler.exited(job_a, &ok(), None);
+        scheduler.exited(job_b, &ok(), None);
 
         // A worktree's next tree is closest to its previous one.
         scheduler.distance.0.insert(("b1".into(), "b2".into()), 1);
@@ -891,7 +1036,7 @@ mod tests {
             panic!("{first:?}");
         };
         let ended = Instant::now();
-        assert!(maintains(&scheduler.exited(job, &ok())).is_empty());
+        assert!(maintains(&scheduler.exited(job, &ok(), None)).is_empty());
         let due = scheduler.next_maintenance().expect("the slot is due");
         assert!(due >= ended + MAINTENANCE_QUIET);
         assert!(scheduler.maintenance_due(ended).is_empty());
@@ -909,6 +1054,7 @@ mod tests {
             },
             revision: revision("o1"),
             operation: check(),
+            label: None,
         });
         assert_eq!(starts(&other).len(), 1);
         let (slots, queue) = scheduler.status();
@@ -930,13 +1076,13 @@ mod tests {
             let [(job, ..)] = starts(&effects)[..] else {
                 panic!("{effects:?}");
             };
-            assert!(maintains(&scheduler.exited(job, &ok())).is_empty());
+            assert!(maintains(&scheduler.exited(job, &ok(), None)).is_empty());
         }
         let last = submit(&mut scheduler, 99, "/a", "last");
         let [(job, ..)] = starts(&last)[..] else {
             panic!("{last:?}");
         };
-        assert_eq!(maintains(&scheduler.exited(job, &ok())), [0]);
+        assert_eq!(maintains(&scheduler.exited(job, &ok(), None)), [0]);
     }
 
     /// Two slots: slot 0 did `check` at tree a1, slot 1 did `test` at b1.
@@ -950,8 +1096,8 @@ mod tests {
         let [(job_b, 1, _)] = starts(&b)[..] else {
             panic!("{b:?}")
         };
-        scheduler.exited(job_a, &ok());
-        scheduler.exited(job_b, &ok());
+        scheduler.exited(job_a, &ok(), None);
+        scheduler.exited(job_b, &ok(), None);
         scheduler
     }
 
@@ -998,11 +1144,70 @@ mod tests {
         };
         assert!(starts(&second).is_empty());
         let first = Compilation::of(&scheduler.jobs[&job]);
-        let next = scheduler.exited(job, &ok());
+        let next = scheduler.exited(job, &ok(), None);
         let [(next, ..)] = starts(&next)[..] else {
             panic!("{next:?}")
         };
         assert_eq!(Compilation::of(&scheduler.jobs[&next]), first);
         assert_eq!(first.args, ["-p", "x"]);
+    }
+
+    #[test]
+    fn every_decision_is_reported_for_people_watching() {
+        let mut scheduler = scheduler(1);
+        let first = scheduler.submit(Submission {
+            waiter: WaiterId(1),
+            source: source("/work/a"),
+            revision: revision("t1"),
+            operation: check(),
+            label: Some("agent-1".into()),
+        });
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}");
+        };
+        assert!(matches!(
+            reports(&first)[..],
+            [
+                EventKind::Requested { who, shared: false, .. },
+                EventKind::Started { warm: false, first: true, .. },
+            ] if who == "agent-1"
+        ));
+        // Without a label, a request is named by its worktree's folder.
+        let joined = submit(&mut scheduler, 2, "/work/b", "t1");
+        assert!(matches!(
+            reports(&joined)[..],
+            [EventKind::Requested { who, shared: true, .. }] if who == "b"
+        ));
+        submit(&mut scheduler, 3, "/work/c", "c1");
+        let replaced = submit(&mut scheduler, 4, "/work/c", "c2");
+        assert!(matches!(
+            reports(&replaced)[..],
+            [
+                EventKind::Requested { shared: false, .. },
+                EventKind::Replaced { who, from, to, .. },
+            ] if who == "c" && from.to_string() == "c1" && to.to_string() == "c2"
+        ));
+
+        scheduler.crate_built(job, false);
+        scheduler.crate_built(job, true);
+        scheduler.crate_built(job, true);
+        let (slots, _) = scheduler.status();
+        let running = slots[0].build.as_ref().expect("t1 runs");
+        assert_eq!((running.compiled, running.fresh), (1, 2));
+        assert_eq!(running.who, ["agent-1", "b"]);
+
+        let usage = Usage {
+            cpu_ms: 1200,
+            peak_memory: 1 << 20,
+        };
+        let finished = scheduler.exited(job, &ok(), Some(usage));
+        assert!(matches!(
+            reports(&finished)[..],
+            [
+                EventKind::Finished { compiled: 1, fresh: 2, usage: Some(Usage { cpu_ms: 1200, .. }), who, .. },
+                // The next build starts in the slot that just did `check`.
+                EventKind::Started { warm: true, first: true, .. },
+            ] if who.len() == 2
+        ));
     }
 }

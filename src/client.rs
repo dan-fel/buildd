@@ -5,7 +5,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use crate::config;
-use crate::protocol::{BuildRequest, Message, Request, Status};
+use serde::de::DeserializeOwned;
+
+use crate::protocol::{Activity, BuildRequest, Message, Request, Status};
 
 /// Connects to the daemon of `home`.
 ///
@@ -43,14 +45,28 @@ pub fn build(
 ///
 /// # Errors
 /// When the connection fails or the daemon breaks the protocol.
-pub fn status(mut stream: UnixStream) -> Result<Status, String> {
-    send(&mut stream, &Request::Status)?;
+pub fn status(stream: UnixStream) -> Result<Status, String> {
+    ask(stream, &Request::Status)
+}
+
+/// The daemon's slots and queue, its totals since it started, and its
+/// recent events.
+///
+/// # Errors
+/// When the connection fails or the daemon breaks the protocol.
+pub fn activity(stream: UnixStream) -> Result<Activity, String> {
+    ask(stream, &Request::Activity)
+}
+
+/// Sends `request` and reads its one-line answer.
+fn ask<T: DeserializeOwned>(mut stream: UnixStream, request: &Request) -> Result<T, String> {
+    send(&mut stream, request)?;
     let mut line = String::new();
     BufReader::new(stream)
         .read_line(&mut line)
         .map_err(|error| format!("lost the daemon: {error}"))?;
     serde_json::from_str(&line)
-        .map_err(|error| format!("the daemon sent an invalid status: {error}"))
+        .map_err(|error| format!("the daemon sent an invalid answer: {error}"))
 }
 
 fn send(stream: &mut UnixStream, request: &Request) -> Result<(), String> {

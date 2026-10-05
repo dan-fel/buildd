@@ -10,15 +10,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
+use crate::activity::ActivityLog;
 use crate::cargo;
+use crate::cargo::Line;
 use crate::config::{self, Config};
 use crate::git;
-use crate::protocol::{BuildRequest, Message, Outcome, Request, Status};
+use crate::protocol::{Activity, BuildRequest, Message, Outcome, Request, Status, Usage};
 use crate::scheduler::{Distance, Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
 use crate::slot::{Pruning, SlotDirectory, slot_name};
 use crate::snapshot;
@@ -44,13 +46,23 @@ enum Event {
     Status {
         reply: Sender<Status>,
     },
+    Activity {
+        reply: Sender<Activity>,
+    },
     Output {
         job: JobId,
         message: Message,
     },
+    /// Cargo reported a crate of `job`, up to date when `fresh`.
+    Crate {
+        job: JobId,
+        fresh: bool,
+    },
+    /// Cargo ended, having used `usage` when it ran.
     Exited {
         job: JobId,
         outcome: Outcome,
+        usage: Option<Usage>,
     },
     /// Slot `key` was kept within its disk limit by `pruning`; None when
     /// that failed.
@@ -110,6 +122,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         scheduler: Scheduler::new(config.slots, GitDistance::default()),
         waiters: HashMap::new(),
         runs: HashMap::new(),
+        log: ActivityLog::new(SystemTime::now()),
     }
     .drive(&received)
 }
@@ -178,6 +191,14 @@ impl Connection {
                     let _ = write_line(&mut stream, &status);
                 }
             }
+            Ok(Request::Activity) => {
+                let (reply, activity) = crossbeam_channel::bounded(1);
+                if self.events.send(Event::Activity { reply }).is_ok()
+                    && let Ok(activity) = activity.recv()
+                {
+                    let _ = write_line(&mut stream, &activity);
+                }
+            }
             Ok(Request::Build(request)) => self.build(stream, reader, request),
         }
     }
@@ -206,6 +227,7 @@ impl Connection {
             source,
             revision,
             operation: request.operation,
+            label: request.label,
         };
         if self
             .events
@@ -260,6 +282,7 @@ struct Daemon {
     scheduler: Scheduler<GitDistance>,
     waiters: HashMap<WaiterId, Sender<Message>>,
     runs: HashMap<JobId, Arc<Run>>,
+    log: ActivityLog,
 }
 
 impl Daemon {
@@ -295,22 +318,25 @@ impl Daemon {
                     self.scheduler.withdraw(waiter)
                 }
                 Event::Status { reply } => {
-                    let (slots, queue) = self.scheduler.status();
-                    let _ = reply.send(Status {
-                        jobs: self.config.jobs,
-                        idle_jobs: self
-                            .jobserver
-                            .available()
-                            .expect("the daemon's own jobserver pipe can be queried"),
-                        slots,
-                        queue,
-                    });
+                    let _ = reply.send(self.status());
+                    Vec::new()
+                }
+                Event::Activity { reply } => {
+                    let _ = reply.send(self.log.activity(self.status()));
                     Vec::new()
                 }
                 Event::Output { job, message } => self.scheduler.output(job, message),
-                Event::Exited { job, outcome } => {
+                Event::Crate { job, fresh } => {
+                    self.scheduler.crate_built(job, fresh);
+                    Vec::new()
+                }
+                Event::Exited {
+                    job,
+                    outcome,
+                    usage,
+                } => {
                     self.runs.remove(&job);
-                    self.scheduler.exited(job, &outcome)
+                    self.scheduler.exited(job, &outcome, usage)
                 }
                 Event::Maintained { key, pruning } => self.scheduler.maintained(key, pruning),
             };
@@ -320,8 +346,24 @@ impl Daemon {
         }
     }
 
+    fn status(&self) -> Status {
+        let (slots, queue) = self.scheduler.status();
+        Status {
+            jobs: self.config.jobs,
+            idle_jobs: self
+                .jobserver
+                .available()
+                .expect("the daemon's own jobserver pipe can be queried"),
+            capacity: self.config.slots,
+            slot_limit: self.config.slot_limit,
+            slots,
+            queue,
+        }
+    }
+
     fn apply(&mut self, effect: Effect) {
         match effect {
+            Effect::Report(kind) => self.log.record(SystemTime::now(), kind),
             Effect::Send { waiter, message } => {
                 let last = message.is_final();
                 // A client that went away has its withdrawal on the way.
@@ -350,7 +392,11 @@ impl Daemon {
                     let outcome = Outcome::Failed {
                         reason: format!("could not start the build thread: {error}"),
                     };
-                    let _ = self.events.send(Event::Exited { job, outcome });
+                    let _ = self.events.send(Event::Exited {
+                        job,
+                        outcome,
+                        usage: None,
+                    });
                 }
             }
             Effect::Maintain {
@@ -536,15 +582,17 @@ struct Building {
 
 impl Building {
     fn build(self) {
-        let outcome = self.outcome();
+        let (outcome, usage) = self.outcome();
         let _ = self.events.send(Event::Exited {
             job: self.start.job,
             outcome,
+            usage,
         });
     }
 
-    fn outcome(&self) -> Outcome {
-        let failed = |reason: String| Outcome::Failed { reason };
+    /// How the build ended and, when Cargo ran, what it used.
+    fn outcome(&self) -> (Outcome, Option<Usage>) {
+        let failed = |reason: String| (Outcome::Failed { reason }, None);
         if let Err(reason) = self
             .slot
             .materialize(&self.start.repository, &self.start.revision)
@@ -599,14 +647,14 @@ impl Building {
         }
         kill_leftovers(pid);
         self.run.lock().exited = true;
-        let status = child.wait().expect("an exited child can be reaped");
+        let (status, usage) = reap(&child);
         let deadline = std::time::Instant::now() + OUTPUT_GRACE;
         for _ in 0..2 {
             if finished.recv_deadline(deadline).is_err() {
                 break;
             }
         }
-        outcome(status)
+        (outcome(status), Some(usage))
     }
 
     /// Sends each line of `output` to the scheduler on a thread of its own.
@@ -623,14 +671,22 @@ impl Building {
                         .trim_end_matches(['\n', '\r'])
                         .to_owned();
                     bytes.clear();
-                    let message = if !stdout {
-                        Message::Stderr { line }
-                    } else if cargo::forwarded(&line) {
-                        Message::Stdout { line }
+                    let event = if !stdout {
+                        Event::Output {
+                            job,
+                            message: Message::Stderr { line },
+                        }
                     } else {
-                        continue;
+                        match Line::of(&line) {
+                            Line::Crate { fresh } => Event::Crate { job, fresh },
+                            Line::BuildScript => continue,
+                            Line::Forward => Event::Output {
+                                job,
+                                message: Message::Stdout { line },
+                            },
+                        }
                     };
-                    if events.send(Event::Output { job, message }).is_err() {
+                    if events.send(event).is_err() {
                         break;
                     }
                 }
@@ -645,6 +701,46 @@ impl Building {
 #[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
 fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
+}
+
+/// The unit of `ru_maxrss`: bytes on macOS, kilobytes elsewhere.
+#[cfg(target_os = "macos")]
+const MAX_RSS_UNIT: u64 = 1;
+#[cfg(not(target_os = "macos"))]
+const MAX_RSS_UNIT: u64 = 1024;
+
+/// Reaps `child`, which has exited, with what it and the processes it
+/// waited for used: Cargo waits for every compiler it starts.
+fn reap(child: &std::process::Child) -> (ExitStatus, Usage) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let pid = libc::pid_t::try_from(child.id()).expect("process ids fit pid_t");
+    let mut status = 0;
+    // SAFETY: rusage holds only integers, for which all zeroes is valid.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: `status` and `usage` are valid for writes for the call.
+        let reaped = unsafe { libc::wait4(pid, &raw mut status, 0, &raw mut usage) };
+        if reaped == pid {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "reaping our own exited child fails only by a bug: {error}"
+        );
+    }
+    let millis = |time: libc::timeval| {
+        u64::try_from(time.tv_sec).expect("CPU seconds are positive") * 1000
+            + u64::try_from(time.tv_usec).expect("CPU microseconds are positive") / 1000
+    };
+    let usage = Usage {
+        cpu_ms: millis(usage.ru_utime) + millis(usage.ru_stime),
+        peak_memory: u64::try_from(usage.ru_maxrss).expect("memory sizes are positive")
+            * MAX_RSS_UNIT,
+    };
+    (ExitStatus::from_raw(status), usage)
 }
 
 fn outcome(status: ExitStatus) -> Outcome {

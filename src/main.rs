@@ -12,13 +12,17 @@ use buildd::protocol::{BuildRequest, Message, Outcome, Status};
 use buildd::{client, config};
 use serde::Deserialize;
 
+mod top;
+
 const USAGE: &str = "\
 usage:
   buildd check|clippy|build|test [CARGO ARGS...]
       Build the current content of this worktree, committed or not, in a
       build slot, and print Cargo's diagnostics and test output.
-  buildd status
+    buildd status
       Show the build slots and the queue.
+  buildd top
+      Watch the slots, the queue, what sharing saved and recent events.
   buildd daemon
       Run the daemon in the foreground. Clients start it when none runs.";
 
@@ -34,7 +38,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let command = match name.as_str() {
-        "daemon" | "status" => None,
+        "daemon" | "status" | "top" => None,
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -56,6 +60,9 @@ fn main() -> ExitCode {
             },
         ),
         None if name == "daemon" => daemon(&home),
+        None if name == "top" => {
+            top::run(|| client::activity(connect(&home)?)).map(|()| ExitCode::SUCCESS)
+        }
         None => status(&home),
     });
     result.unwrap_or_else(|message| {
@@ -75,6 +82,9 @@ fn build(home: &Path, operation: Operation) -> Result<ExitCode, String> {
     let request = BuildRequest {
         directory,
         operation,
+        label: std::env::var("BUILDD_LABEL")
+            .ok()
+            .filter(|label| !label.is_empty()),
     };
     let last = client::build(connect(home)?, request, render)?;
     Ok(match last {
@@ -153,32 +163,37 @@ fn status(home: &Path) -> Result<ExitCode, String> {
     let Status {
         jobs,
         idle_jobs,
+        capacity,
+        slot_limit,
         slots,
         queue,
     } = client::status(connect(home)?)?;
-    println!("jobs: {idle_jobs} of {jobs} idle");
+    println!(
+        "{capacity} slots of {}, jobs: {idle_jobs} of {jobs} idle",
+        gib(slot_limit)
+    );
     for slot in slots {
         let worktree = slot.worktree.map_or_else(String::new, |worktree| {
             format!(" for {}", worktree.display())
         });
         let size = slot.size.map_or_else(String::new, |size| {
-            #[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
-            let gib = size as f64 / f64::from(1 << 30);
             let warning = if slot.undersized {
                 ", limit below what its builds use"
             } else {
                 ""
             };
-            format!(" [{gib:.1} GiB{warning}]")
+            format!(" [{}{warning}]", gib(size))
         });
         match slot.build {
             Some(build) => println!(
-                "slot {}{size}: {} {} ({} waiting, {}{}){worktree}",
+                "slot {}{size}: {} {} for {} ({}, compiled {} reused {}{})",
                 slot.name,
                 build.revision.short(),
                 build.operation,
-                build.waiters,
+                build.who.join(", "),
                 seconds(build.elapsed_ms),
+                build.compiled,
+                build.fresh,
                 if build.cancelled { ", cancelled" } else { "" },
             ),
             None if slot.maintaining => println!("slot {}{size}: pruning{worktree}", slot.name),
@@ -186,21 +201,21 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         }
     }
     for (position, build) in queue.iter().enumerate() {
-        let worktrees = build
-            .worktrees
-            .iter()
-            .map(|worktree| worktree.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
         println!(
-            "queued {}: {} {} (waited {}) for {worktrees}",
+            "queued {}: {} {} (waited {}) for {}",
             position + 1,
             build.revision.short(),
             build.operation,
             seconds(build.waited_ms),
+            build.who.join(", "),
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
 }
 
 fn seconds(millis: u64) -> String {

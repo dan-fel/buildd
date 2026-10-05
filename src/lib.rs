@@ -14,6 +14,7 @@
 //! sessions or worktrees, and a slot's Cargo fingerprints stay valid because
 //! its path never changes.
 
+mod activity;
 pub mod cargo;
 pub mod client;
 pub mod config;
