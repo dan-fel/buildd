@@ -1,7 +1,7 @@
 //! The Cargo commands buildd runs and how it runs them in a slot.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,32 @@ const RESERVED_OPTIONS: [&str; 8] = [
     "--lockfile-path",
     "--jobs",
 ];
+
+/// What Cargo compiles for a build: its directory, command, and the
+/// arguments before `--` (those after go to the test harness or the
+/// compiler driver). A slot that did a compilation keeps its artifacts until
+/// its target is cleared, so doing it again there is incremental.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct Compilation {
+    pub(crate) prefix: PathBuf,
+    pub(crate) command: Command,
+    pub(crate) args: Vec<String>,
+}
+
+impl Compilation {
+    pub(crate) fn new(prefix: &Path, operation: &Operation) -> Self {
+        Self {
+            prefix: prefix.to_owned(),
+            command: operation.command,
+            args: operation
+                .args
+                .iter()
+                .take_while(|argument| *argument != "--")
+                .cloned()
+                .collect(),
+        }
+    }
+}
 
 /// A Cargo command and its arguments as the client gave them. Two equal
 /// operations on one revision are one build.

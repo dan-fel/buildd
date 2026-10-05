@@ -33,9 +33,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::cargo::{Command, Operation};
+use crate::cargo::{Compilation, Operation};
 use crate::protocol::{EventKind, Message, Outcome, QueuedBuild, RunningBuild, SlotStatus, Usage};
-use crate::slot::{Pruning, slot_name};
+use crate::slot::{Pruning, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
 
 /// How long a slot stays idle before it is kept within its disk limit.
@@ -91,6 +91,12 @@ pub(crate) enum Effect {
     },
     /// Something happened, for people watching.
     Report(EventKind),
+    /// Slot `slot` of `repository` has a new record to keep on disk.
+    Persist {
+        repository: PathBuf,
+        slot: usize,
+        record: SlotRecord,
+    },
 }
 
 /// A build to start in slot `slot` of `repository`.
@@ -106,30 +112,9 @@ pub(crate) struct Start {
     pub(crate) operation: Operation,
 }
 
-/// What Cargo compiles for a build: its directory, command, and the
-/// arguments before `--` (those after go to the test harness or the
-/// compiler driver). A slot that did a compilation keeps its artifacts until
-/// its target is cleared, so doing it again there is incremental.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct Compilation {
-    prefix: PathBuf,
-    command: Command,
-    args: Vec<String>,
-}
-
 impl Compilation {
     fn of(job: &Job) -> Self {
-        Self {
-            prefix: job.prefix.clone(),
-            command: job.operation.command,
-            args: job
-                .operation
-                .args
-                .iter()
-                .take_while(|argument| *argument != "--")
-                .cloned()
-                .collect(),
-        }
+        Self::new(&job.prefix, &job.operation)
     }
 }
 
@@ -174,8 +159,8 @@ struct Slot {
     job: Option<JobId>,
     /// The tree its checkout holds: that of its latest build.
     revision: Revision,
-    /// The worktree its latest build was for.
-    worktree: PathBuf,
+    /// The worktree its latest build was for, when it is known.
+    worktree: Option<PathBuf>,
     /// When it last started a build, on the scheduler's clock.
     used: u64,
     /// Its target is being kept within its disk limit.
@@ -195,6 +180,20 @@ struct Slot {
 impl Slot {
     fn busy(&self) -> bool {
         self.job.is_some() || self.maintaining
+    }
+
+    fn persist(&self) -> Effect {
+        let mut compiled = self.compiled.iter().cloned().collect::<Vec<_>>();
+        compiled
+            .sort_by(|a, b| (&a.prefix, a.command, &a.args).cmp(&(&b.prefix, b.command, &b.args)));
+        Effect::Persist {
+            repository: self.repository.clone(),
+            slot: self.index,
+            record: SlotRecord {
+                worktree: self.worktree.clone(),
+                compiled,
+            },
+        }
     }
 }
 
@@ -260,6 +259,43 @@ impl<D: Distance> Scheduler<D> {
             waiting: HashMap::new(),
             slots: Vec::new(),
         }
+    }
+
+    /// Takes back slot `index` of `repository`, left on disk by an earlier
+    /// daemon with its checkout at `revision` and its `record`. It is due
+    /// for measurement like a slot after a build.
+    pub(crate) fn restore(
+        &mut self,
+        repository: PathBuf,
+        index: usize,
+        revision: Revision,
+        record: SlotRecord,
+    ) {
+        assert!(
+            index < self.capacity,
+            "only slots within capacity are restored"
+        );
+        assert!(
+            !self
+                .slots
+                .iter()
+                .any(|slot| slot.repository == repository && slot.index == index),
+            "a slot is restored once"
+        );
+        self.slots.push(Slot {
+            repository,
+            index,
+            job: None,
+            revision,
+            worktree: record.worktree,
+            used: 0,
+            maintaining: false,
+            unmeasured: 1,
+            idle_since: Instant::now(),
+            size: None,
+            undersized: false,
+            compiled: record.compiled.into_iter().collect(),
+        });
     }
 
     pub(crate) fn submit(&mut self, submission: Submission) -> Vec<Effect> {
@@ -475,6 +511,7 @@ impl<D: Distance> Scheduler<D> {
         if let Outcome::Exited { .. } = outcome {
             entry.compiled.insert(compilation);
         }
+        let persist = entry.persist();
         entry.job = None;
         entry.unmeasured += 1;
         entry.idle_since = Instant::now();
@@ -490,6 +527,7 @@ impl<D: Distance> Scheduler<D> {
             fresh: job.fresh,
             usage,
         })];
+        effects.push(persist);
         if entry.unmeasured >= MAINTENANCE_DUE {
             effects.push(self.maintain(slot));
         }
@@ -556,8 +594,10 @@ impl<D: Distance> Scheduler<D> {
         slot.unmeasured = 0;
         slot.size = pruning.map(Pruning::size);
         slot.undersized = pruning.is_some_and(Pruning::undersized);
+        let mut effects = Vec::new();
         if let Some(Pruning::Cleared { .. }) = pruning {
             slot.compiled.clear();
+            effects.push(slot.persist());
         }
         let name = slot_name(&slot.repository, slot.index);
         let report = match pruning {
@@ -584,7 +624,7 @@ impl<D: Distance> Scheduler<D> {
                 cleared: true,
             }),
         };
-        let mut effects = report.map(Effect::Report).into_iter().collect::<Vec<_>>();
+        effects.extend(report.map(Effect::Report));
         effects.extend(self.start_ready());
         effects
     }
@@ -615,7 +655,7 @@ impl<D: Distance> Scheduler<D> {
             let entry = &mut self.slots[slot];
             entry.job = Some(id);
             entry.revision = job.revision.clone();
-            entry.worktree = job.waiters[0].worktree.clone();
+            entry.worktree = Some(job.waiters[0].worktree.clone());
             entry.used = self.clock;
             let job = self.jobs.get_mut(&id).expect("chosen above");
             job.state = State::Running {
@@ -688,13 +728,16 @@ impl<D: Distance> Scheduler<D> {
         if own().any(|slot| slot.maintaining) || own().count() >= self.capacity {
             return None;
         }
-        let index = own().count();
+        // Restored slots can leave gaps: take the lowest free index.
+        let index = (0..self.capacity)
+            .find(|index| !own().any(|slot| slot.index == *index))
+            .expect("a repository with fewer than capacity slots has a free index");
         self.slots.push(Slot {
             repository,
             index,
             job: None,
             revision,
-            worktree: job.waiters[0].worktree.clone(),
+            worktree: Some(job.waiters[0].worktree.clone()),
             used: 0,
             maintaining: false,
             unmeasured: 0,
@@ -713,7 +756,7 @@ impl<D: Distance> Scheduler<D> {
             .iter()
             .map(|slot| SlotStatus {
                 name: slot_name(&slot.repository, slot.index),
-                worktree: Some(slot.worktree.clone()),
+                worktree: slot.worktree.clone(),
                 size: slot.size,
                 maintaining: slot.maintaining,
                 undersized: slot.undersized,
@@ -1209,5 +1252,69 @@ mod tests {
                 EventKind::Started { warm: true, first: true, .. },
             ] if who.len() == 2
         ));
+    }
+
+    fn persisted(effects: &[Effect]) -> Vec<(usize, &SlotRecord)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Persist { slot, record, .. } => Some((*slot, record)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_finished_build_persists_its_slots_record() {
+        let mut scheduler = scheduler(1);
+        let first = submit(&mut scheduler, 1, "/work/a", "a1");
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}");
+        };
+        let finished = scheduler.exited(job, &ok(), None);
+        let [(0, record)] = persisted(&finished)[..] else {
+            panic!("{finished:?}");
+        };
+        assert_eq!(record.worktree.as_deref(), Some(Path::new("/work/a")));
+        assert_eq!(record.compiled, [Compilation::new(Path::new(""), &check())]);
+        // A cleared target forgets them, and that is persisted too.
+        scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
+        let cleared = scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 1 }));
+        assert!(matches!(persisted(&cleared)[..], [(0, record)] if record.compiled.is_empty()));
+    }
+
+    #[test]
+    fn restored_slots_are_placed_like_warm_ones_and_new_slots_fill_gaps() {
+        let mut scheduler = scheduler(3);
+        let record = SlotRecord {
+            worktree: Some("/work/a".into()),
+            compiled: vec![Compilation::new(Path::new(""), &check())],
+        };
+        scheduler.restore(
+            "/repo/.git".into(),
+            0,
+            revision("x1"),
+            SlotRecord::default(),
+        );
+        scheduler.restore("/repo/.git".into(), 2, revision("y1"), record);
+        let (slots, _) = scheduler.status();
+        assert_eq!(slots.len(), 2);
+        assert!(slots.iter().all(|slot| slot.size.is_none()));
+        // Slot 2 ran `check` before, so it wins over slot 0, which is closer.
+        scheduler.distance.0.insert(("x1".into(), "a2".into()), 1);
+        let first = submit(&mut scheduler, 1, "/work/a", "a2");
+        assert!(matches!(starts(&first)[..], [(_, 2, _)]));
+        assert!(matches!(
+            reports(&first)[..],
+            [
+                EventKind::Requested { .. },
+                EventKind::Started { warm: true, .. }
+            ]
+        ));
+        let second = submit(&mut scheduler, 2, "/work/b", "b1");
+        assert!(matches!(starts(&second)[..], [(_, 0, _)]));
+        // Both restored slots are busy: the new one takes the free index 1.
+        let third = submit(&mut scheduler, 3, "/work/c", "c1");
+        assert!(matches!(starts(&third)[..], [(_, 1, _)]));
     }
 }

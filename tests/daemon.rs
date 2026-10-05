@@ -378,3 +378,47 @@ fn a_slot_over_its_disk_limit_is_pruned_once_it_is_quiet() {
     let again = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&again).success(), "{again:#?}");
 }
+
+#[test]
+fn a_restarted_daemon_keeps_its_slots_warm_and_drops_slots_beyond_its_count() {
+    let mut daemon = Daemon::start(2);
+    let repository = crate_repository(None);
+    let first = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&first).success(), "{first:#?}");
+    // A slot beyond a smaller configuration, as a larger one left it.
+    let project = std::fs::read_dir(daemon.home.0.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::create_dir(project.join("1")).unwrap();
+
+    let _ = daemon.process.kill();
+    let _ = daemon.process.wait();
+    std::fs::write(daemon.home.0.join("config.toml"), "slots = 1\njobs = 4\n").unwrap();
+    daemon.process = Process::new(env!("CARGO_BIN_EXE_buildd"))
+        .arg("daemon")
+        .env("BUILDD_HOME", &daemon.home.0)
+        .spawn()
+        .unwrap();
+    wait_until("the restarted daemon listens", || {
+        client::connect(&daemon.home.0).is_ok()
+    });
+    assert!(!project.join("1").exists(), "slot 1 is beyond one slot");
+    let slots = daemon.status().slots;
+    assert_eq!(slots.len(), 1, "slot 0 is back before any build");
+    assert_eq!(slots[0].worktree.as_deref(), Some(repository.0.as_path()));
+
+    let again = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&again).success(), "{again:#?}");
+    let warm = daemon
+        .activity()
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::Started { warm, .. } => Some(*warm),
+            _ => None,
+        });
+    assert_eq!(warm, Some(true));
+}

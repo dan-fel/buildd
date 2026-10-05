@@ -31,6 +31,9 @@ share one CPU budget instead of each assuming it owns the machine.
   ones at their place in the queue.
 - **Cancellation.** Closing the client (Ctrl-C) withdraws the request. A
   build nobody waits for any more is stopped with its whole process group.
+- **Restarts keep slots warm.** Each slot records the compilations it ran
+  and the worktree it last built for; a restarted daemon takes its slots
+  back, with their checkouts and targets, and removes any beyond `slots`.
 - **Disk limit.** A slot's target is kept within `slot_limit_gib` once the
   slot has been idle for two seconds, so measuring it never delays the next
   build of a session running several in a row, and right after a build once
@@ -226,7 +229,8 @@ directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 config.toml        slots = 2, jobs = <CPUs>, slot_limit_gib = 20 by default
 sock               the daemon's socket
 daemon.log         output of a daemon a client started
-slots/<repo>-<hash>/<n>/{src,target}
+slots/<repo>-<hash>/repository     the repository these slots build
+slots/<repo>-<hash>/<n>/{src,target,record.json}
 ```
 
 ## Load test
@@ -260,9 +264,6 @@ library's `client` module is what other programs integrate with.
   client's `RUSTFLAGS` or `RUST_LOG` do not reach the build.
 - Ignored files are not part of a snapshot; a build that needs a generated,
   ignored file fails in a slot.
-- A slot's record of the compilations it did lives in the daemon's memory:
-  after a restart, slot choice cannot prefer the slot that did a compilation
-  until it does it again, and `buildd top` counts those first builds as cold.
 - A timeline of recent builds per slot in `buildd top`.
 
 Unix only (Unix sockets, process groups).

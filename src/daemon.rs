@@ -22,7 +22,7 @@ use crate::config::{self, Config};
 use crate::git;
 use crate::protocol::{Activity, BuildRequest, Message, Outcome, Request, Status, Usage};
 use crate::scheduler::{Distance, Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
-use crate::slot::{Pruning, SlotDirectory, slot_name};
+use crate::slot::{self, Pruning, SlotDirectory, slot_name};
 use crate::snapshot;
 use crate::snapshot::Revision;
 
@@ -114,17 +114,65 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .name("buildd-accept".into())
         .spawn(move || accepting.accept(&listener))
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
+    let mut scheduler = Scheduler::new(config.slots, GitDistance::default());
+    restore_slots(home, config, &mut scheduler)?;
     Daemon {
         home: home.to_owned(),
         config,
         jobserver,
         events,
-        scheduler: Scheduler::new(config.slots, GitDistance::default()),
+        scheduler,
         waiters: HashMap::new(),
         runs: HashMap::new(),
         log: ActivityLog::new(SystemTime::now()),
     }
     .drive(&received)
+}
+
+/// Takes back the slots an earlier daemon left in `home`: their checkouts,
+/// targets and records stay warm across restarts. Slots beyond the
+/// configured count, left from a larger configuration, are removed so build
+/// disk stays within `slots` times the limit.
+fn restore_slots(
+    home: &Path,
+    config: Config,
+    scheduler: &mut Scheduler<GitDistance>,
+) -> Result<(), String> {
+    for existing in slot::existing_slots(home)? {
+        let name = slot_name(&existing.repository, existing.index);
+        if existing.index >= config.slots {
+            match existing.directory.remove() {
+                Ok(()) => eprintln!("buildd: removed slot {name}: beyond {} slots", config.slots),
+                Err(error) => eprintln!("buildd: could not remove slot {name}: {error}"),
+            }
+            continue;
+        }
+        if !existing.repository.exists() {
+            eprintln!(
+                "buildd: slot {name}: its repository {} is gone; leaving the slot alone",
+                existing.repository.display()
+            );
+            continue;
+        }
+        let restored = existing.directory.tree().and_then(|revision| {
+            existing
+                .directory
+                .read_record()
+                .map(|record| (revision, record))
+        });
+        match restored {
+            Ok((revision, record)) => {
+                eprintln!(
+                    "buildd: restored slot {name} with {} compilations",
+                    record.compiled.len()
+                );
+                scheduler.restore(existing.repository, existing.index, revision, record);
+            }
+            // A slot whose checkout never completed is rebuilt when needed.
+            Err(error) => eprintln!("buildd: slot {name} not restored: {error}"),
+        }
+    }
+    Ok(())
 }
 
 struct Accepting {
@@ -364,6 +412,16 @@ impl Daemon {
     fn apply(&mut self, effect: Effect) {
         match effect {
             Effect::Report(kind) => self.log.record(SystemTime::now(), kind),
+            Effect::Persist {
+                repository,
+                slot,
+                record,
+            } => {
+                let directory = SlotDirectory::new(&self.home, &repository, slot);
+                if let Err(error) = directory.write_record(&record) {
+                    eprintln!("buildd: {error}");
+                }
+            }
             Effect::Send { waiter, message } => {
                 let last = message.is_final();
                 // A client that went away has its withdrawal on the way.

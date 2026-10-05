@@ -19,6 +19,11 @@ use crate::git;
 pub struct Revision(String);
 
 impl Revision {
+    /// The revision named by a tree id git printed.
+    pub(crate) fn of_tree(id: &str) -> Self {
+        Self(id.trim().to_owned())
+    }
+
     /// The first ten digits, enough to tell revisions apart in messages.
     #[must_use]
     pub fn short(&self) -> &str {
@@ -107,7 +112,7 @@ impl Source {
         let mut write = git::command(&self.worktree);
         write.env("GIT_INDEX_FILE", &index.0).arg("write-tree");
         let tree = git::run(write)?;
-        Ok(Revision(tree.trim().to_owned()))
+        Ok(Revision::of_tree(&tree))
     }
 }
 

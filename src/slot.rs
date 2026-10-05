@@ -8,10 +8,14 @@
 //! every fingerprint in its target, never changes.
 
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
+use crate::cargo::Compilation;
 use crate::git;
 use crate::snapshot::Revision;
 
@@ -29,6 +33,59 @@ const COMMIT_ENVIRONMENT: [(&str, &str); 6] = [
     ("GIT_COMMITTER_EMAIL", "buildd@localhost"),
     ("GIT_COMMITTER_DATE", "1970-01-01T00:00:00Z"),
 ];
+
+/// What a slot keeps on disk that its checkout and target do not tell: the
+/// compilations it ran since its target was last cleared, and the worktree
+/// it last built for. A daemon reads it back when it starts.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SlotRecord {
+    pub(crate) worktree: Option<PathBuf>,
+    pub(crate) compiled: Vec<Compilation>,
+}
+
+/// A slot directory a daemon left behind.
+#[derive(Debug)]
+pub(crate) struct ExistingSlot {
+    pub(crate) repository: PathBuf,
+    pub(crate) index: usize,
+    pub(crate) directory: SlotDirectory,
+}
+
+/// The slot directories under `home` whose repository is known: each
+/// project directory names its repository in a `repository` file.
+pub(crate) fn existing_slots(home: &Path) -> Result<Vec<ExistingSlot>, String> {
+    let slots = home.join("slots");
+    if !slots.exists() {
+        return Ok(Vec::new());
+    }
+    let mut existing = Vec::new();
+    for project in read_directory(&slots)? {
+        let Ok(repository) = std::fs::read(project.join("repository")) else {
+            eprintln!(
+                "buildd: {} names no repository; leaving it alone",
+                project.display()
+            );
+            continue;
+        };
+        let repository = PathBuf::from(std::ffi::OsString::from_vec(repository));
+        for slot in read_directory(&project)? {
+            let Some(index) = slot
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            existing.push(ExistingSlot {
+                repository: repository.clone(),
+                index,
+                directory: SlotDirectory(slot),
+            });
+        }
+    }
+    existing.sort_by(|a, b| (&a.repository, a.index).cmp(&(&b.repository, b.index)));
+    Ok(existing)
+}
 
 /// The directory of slot `index` of `repository` under `home`.
 #[derive(Clone, Debug)]
@@ -53,11 +110,63 @@ impl SlotDirectory {
         self.0.join("target")
     }
 
+    /// The tree the slot's checkout holds.
+    pub(crate) fn tree(&self) -> Result<Revision, String> {
+        let mut command = git::command(&self.source());
+        command.args(["rev-parse", "HEAD^{tree}"]);
+        git::run(command).map(|tree| Revision::of_tree(&tree))
+    }
+
+    /// The slot's record; empty when it has none.
+    pub(crate) fn read_record(&self) -> Result<SlotRecord, String> {
+        let path = self.0.join("record.json");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SlotRecord::default()),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        }
+    }
+
+    /// Replaces the slot's record, never leaving a partly written one.
+    pub(crate) fn write_record(&self, record: &SlotRecord) -> Result<(), String> {
+        let path = self.0.join("record.json");
+        let partial = self.0.join("record.json.partial");
+        let text = serde_json::to_string(record).expect("records serialize");
+        std::fs::create_dir_all(&self.0)
+            .and_then(|()| std::fs::write(&partial, text))
+            .and_then(|()| std::fs::rename(&partial, &path))
+            .map_err(|error| format!("could not write {}: {error}", path.display()))
+    }
+
+    /// Removes the slot: its checkout, target and record.
+    pub(crate) fn remove(&self) -> Result<(), String> {
+        remove_tree(&self.0)
+    }
+
     /// Makes the checkout hold exactly `revision`: files that differ are
     /// written, files the tree lacks are removed, and every other file keeps
     /// its modification time.
     pub(crate) fn materialize(&self, repository: &Path, revision: &Revision) -> Result<(), String> {
         let source = self.source();
+        let project = self
+            .0
+            .parent()
+            .expect("a slot lives in a project directory");
+        std::fs::create_dir_all(project)
+            .and_then(|()| {
+                std::fs::write(
+                    project.join("repository"),
+                    repository.as_os_str().as_encoded_bytes(),
+                )
+            })
+            .map_err(|error| {
+                format!(
+                    "could not note the repository of {}: {error}",
+                    project.display()
+                )
+            })?;
         if !source.join(".git").exists() {
             std::fs::create_dir_all(&source)
                 .map_err(|error| format!("could not create {}: {error}", source.display()))?;
@@ -553,6 +662,33 @@ mod tests {
         std::fs::hard_link(directory.0.join("a/data"), directory.0.join("b/data")).unwrap();
         let linked = disk_usage(&directory.0, &[]).unwrap().total;
         assert!(linked < single + 50_000, "{single} then {linked}");
+    }
+
+    #[test]
+    fn slots_are_found_again_with_their_record_and_tree() {
+        let repository = repository();
+        let home = TempDir::new();
+        let scratch = TempDir::new();
+        let source = resolve(&repository.0).unwrap();
+        let tree = source.snapshot(&scratch.0).unwrap();
+        let slot = SlotDirectory::new(&home.0, &source.repository, 1);
+        assert_eq!(slot.read_record(), Ok(SlotRecord::default()));
+        slot.materialize(&source.repository, &tree).unwrap();
+        let record = SlotRecord {
+            worktree: Some(repository.0.clone()),
+            compiled: Vec::new(),
+        };
+        slot.write_record(&record).unwrap();
+
+        let [existing] = &existing_slots(&home.0).unwrap()[..] else {
+            panic!("one slot");
+        };
+        assert_eq!(existing.repository, source.repository);
+        assert_eq!(existing.index, 1);
+        assert_eq!(existing.directory.read_record(), Ok(record));
+        assert_eq!(existing.directory.tree(), Ok(tree));
+        existing.directory.remove().unwrap();
+        assert!(existing_slots(&home.0).unwrap().is_empty());
     }
 
     #[test]
