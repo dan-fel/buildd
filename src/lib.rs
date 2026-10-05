@@ -19,6 +19,7 @@ pub mod cargo;
 pub mod client;
 pub mod config;
 pub mod daemon;
+mod distance;
 mod git;
 pub mod protocol;
 mod scheduler;

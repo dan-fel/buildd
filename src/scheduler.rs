@@ -257,6 +257,11 @@ impl Job {
 }
 
 impl<D: Distance> Scheduler<D> {
+    /// The scheduler's measure of distance between trees.
+    pub(crate) fn distance_mut(&mut self) -> &mut D {
+        &mut self.distance
+    }
+
     pub(crate) fn new(capacity: usize, distance: D) -> Self {
         assert!(capacity > 0, "a scheduler runs at least one build");
         Self {

@@ -20,9 +20,12 @@ share one CPU budget instead of each assuming it owns the machine.
 - **Best slot.** A build takes the idle slot where Cargo has the least to
   do: one that already ran the same compilation (directory, command and
   Cargo arguments) before one that did not, and among those the one whose
-  checkout differs from the build's tree in the fewest paths
-  (`git diff-tree`), usually the slot that last built its worktree. It never
-  waits for a busy slot while another is idle.
+  checkout is closest to the build's tree. Closeness is the packages Cargo
+  compiles again: the paths that differ (`git diff-tree`), each changed
+  package counted with every workspace package that depends on it, learned
+  from `cargo metadata`, and a lockfile or build-configuration change
+  counting all of them. It never waits for a busy slot while another is
+  idle.
 - **One CPU budget.** Every Cargo the daemon runs shares one jobserver with
   `jobs` tokens.
 - **Deduplication and supersession.** A request equal to a queued or running

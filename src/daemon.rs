@@ -19,12 +19,11 @@ use crate::activity::ActivityLog;
 use crate::cargo;
 use crate::cargo::Line;
 use crate::config::{self, Config};
-use crate::git;
+use crate::distance::{GitDistance, Workspace};
 use crate::protocol::{Activity, BuildRequest, Message, Outcome, Request, Status, Usage};
-use crate::scheduler::{Distance, Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
+use crate::scheduler::{Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
 use crate::slot::{self, Pruning, SlotDirectory, slot_name};
 use crate::snapshot;
-use crate::snapshot::Revision;
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
 /// process group is killed.
@@ -71,12 +70,15 @@ enum Event {
         outcome: Outcome,
         usage: Option<Usage>,
     },
-    /// Slot `key` was kept within its disk limit by `pruning`, removing
-    /// compiled units `evicted`; None when that failed.
+    /// Slot `key` of `repository` was kept within its disk limit by
+    /// `pruning`, removing compiled units `evicted` (None when that failed),
+    /// and its checkout's `workspace` was read.
     Maintained {
         key: SlotKey,
+        repository: PathBuf,
         pruning: Option<Pruning>,
         evicted: Vec<String>,
+        workspace: Option<Workspace>,
     },
 }
 
@@ -400,9 +402,16 @@ impl Daemon {
                 }
                 Event::Maintained {
                     key,
+                    repository,
                     pruning,
                     evicted,
-                } => self.scheduler.maintained(key, pruning, &evicted),
+                    workspace,
+                } => {
+                    if let Some(workspace) = workspace {
+                        self.scheduler.distance_mut().learn(repository, workspace);
+                    }
+                    self.scheduler.maintained(key, pruning, &evicted)
+                }
             };
             for effect in effects {
                 self.apply(effect);
@@ -487,18 +496,29 @@ impl Daemon {
                     .name("buildd-maintain".into())
                     .spawn(move || {
                         let (pruning, evicted) = maintain(&directory, &name, limit, &used);
+                        // Knowing the packages lets slot choice weigh changes
+                        // by what Cargo compiles again.
+                        let workspace =
+                            Workspace::read(&directory.source()).unwrap_or_else(|error| {
+                                eprintln!("buildd: slot {name}: {error}");
+                                None
+                            });
                         let _ = events.send(Event::Maintained {
                             key,
+                            repository,
                             pruning,
                             evicted,
+                            workspace,
                         });
                     });
                 if let Err(error) = spawned {
                     eprintln!("buildd: could not start maintaining a slot: {error}");
                     let _ = self.events.send(Event::Maintained {
                         key,
+                        repository: PathBuf::new(),
                         pruning: None,
                         evicted: Vec::new(),
+                        workspace: None,
                     });
                 }
             }
@@ -615,49 +635,6 @@ fn maintain(
             eprintln!("buildd: slot {name} could not be kept within its limit: {error}");
             (None, Vec::new())
         }
-    }
-}
-
-/// Distances between trees from `git diff-tree`: the number of paths that
-/// differ, remembered per pair of trees.
-#[derive(Default)]
-struct GitDistance {
-    known: HashMap<(PathBuf, Revision, Revision), u64>,
-}
-
-/// How many distances [`GitDistance`] remembers before it starts over.
-const KNOWN_DISTANCES: usize = 4096;
-
-impl Distance for GitDistance {
-    fn distance(&mut self, repository: &Path, from: &Revision, to: &Revision) -> u64 {
-        if from == to {
-            return 0;
-        }
-        let (low, high) = if from < to { (from, to) } else { (to, from) };
-        let key = (repository.to_owned(), low.clone(), high.clone());
-        if let Some(distance) = self.known.get(&key) {
-            return *distance;
-        }
-        let mut command = git::command(repository);
-        command
-            .arg("--git-dir")
-            .arg(repository)
-            .args(["diff-tree", "-r", "--name-only", "--no-renames"])
-            .arg(low.to_string())
-            .arg(high.to_string());
-        let distance = match git::run(command) {
-            Ok(paths) => paths.lines().count() as u64,
-            // An unknown distance ranks behind every known one.
-            Err(error) => {
-                eprintln!("buildd: could not compare trees: {error}");
-                return u64::MAX;
-            }
-        };
-        if self.known.len() >= KNOWN_DISTANCES {
-            self.known.clear();
-        }
-        self.known.insert(key, distance);
-        distance
     }
 }
 
