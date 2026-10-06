@@ -300,6 +300,9 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
             if slot.undersized {
                 line.push(Span::from("  limit below what its builds use").red());
             }
+            if let Some(crates) = slot.duplicated.filter(|crates| *crates > 0) {
+                line.push(Span::from(format!("  {crates} duplicated crates")).yellow());
+            }
             Line::from(line)
         }
     };
@@ -408,6 +411,12 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             format!(
                 "{slot} stopped {operation} @ {}: nobody waits",
                 revision.short()
+            ),
+            Style::new().fg(Color::Yellow),
+        ),
+        EventKind::Duplicated { slot, crates } => (
+            format!(
+                "{slot} holds {crates} crates in several variants: builds select different features"
             ),
             Style::new().fg(Color::Yellow),
         ),
@@ -608,6 +617,7 @@ mod tests {
                             phase: Phase::Testing,
                         }),
                         last: None,
+                        duplicated: None,
                     },
                     SlotStatus {
                         name: "app-c716/1".into(),
@@ -626,6 +636,7 @@ mod tests {
                             build_ms: 300_000,
                             test_ms: Some(200_000),
                         }),
+                        duplicated: Some(12),
                     },
                 ],
                 queue: vec![QueuedBuild {
@@ -722,7 +733,7 @@ mod tests {
             "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free, below the floor",
             "check -p app-ui @ 7f3a9c0d1e",
             "for agent-1, agent-7  shared by 2  testing · 4 jobs · compiled 3 · reused 412",
-            "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use",
+            "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use  12 duplicated crates",
             "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s · ~40.0 s · for app-c716/0 (~30.0 s, cold ~300.0 s)",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",

@@ -101,6 +101,8 @@ enum Event {
         pruning: Option<Pruning>,
         evicted: Vec<String>,
         workspace: Option<Workspace>,
+        /// Crates its target holds in several variants, when counted.
+        duplicated: Option<usize>,
     },
 }
 
@@ -463,11 +465,16 @@ impl Daemon {
                     pruning,
                     evicted,
                     workspace,
+                    duplicated,
                 } => {
                     if let Some(workspace) = workspace {
                         self.scheduler.distance_mut().learn(repository, workspace);
                     }
-                    self.scheduler.maintained(key, pruning, &evicted)
+                    let report =
+                        duplicated.and_then(|crates| self.scheduler.duplicated(key, crates));
+                    let mut effects = self.scheduler.maintained(key, pruning, &evicted);
+                    effects.extend(report);
+                    effects
                 }
             };
             for effect in effects {
@@ -507,7 +514,7 @@ impl Daemon {
                 units += gone_units;
                 freed += before.saturating_sub(after);
             }
-            effects.extend(self.scheduler.maintained(key, pruning, &evicted));
+            effects.extend(self.scheduler.reclaimed(key, pruning, &evicted));
         }
         log!(
             "disk: {} short of the floor of {}: idle slots gave up {caches} caches and \
@@ -612,6 +619,9 @@ impl Daemon {
                     .name("buildd-maintain".into())
                     .spawn(move || {
                         let (pruning, evicted) = maintain(&directory, &name, limit, &used);
+                        let duplicated = slot::duplicated_crates(&directory.target())
+                            .inspect_err(|error| log!("slot {name}: {error}"))
+                            .ok();
                         // Knowing the packages lets slot choice weigh changes
                         // by what Cargo compiles again.
                         let workspace =
@@ -625,6 +635,7 @@ impl Daemon {
                             pruning,
                             evicted,
                             workspace,
+                            duplicated,
                         });
                     });
                 if let Err(error) = spawned {
@@ -635,6 +646,7 @@ impl Daemon {
                         pruning: None,
                         evicted: Vec::new(),
                         workspace: None,
+                        duplicated: None,
                     });
                 }
             }

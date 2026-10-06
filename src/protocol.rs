@@ -149,6 +149,9 @@ pub struct SlotStatus {
     /// limit is below what they need, and they compile from scratch.
     pub undersized: bool,
     pub build: Option<RunningBuild>,
+    /// Crates its target holds in more than one variant, when counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicated: Option<usize>,
     /// How its latest build ended, since the daemon started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<LastBuild>,
@@ -347,6 +350,9 @@ pub enum EventKind {
         caches: usize,
         units: usize,
     },
+    /// More crates than before are compiled in several variants in `slot`:
+    /// builds there select different features.
+    Duplicated { slot: String, crates: usize },
     /// A slot was kept within its limit: `caches` incremental caches and
     /// `units` compiled units went, `in_use` of them used in the last ten
     /// minutes, or the whole target when `cleared`.

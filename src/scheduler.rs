@@ -220,6 +220,8 @@ struct Slot {
     undersized: bool,
     /// How its latest build since the daemon started ended.
     last: Option<LastBuild>,
+    /// Crates its target holds in several variants, when last counted.
+    duplicated: Option<usize>,
     /// What its latest build of each compilation used.
     compilations: Vec<CompilationRun>,
     /// When a build last used each compiled unit, in seconds since the Unix
@@ -431,6 +433,7 @@ impl<D: Distance> Scheduler<D> {
             size: None,
             undersized: false,
             last: None,
+            duplicated: None,
             compilations: record.compilations,
             units: record.units.into_iter().collect(),
         });
@@ -800,6 +803,20 @@ impl<D: Distance> Scheduler<D> {
         Some(Effect::Reclaim { slots, needed })
     }
 
+    /// Slot `key`'s target holds `crates` crates in several variants; a
+    /// rise is reported.
+    pub(crate) fn duplicated(&mut self, key: SlotKey, crates: usize) -> Option<Effect> {
+        let slot = &mut self.slots[key.0];
+        let rose = crates > slot.duplicated.unwrap_or(0);
+        slot.duplicated = Some(crates);
+        rose.then(|| {
+            Effect::Report(EventKind::Duplicated {
+                slot: slot_name(&slot.repository, slot.index),
+                crates,
+            })
+        })
+    }
+
     /// When the next idle slot is due for maintenance, if one will be.
     pub(crate) fn next_maintenance(&self) -> Option<Instant> {
         self.slots
@@ -832,13 +849,38 @@ impl<D: Distance> Scheduler<D> {
         pruning: Option<Pruning>,
         evicted: &[String],
     ) -> Vec<Effect> {
+        self.handed_back(key, pruning, evicted, true)
+    }
+
+    /// Slot `key` gave up what builds used longest ago to free disk, as
+    /// `pruning` says, removing compiled units `evicted`. Its own limit was
+    /// not looked at, so it stays due for maintenance.
+    pub(crate) fn reclaimed(
+        &mut self,
+        key: SlotKey,
+        pruning: Option<Pruning>,
+        evicted: &[String],
+    ) -> Vec<Effect> {
+        self.handed_back(key, pruning, evicted, false)
+    }
+
+    /// A slot handed out to free disk is back; its limit was kept when
+    /// `limit_kept`.
+    fn handed_back(
+        &mut self,
+        key: SlotKey,
+        pruning: Option<Pruning>,
+        evicted: &[String],
+        limit_kept: bool,
+    ) -> Vec<Effect> {
         let slot = &mut self.slots[key.0];
-        assert!(
-            slot.maintaining,
-            "only a slot being maintained is maintained"
-        );
+        assert!(slot.maintaining, "only a slot handed out comes back");
         slot.maintaining = false;
-        slot.unmeasured = 0;
+        if limit_kept {
+            slot.unmeasured = 0;
+        } else {
+            slot.unmeasured = slot.unmeasured.max(1);
+        }
         slot.size = pruning.map(Pruning::size);
         slot.undersized = pruning.is_some_and(Pruning::undersized);
         let mut effects = Vec::new();
@@ -1117,6 +1159,7 @@ impl<D: Distance> Scheduler<D> {
             size: None,
             undersized: false,
             last: None,
+            duplicated: None,
             compilations: Vec::new(),
             units: HashMap::new(),
         });
@@ -1220,6 +1263,7 @@ impl<D: Distance> Scheduler<D> {
                     }
                 }),
                 last: slot.last.clone(),
+                duplicated: slot.duplicated,
             })
             .collect();
         let queue = self
@@ -2213,8 +2257,10 @@ mod tests {
         assert_eq!(scheduler.reclaim(7), None, "no slot is idle any more");
         let waiting = submit(&mut scheduler, 4, "/d", "d1");
         assert!(starts(&waiting).is_empty());
-        let done = scheduler.maintained(*key, Some(Pruning::Within { size: 1 }), &[]);
+        let done = scheduler.reclaimed(*key, Some(Pruning::Within { size: 1 }), &[]);
         assert_eq!(starts(&done).len(), 1, "{done:?}");
+        // Its limit still has to be kept after that build.
+        assert!(scheduler.slots[key.0].unmeasured > 0);
     }
 
     #[test]

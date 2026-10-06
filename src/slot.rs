@@ -391,6 +391,44 @@ pub(crate) fn reclaim(
         .collect()
 }
 
+/// How many crates have their library compiled in more than one variant in
+/// a profile of `target`: what builds selecting different features leave
+/// behind, besides crates the lockfile holds in two versions.
+///
+/// # Errors
+/// When the target cannot be read.
+pub(crate) fn duplicated_crates(target: &Path) -> Result<usize, String> {
+    if !target.exists() {
+        return Ok(0);
+    }
+    let mut duplicated = 0;
+    for (profile, _) in profile_directories(target)? {
+        let deps = profile.join("deps");
+        if !deps.is_dir() {
+            continue;
+        }
+        let mut variants = BTreeMap::<String, usize>::new();
+        for path in read_directory(&deps)? {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(stem) = name
+                .strip_prefix("lib")
+                .and_then(|name| name.strip_suffix(".rlib"))
+            else {
+                continue;
+            };
+            if let Some((crate_name, hash)) = stem.rsplit_once('-')
+                && unit_hash(name).is_some_and(|unit| unit == hash)
+            {
+                *variants.entry(crate_name.to_owned()).or_default() += 1;
+            }
+        }
+        duplicated += variants.values().filter(|count| **count > 1).count();
+    }
+    Ok(duplicated)
+}
+
 /// The disk space free for unprivileged use on the volume holding `path`.
 ///
 /// # Errors
@@ -805,6 +843,23 @@ mod tests {
             .unwrap()
             .set_modified(time)
             .unwrap();
+    }
+
+    #[test]
+    fn crates_compiled_in_several_variants_are_counted_per_profile() {
+        let home = TempDir::new();
+        let target = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0).target();
+        assert_eq!(duplicated_crates(&target), Ok(0));
+        for name in [
+            "debug/deps/libserde-0123456789abcdef.rlib",
+            "debug/deps/libserde-fedcba9876543210.rlib",
+            "debug/deps/libserde-fedcba9876543210.rmeta",
+            "debug/deps/libone-0123456789abcdef.rlib",
+            "release/deps/libserde-0123456789abcdef.rlib",
+        ] {
+            file(&target.join(name), 10);
+        }
+        assert_eq!(duplicated_crates(&target), Ok(1));
     }
 
     #[test]
