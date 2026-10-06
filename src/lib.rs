@@ -27,6 +27,7 @@ mod memory;
 mod passed;
 mod products;
 pub mod protocol;
+mod remote;
 mod scheduler;
 mod slot;
 pub mod snapshot;

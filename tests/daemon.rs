@@ -108,6 +108,7 @@ fn request(directory: &Path, command: Command, args: &[&str]) -> BuildRequest {
         label: None,
         copy_to: None,
         rerun_all: false,
+        os: None,
     }
 }
 
@@ -420,6 +421,83 @@ fn test_binaries_that_passed_unchanged_are_skipped_until_their_package_changes()
     assert!(outcome(&all).success(), "{all:#?}");
     assert_eq!(skipped(&all), None, "--rerun-all runs everything");
     assert_eq!(daemon.activity().totals.skipped, 3);
+}
+
+#[test]
+fn a_tree_pushed_into_a_mirror_builds_like_a_worktree_and_drain_stops_new_builds() {
+    use buildd::protocol::{Mirror, Request, RevisionRequest};
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    let daemon = Daemon::start(1);
+    let ask = |request: &Request| {
+        let mut stream = daemon.connect();
+        let mut text = serde_json::to_string(request).unwrap();
+        text.push('\n');
+        stream.write_all(text.as_bytes()).unwrap();
+        BufReader::new(stream)
+            .lines()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    let rejected = ask(&Request::Mirror {
+        project: "../escape".into(),
+    });
+    assert!(rejected[0].contains("not a project name"), "{rejected:?}");
+    let answer = ask(&Request::Mirror {
+        project: "fixture-1".into(),
+    });
+    let mirror: Mirror = serde_json::from_str(&answer[0]).unwrap();
+
+    // Another machine's daemon pushes a commit of the tree it built.
+    let repository = crate_repository(None);
+    let tree = git(&repository.0, &["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_owned();
+    git(
+        &repository.0,
+        &[
+            "push",
+            "-q",
+            mirror.path.to_str().unwrap(),
+            &format!("HEAD:refs/buildd/{tree}"),
+        ],
+    );
+    let build = |tree: &str| {
+        let request = Request::BuildRevision(RevisionRequest {
+            project: "fixture-1".into(),
+            revision: serde_json::from_value(serde_json::Value::String(tree.into())).unwrap(),
+            worktree: "/elsewhere/worktree".into(),
+            prefix: "".into(),
+            operation: Operation {
+                command: Command::Check,
+                args: Vec::new(),
+                rustflags: Vec::new(),
+            },
+            label: Some("remote".into()),
+            rerun_all: false,
+        });
+        ask(&request)
+            .iter()
+            .map(|line| serde_json::from_str::<Message>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let built = build(&tree);
+    assert!(outcome(&built).success(), "{built:#?}");
+    assert_eq!(started(&built), tree);
+    let unknown = build(&"0".repeat(40));
+    assert!(
+        matches!(&unknown[..], [Message::Rejected { reason }] if reason.contains("was not pushed")),
+        "{unknown:#?}"
+    );
+
+    let drained = client::drain(daemon.connect(), true).unwrap();
+    assert!(drained.draining);
+    let refused = build(&tree);
+    assert!(
+        matches!(&refused[..], [Message::Rejected { reason }] if reason.contains("draining")),
+        "{refused:#?}"
+    );
+    assert!(!client::drain(daemon.connect(), false).unwrap().draining);
 }
 
 #[test]

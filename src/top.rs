@@ -5,7 +5,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use buildd::protocol::{Activity, EventKind, Outcome, Phase, SlotStatus};
+use buildd::protocol::{Activity, EventKind, Outcome, Phase, RemoteActivity, SlotStatus};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -57,10 +57,21 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
     let status = &activity.status;
     let slot_rows = 2 * status.slots.len().max(1);
     let queue_rows = status.queue.len().clamp(1, 8);
-    let [header, slots, queue, totals, events, footer] = Layout::vertical([
+    let remote_lines = activity
+        .remotes
+        .iter()
+        .flat_map(remote_lines)
+        .collect::<Vec<_>>();
+    let remote_rows = if remote_lines.is_empty() {
+        0
+    } else {
+        remote_lines.len() + 2
+    };
+    let [header, slots, queue, remotes, totals, events, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(rows(slot_rows + 2)),
         Constraint::Length(rows(queue_rows + 2)),
+        Constraint::Length(rows(remote_rows)),
         Constraint::Length(7),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -145,6 +156,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         Paragraph::new(queue_lines).block(Block::bordered().title(" queue ")),
         queue,
     );
+    if !remote_lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(remote_lines).block(Block::bordered().title(" remote hosts ")),
+            remotes,
+        );
+    }
 
     let t = &activity.totals;
     let crates = t.compiled + t.fresh;
@@ -214,6 +231,64 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         events,
     );
     frame.render_widget(Line::from(" q quit").dark_gray(), footer);
+}
+
+/// A remote host's lines: its budget, then a line per slot and its queue,
+/// or why it could not be asked.
+fn remote_lines(remote: &RemoteActivity) -> Vec<Line<'static>> {
+    let name = Span::from(format!("{} ({})", remote.name, remote.os)).bold();
+    let activity = match &remote.activity {
+        Ok(activity) => activity,
+        Err(error) => {
+            return vec![Line::from(vec![
+                name,
+                Span::from(format!("  unreachable: {error}")).red(),
+            ])];
+        }
+    };
+    let status = &activity.status;
+    let free = status.free_disk.map_or_else(
+        || "free disk unknown".to_owned(),
+        |free| format!("{} free", gib(free)),
+    );
+    let mut first = vec![
+        name,
+        Span::from(format!(
+            "  jobs {}/{} · memory {:.1}/{} · {free} · {} queued",
+            status.jobs - status.idle_jobs,
+            status.jobs,
+            gib_number(status.memory_in_use),
+            gib(status.memory),
+            status.queue.len()
+        )),
+    ];
+    if status.draining {
+        first.push(Span::from("  draining").yellow());
+    }
+    std::iter::once(Line::from(first))
+        .chain(status.slots.iter().map(|slot| {
+            let what = match &slot.build {
+                Some(build) => {
+                    let phase = match build.phase {
+                        Phase::Compiling => "compiling",
+                        Phase::Testing => "testing",
+                        Phase::Copying => "copying",
+                    };
+                    format!(
+                        "{} @ {} for {}  {} {}",
+                        build.operation,
+                        build.revision.short(),
+                        build.who.join(", "),
+                        phase,
+                        seconds(build.elapsed_ms)
+                    )
+                }
+                None if slot.maintaining => "pruning".to_owned(),
+                None => "idle".to_owned(),
+            };
+            Line::from(format!("    {:<26} {what}", slot.name))
+        }))
+        .collect()
 }
 
 /// A slot's two lines: its disk and what it does, then for whom.
@@ -605,6 +680,7 @@ mod tests {
                 min_free: 15 << 30,
                 memory: 18 << 30,
                 memory_in_use: 14 << 30,
+                draining: false,
                 slots: vec![
                     SlotStatus {
                         name: "app-c716/0".into(),
@@ -676,6 +752,11 @@ mod tests {
                 first_builds: 6,
                 warm_first_builds: 6,
             },
+            remotes: vec![RemoteActivity {
+                name: "pc".into(),
+                os: "linux".into(),
+                activity: Err("ssh: connect to host pc port 22: Connection refused".into()),
+            }],
             events: vec![
                 Event {
                     at_ms: at(9),
@@ -746,6 +827,7 @@ mod tests {
             "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s · ~40.0 s · for app-c716/0 (~30.0 s, cold ~300.0 s)",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",
+            "pc (linux)  unreachable: ssh: connect to host pc port 22: Connection refused",
             "new worktrees starting on a warm slot: 6 of 6",
             "separate targets ≈ 15 × 12.0 GiB = 180.0 GiB (estimate)",
             "agent-7 joined check -p app-ui @ 7f3a9c0d1e: no extra Cargo run",

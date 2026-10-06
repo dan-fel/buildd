@@ -20,7 +20,7 @@ use crate::budget::{Budget, Lease};
 use crate::cargo;
 use crate::cargo::Line;
 use crate::cargo::{Compilation, Operation};
-use crate::config::{self, Config};
+use crate::config::{self, Config, Remote};
 use crate::distance::{GitDistance, Workspace};
 use crate::git;
 use crate::log::log;
@@ -28,11 +28,13 @@ use crate::memory;
 use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
-    Activity, BuildRequest, EventKind, Message, Outcome, Request, Status, Usage,
+    Activity, BuildRequest, EventKind, Message, Mirror, Outcome, RemoteActivity, Request,
+    RevisionRequest, Status, Usage,
 };
+use crate::remote;
 use crate::scheduler::{Effect, IdleSlot, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
 use crate::slot::{self, Pruning, SlotDirectory, slot_name};
-use crate::snapshot;
+use crate::snapshot::{self, Source};
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
 /// process group is killed.
@@ -58,6 +60,11 @@ enum Event {
     },
     Activity {
         reply: Sender<Activity>,
+    },
+    /// Stop taking builds, or take them again.
+    Drain {
+        drain: bool,
+        reply: Sender<Status>,
     },
     Output {
         job: JobId,
@@ -150,6 +157,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     let (events, received) = crossbeam_channel::unbounded();
     let accepting = Accepting {
         home: home.to_owned(),
+        remotes: Arc::new(config.remotes.clone()),
         events: events.clone(),
         next_waiter: Arc::new(AtomicU64::new(0)),
     };
@@ -158,7 +166,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .spawn(move || accepting.accept(&listener))
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
     let mut scheduler = Scheduler::new(config.slots, config.memory, GitDistance::default());
-    restore_slots(home, config, &mut scheduler)?;
+    restore_slots(home, &config, &mut scheduler)?;
     Daemon {
         home: home.to_owned(),
         config,
@@ -170,6 +178,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         log: ActivityLog::new(SystemTime::now(), EventFile::new(home)),
         reclaiming: false,
         below_floor: false,
+        draining: false,
     }
     .drive(&received)
 }
@@ -180,7 +189,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
 /// disk stays within `slots` times the limit.
 fn restore_slots(
     home: &Path,
-    config: Config,
+    config: &Config,
     scheduler: &mut Scheduler<GitDistance>,
 ) -> Result<(), String> {
     for existing in slot::existing_slots(home)? {
@@ -222,6 +231,7 @@ fn restore_slots(
 
 struct Accepting {
     home: PathBuf,
+    remotes: Arc<Vec<Remote>>,
     events: Sender<Event>,
     next_waiter: Arc<AtomicU64>,
 }
@@ -238,6 +248,7 @@ impl Accepting {
             };
             let connection = Connection {
                 home: self.home.clone(),
+                remotes: Arc::clone(&self.remotes),
                 events: self.events.clone(),
                 waiter: WaiterId(self.next_waiter.fetch_add(1, Ordering::Relaxed)),
             };
@@ -254,6 +265,7 @@ impl Accepting {
 /// One client's connection.
 struct Connection {
     home: PathBuf,
+    remotes: Arc<Vec<Remote>>,
     events: Sender<Event>,
     waiter: WaiterId,
 }
@@ -287,21 +299,204 @@ impl Connection {
             Ok(Request::Activity) => {
                 let (reply, activity) = crossbeam_channel::bounded(1);
                 if self.events.send(Event::Activity { reply }).is_ok()
-                    && let Ok(activity) = activity.recv()
+                    && let Ok(mut activity) = activity.recv()
                 {
+                    activity.remotes = self.remote_activity();
                     let _ = write_line(&mut stream, &activity);
                 }
             }
-            Ok(Request::Build(request)) => self.build(stream, reader, request),
+            Ok(Request::Drain { drain }) => {
+                let (reply, status) = crossbeam_channel::bounded(1);
+                if self.events.send(Event::Drain { drain, reply }).is_ok()
+                    && let Ok(status) = status.recv()
+                {
+                    let _ = write_line(&mut stream, &status);
+                }
+            }
+            Ok(Request::Mirror { project }) => match mirror(&self.home, &project) {
+                Ok(path) => {
+                    let _ = write_line(&mut stream, &Mirror { path });
+                }
+                Err(reason) => {
+                    let _ = write_line(&mut stream, &Message::Rejected { reason });
+                }
+            },
+            Ok(Request::Build(request)) => match request.os.as_deref() {
+                Some(os) if os != std::env::consts::OS => {
+                    self.build_remotely(stream, reader, request)
+                }
+                _ => self.build(stream, reader, request),
+            },
+            Ok(Request::BuildRevision(request)) => self.build_revision(stream, reader, request),
         }
     }
 
-    fn build(
+    /// What each remote host's daemon does, asked in parallel.
+    fn remote_activity(&self) -> Vec<RemoteActivity> {
+        std::thread::scope(|scope| {
+            let asked = self
+                .remotes
+                .iter()
+                .map(|remote| scope.spawn(|| remote::activity(&self.home, remote)))
+                .collect::<Vec<_>>();
+            self.remotes
+                .iter()
+                .zip(asked)
+                .map(|(remote, asked)| RemoteActivity {
+                    name: remote.name.clone(),
+                    os: remote.os.clone(),
+                    activity: asked
+                        .join()
+                        .expect("asking a remote does not panic")
+                        .map(Box::new),
+                })
+                .collect()
+        })
+    }
+
+    /// Builds a tree another daemon pushed into this daemon's mirror.
+    fn build_revision(
+        self,
+        mut stream: UnixStream,
+        reader: BufReader<UnixStream>,
+        request: RevisionRequest,
+    ) {
+        let prepared = request.operation.validate().and_then(|()| {
+            let repository = existing_mirror(&self.home, &request.project)?;
+            if request.prefix.is_absolute()
+                || request
+                    .prefix
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            {
+                return Err(format!(
+                    "the directory to build in is outside the tree: {}",
+                    request.prefix.display()
+                ));
+            }
+            let mut exists = git::command(&repository);
+            exists
+                .arg("--git-dir")
+                .arg(&repository)
+                .args(["cat-file", "-e"])
+                .arg(format!("{}^{{tree}}", request.revision));
+            git::run(exists)
+                .map_err(|_| format!("tree {} was not pushed", request.revision.short()))?;
+            Ok(Source {
+                repository,
+                worktree: request.worktree.clone(),
+                prefix: request.prefix.clone(),
+                index: PathBuf::new(),
+            })
+        });
+        let source = match prepared {
+            Ok(source) => source,
+            Err(reason) => {
+                let _ = write_line(&mut stream, &Message::Rejected { reason });
+                return;
+            }
+        };
+        let submission = Submission {
+            waiter: self.waiter,
+            source,
+            revision: request.revision,
+            operation: request.operation,
+            label: request.label,
+            copy_to: None,
+            rerun_all: request.rerun_all,
+        };
+        self.submit(stream, reader, submission);
+    }
+
+    /// Snapshots the worktree here and builds the tree on the remote host
+    /// for the requested OS.
+    fn build_remotely(
         self,
         mut stream: UnixStream,
         mut reader: BufReader<UnixStream>,
         request: BuildRequest,
     ) {
+        let os = request.os.clone().expect("only builds for an OS go remote");
+        let prepared = request.operation.validate().and_then(|()| {
+            let remote = self
+                .remotes
+                .iter()
+                .find(|remote| remote.os == os)
+                .ok_or_else(|| {
+                    format!("no remote host builds for {os}; see [[remote]] in config.toml")
+                })?;
+            if request.copy_to.is_some() {
+                return Err("--copy-to builds on this machine only".into());
+            }
+            let source = snapshot::resolve(&request.directory)?;
+            let revision = source.snapshot(&self.home.join("tmp"))?;
+            Ok((remote.clone(), source, revision))
+        });
+        let (remote, source, revision) = match prepared {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                let _ = write_line(&mut stream, &Message::Rejected { reason });
+                return;
+            }
+        };
+        let label = request.label.or_else(|| {
+            source
+                .worktree
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+        let revision_request = RevisionRequest {
+            project: String::new(),
+            revision: revision.clone(),
+            worktree: source.worktree.clone(),
+            prefix: source.prefix.clone(),
+            operation: request.operation,
+            label,
+            rerun_all: request.rerun_all,
+        };
+        let pushing = format!(
+            "buildd: pushing tree {} to {} ({})",
+            revision.short(),
+            remote.name,
+            remote.ssh
+        );
+        let _ = write_line(&mut stream, &Message::Stderr { line: pushing });
+        let mut writer = match stream.try_clone() {
+            Ok(writer) => writer,
+            Err(error) => {
+                log!("could not write to a client: {error}");
+                return;
+            }
+        };
+        let built = remote::build(
+            &self.home,
+            &remote,
+            &source,
+            &revision,
+            revision_request,
+            |child| {
+                // The end of the client's stream withdraws the build there.
+                let child = Arc::clone(child);
+                let _ = std::thread::Builder::new()
+                    .name("buildd-client-watch".into())
+                    .spawn(move || {
+                        let mut buffer = [0; 256];
+                        while matches!(reader.read(&mut buffer), Ok(read) if read > 0) {}
+                        let _ = child
+                            .lock()
+                            .expect("no thread panics holding the ssh child")
+                            .kill();
+                    });
+            },
+            |message| write_line(&mut writer, message).is_ok(),
+        );
+        if let Err(reason) = built {
+            let _ = write_line(&mut stream, &Message::Rejected { reason });
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn build(self, mut stream: UnixStream, reader: BufReader<UnixStream>, request: BuildRequest) {
         let copy_to = request.copy_to;
         let prepared = request.operation.validate().and_then(|()| {
             if let Some(directory) = copy_to
@@ -324,7 +519,6 @@ impl Connection {
                 return;
             }
         };
-        let (messages, received) = crossbeam_channel::unbounded();
         let submission = Submission {
             waiter: self.waiter,
             source,
@@ -334,6 +528,19 @@ impl Connection {
             copy_to,
             rerun_all: request.rerun_all,
         };
+        self.submit(stream, reader, submission);
+    }
+
+    /// Hands `submission` to the scheduler and passes its messages to the
+    /// client until the last one; the end of the client's stream withdraws
+    /// it.
+    fn submit(
+        self,
+        mut stream: UnixStream,
+        mut reader: BufReader<UnixStream>,
+        submission: Submission,
+    ) {
+        let (messages, received) = crossbeam_channel::unbounded();
         if self
             .events
             .send(Event::Submit {
@@ -373,6 +580,65 @@ impl Connection {
     }
 }
 
+/// How many pushed trees a mirror keeps referenced, newest first: enough for
+/// the next push to send only what changed.
+const MIRROR_REFS: usize = 20;
+
+/// The path of `project`'s mirror under `home`, after checking the name.
+fn mirror_path(home: &Path, project: &str) -> Result<PathBuf, String> {
+    let valid = !project.is_empty()
+        && !project.starts_with('.')
+        && project
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !valid {
+        return Err(format!("not a project name: {project:?}"));
+    }
+    Ok(home.join("mirrors").join(project))
+}
+
+/// `project`'s mirror, which must exist.
+fn existing_mirror(home: &Path, project: &str) -> Result<PathBuf, String> {
+    let path = mirror_path(home, project)?;
+    std::fs::canonicalize(&path).map_err(|_| format!("no mirror of {project}: push to it first"))
+}
+
+/// `project`'s mirror under `home`, created when absent, with only its
+/// newest [`MIRROR_REFS`] pushed trees still referenced.
+fn mirror(home: &Path, project: &str) -> Result<PathBuf, String> {
+    let path = mirror_path(home, project)?;
+    if !path.exists() {
+        std::fs::create_dir_all(&path)
+            .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+        let mut init = git::command(&path);
+        init.args(["init", "--bare", "-q", "--template="]);
+        git::run(init)?;
+        // Loose refs keep their push times, which pruning goes by.
+        let mut config = git::command(&path);
+        config.args(["config", "gc.auto", "0"]);
+        git::run(config)?;
+    }
+    let refs = path.join("refs/buildd");
+    if let Ok(entries) = std::fs::read_dir(&refs) {
+        let mut pushed = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((modified, entry.file_name()))
+            })
+            .collect::<Vec<_>>();
+        pushed.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, name) in pushed.into_iter().skip(MIRROR_REFS) {
+            let mut delete = git::command(&path);
+            delete
+                .args(["update-ref", "-d"])
+                .arg(format!("refs/buildd/{}", name.to_string_lossy()));
+            git::run(delete)?;
+        }
+    }
+    std::fs::canonicalize(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 fn write_line(stream: &mut UnixStream, value: &impl serde::Serialize) -> std::io::Result<()> {
     let mut text = serde_json::to_string(value).expect("protocol values serialize");
     text.push('\n');
@@ -393,6 +659,8 @@ struct Daemon {
     /// Free disk was below the floor when last looked at, and nothing more
     /// could be done then.
     below_floor: bool,
+    /// It takes no new builds.
+    draining: bool,
 }
 
 impl Daemon {
@@ -420,8 +688,28 @@ impl Daemon {
                     submission,
                     messages,
                 } => {
+                    if self.draining {
+                        let reason = "this daemon is draining: it takes no new builds".to_owned();
+                        let _ = messages.send(Message::Rejected { reason });
+                        continue;
+                    }
                     self.waiters.insert(submission.waiter, messages);
                     self.scheduler.submit(submission)
+                }
+                Event::Drain { drain, reply } => {
+                    if drain != self.draining {
+                        log!(
+                            "{}",
+                            if drain {
+                                "draining"
+                            } else {
+                                "taking builds again"
+                            }
+                        );
+                    }
+                    self.draining = drain;
+                    let _ = reply.send(self.status());
+                    Vec::new()
                 }
                 Event::Withdraw { waiter } => {
                     self.waiters.remove(&waiter);
@@ -568,6 +856,7 @@ impl Daemon {
             min_free: self.config.min_free,
             memory,
             memory_in_use,
+            draining: self.draining,
             slots,
             queue,
         }

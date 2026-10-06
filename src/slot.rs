@@ -24,17 +24,6 @@ use crate::snapshot::Revision;
 /// removing it makes their next compilation start from scratch.
 const IN_USE: Duration = Duration::from_secs(10 * 60);
 
-/// Fixed identity and date for slot commits, so one tree is always one
-/// commit.
-const COMMIT_ENVIRONMENT: [(&str, &str); 6] = [
-    ("GIT_AUTHOR_NAME", "buildd"),
-    ("GIT_AUTHOR_EMAIL", "buildd@localhost"),
-    ("GIT_AUTHOR_DATE", "1970-01-01T00:00:00Z"),
-    ("GIT_COMMITTER_NAME", "buildd"),
-    ("GIT_COMMITTER_EMAIL", "buildd@localhost"),
-    ("GIT_COMMITTER_DATE", "1970-01-01T00:00:00Z"),
-];
-
 /// What a slot keeps on disk that its checkout and target do not tell: the
 /// worktree it last built for, what its builds of each compilation used, and
 /// the compiled units its target holds. A daemon reads it back when it
@@ -211,20 +200,9 @@ impl SlotDirectory {
             })
             .map_err(|error| format!("could not write {}: {error}", alternates.display()))?;
 
-        let mut commit = git::command(&source);
-        commit
-            .envs(COMMIT_ENVIRONMENT)
-            .args([
-                "-c",
-                "commit.gpgSign=false",
-                "commit-tree",
-                "-m",
-                "buildd snapshot",
-            ])
-            .arg(revision.to_string());
-        let commit = git::run(commit)?;
+        let commit = git::snapshot_commit(git::command(&source), revision)?;
         let mut reset = git::command(&source);
-        reset.args(["reset", "-q", "--hard", commit.trim()]);
+        reset.args(["reset", "-q", "--hard", &commit]);
         git::run(reset)?;
         let mut clean = git::command(&source);
         clean.args(["clean", "-q", "-ffdx"]);
@@ -738,7 +716,7 @@ pub(crate) fn slot_name(repository: &Path, index: usize) -> String {
 
 /// The directory name of a repository's slots: a readable name and a hash of
 /// the repository's path, so two repositories never share slots.
-fn project_name(repository: &Path) -> String {
+pub(crate) fn project_name(repository: &Path) -> String {
     let readable = if repository.file_name().is_some_and(|name| name == ".git") {
         repository.parent().and_then(Path::file_name)
     } else {

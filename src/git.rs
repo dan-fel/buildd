@@ -62,3 +62,32 @@ pub(crate) fn changed_paths(
         .arg(to.to_string());
     run(diff).map(|paths| paths.lines().map(str::to_owned).collect())
 }
+
+/// Fixed identity and date for snapshot commits, so one tree is always one
+/// commit, in every repository.
+const COMMIT_ENVIRONMENT: [(&str, &str); 6] = [
+    ("GIT_AUTHOR_NAME", "buildd"),
+    ("GIT_AUTHOR_EMAIL", "buildd@localhost"),
+    ("GIT_AUTHOR_DATE", "1970-01-01T00:00:00Z"),
+    ("GIT_COMMITTER_NAME", "buildd"),
+    ("GIT_COMMITTER_EMAIL", "buildd@localhost"),
+    ("GIT_COMMITTER_DATE", "1970-01-01T00:00:00Z"),
+];
+
+/// Makes the commit of tree `revision` alone with `git`, a git command for
+/// the repository to make it in, and returns its id.
+pub(crate) fn snapshot_commit(
+    mut git: Command,
+    revision: &crate::snapshot::Revision,
+) -> Result<String, String> {
+    git.envs(COMMIT_ENVIRONMENT)
+        .args([
+            "-c",
+            "commit.gpgSign=false",
+            "commit-tree",
+            "-m",
+            "buildd snapshot",
+        ])
+        .arg(revision.to_string());
+    run(git).map(|commit| commit.trim().to_owned())
+}

@@ -20,6 +20,16 @@ use crate::snapshot::Revision;
 pub enum Request {
     /// Build the current content of the worktree holding `directory`.
     Build(BuildRequest),
+    /// Build a tree another machine's daemon pushed into this daemon's
+    /// mirror of a project; answered like [`Request::Build`].
+    BuildRevision(RevisionRequest),
+    /// The bare repository this daemon keeps for `project`, created when
+    /// absent: where another daemon pushes trees. Answered with one
+    /// [`Mirror`].
+    Mirror { project: String },
+    /// Stop taking builds (`drain`), letting running and queued ones end,
+    /// or take them again. Answered with one [`Status`].
+    Drain { drain: bool },
     /// Describe the slots and the queue.
     Status,
     /// Describe the slots and the queue, what the daemon did since it
@@ -47,6 +57,35 @@ pub struct BuildRequest {
     /// before and are unchanged too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rerun_all: bool,
+    /// The OS to build on, as Rust names it (`linux`, `macos`): a remote
+    /// host's daemon builds when it is not this machine's. This machine's
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+}
+
+/// A build of a tree pushed into a project's mirror.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevisionRequest {
+    /// The mirror's name, as [`Request::Mirror`] gave it.
+    pub project: String,
+    pub revision: Revision,
+    /// The worktree the tree came from on the other machine: who is
+    /// building, for supersession and people watching.
+    pub worktree: PathBuf,
+    /// Where in the tree Cargo runs.
+    pub prefix: PathBuf,
+    pub operation: Operation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rerun_all: bool,
+}
+
+/// Where a project's mirror is.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Mirror {
+    pub path: PathBuf,
 }
 
 /// What the daemon tells a client about its build.
@@ -137,6 +176,9 @@ pub struct Status {
     pub slots: Vec<SlotStatus>,
     /// Waiting builds, next first.
     pub queue: Vec<QueuedBuild>,
+    /// It takes no new builds; running and queued ones end.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// A build slot.
@@ -243,6 +285,17 @@ pub struct Activity {
     pub totals: Totals,
     /// Its most recent events, oldest first.
     pub events: Vec<Event>,
+    /// What each remote host's daemon does, or why it could not be asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<RemoteActivity>,
+}
+
+/// A remote host as `buildd top` shows it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteActivity {
+    pub name: String,
+    pub os: String,
+    pub activity: Result<Box<Activity>, String>,
 }
 
 /// Counts since the daemon started, derived from its events.
@@ -403,6 +456,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            os: None,
         });
         let text = serde_json::to_string(&request).unwrap();
         assert_eq!(

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// The daemon's limits, from `config.toml` in its home.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     /// Builds that run at once. Each repository gets at most this many slot
     /// directories.
@@ -25,6 +25,23 @@ pub struct Config {
     /// Memory running builds may use together, in bytes, by their recorded
     /// peaks: a build that would not fit waits.
     pub memory: u64,
+    /// Other machines' daemons, for builds that must run on another OS.
+    pub remotes: Vec<Remote>,
+}
+
+/// Another machine whose buildd daemon builds for `os`, reached over SSH.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Remote {
+    /// What people see: `pc`.
+    pub name: String,
+    /// The SSH destination: `user@host`.
+    pub ssh: String,
+    /// The OS its builds run on, as Rust names it: `linux`, `macos`.
+    pub os: String,
+    /// The shell command that runs `buildd serve` there, with whatever
+    /// environment it needs: `. ~/.cargo/env; ~/.local/bin/buildd serve`.
+    pub command: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -36,6 +53,8 @@ struct File {
     slot_limit_gib: Option<f64>,
     min_free_gib: Option<f64>,
     memory_gib: Option<f64>,
+    #[serde(default)]
+    remote: Vec<Remote>,
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -101,11 +120,24 @@ impl Config {
                 reason = "a positive, finite number of GiB rounds to bytes"
             )]
             memory: (memory_gib * GIB).round() as u64,
+            remotes: file.remote,
         };
         if config.slots == 0 || config.jobs == 0 {
             return Err(format!(
                 "{}: slots and jobs must be at least 1",
                 path.display()
+            ));
+        }
+        if let Some(remote) = config
+            .remotes
+            .iter()
+            .find(|remote| remote.os == std::env::consts::OS)
+        {
+            return Err(format!(
+                "{}: remote {} builds for {}, this machine's own OS",
+                path.display(),
+                remote.name,
+                remote.os
             ));
         }
         if !(1..=config.jobs).contains(&config.test_jobs) {
@@ -165,8 +197,23 @@ mod tests {
             slot_limit: 1 << 29,
             min_free: 0,
             memory: 8 << 30,
+            remotes: Vec::new(),
         };
         assert_eq!(Config::load(&home.0).unwrap(), expected);
+        let other = if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        };
+        write(&format!(
+            "[[remote]]\nname = \"pc\"\nssh = \"me@pc\"\nos = \"{other}\"\ncommand = \"buildd serve\"\n"
+        ));
+        assert_eq!(Config::load(&home.0).unwrap().remotes[0].name, "pc");
+        write(&format!(
+            "[[remote]]\nname = \"self\"\nssh = \"me@here\"\nos = \"{}\"\ncommand = \"buildd serve\"\n",
+            std::env::consts::OS
+        ));
+        assert!(Config::load(&home.0).is_err(), "a remote for this OS");
         write("slot_limit_gib = 12\n");
         assert_eq!(Config::load(&home.0).unwrap().slot_limit, 12 << 30);
         write("jobs = 6\ntest_jobs = 6\n");

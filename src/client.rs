@@ -58,6 +58,14 @@ pub fn activity(stream: UnixStream) -> Result<Activity, String> {
     ask(stream, &Request::Activity)
 }
 
+/// Stops the daemon taking new builds (`drain`), or makes it take them again.
+///
+/// # Errors
+/// When the connection fails or the daemon breaks the protocol.
+pub fn drain(stream: UnixStream, drain: bool) -> Result<Status, String> {
+    ask(stream, &Request::Drain { drain })
+}
+
 /// Sends `request` and reads its one-line answer.
 fn ask<T: DeserializeOwned>(mut stream: UnixStream, request: &Request) -> Result<T, String> {
     send(&mut stream, request)?;

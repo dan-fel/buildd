@@ -302,6 +302,38 @@ slots/<repo>-<hash>/repository     the repository these slots build
 slots/<repo>-<hash>/<n>/{src,target,record.json}
 ```
 
+## Remote hosts: building for another OS
+
+A build can run on another machine's buildd daemon, for an OS this one is
+not. Name the host in `config.toml`:
+
+```toml
+[[remote]]
+name = "pc"
+ssh = "me@192.168.0.10"
+os = "linux"
+command = ". ~/.cargo/env; ~/.local/bin/buildd serve"
+```
+
+and ask for the OS: `buildd test --os linux --workspace`. Everything else
+is the same command and the same output. The local daemon snapshots the
+worktree as usual, makes the tree's commit and pushes it (`git push` over
+SSH) into the remote daemon's mirror of the repository, which keeps the
+latest 20 pushed trees so the next push sends only what changed. It then
+runs `command` over the same SSH connection (one per host, kept open
+between builds) to ask that daemon to build the tree, and passes its
+messages on; the slot shows as `pc:<slot>`. Closing the client closes the
+SSH session, which withdraws the build there. buildd never picks another
+OS by itself: results differ by OS, so the caller names it, and a request
+for an OS no host builds for is rejected. `buildd top` shows each remote
+host's slots, queue and budget, or why it could not be reached.
+
+The remote daemon is an ordinary daemon with its own slots, budget, limits
+and config; it knows nothing about the machines that use it. `buildd
+serve` passes one request from standard input to it. `buildd drain` makes
+a daemon take no new builds while running and queued ones end (to keep a
+machine quiet for a benchmark); `buildd undrain` reverses it.
+
 ## macOS: exempt the daemon from first-run scans
 
 macOS scans every new executable the first time it runs unless the app

@@ -126,6 +126,7 @@ impl ActivityLog {
             started_at_ms: epoch_millis(self.started),
             totals: self.totals.clone(),
             events: self.events.iter().cloned().collect(),
+            remotes: Vec::new(),
         }
     }
 }
@@ -265,6 +266,7 @@ mod tests {
             memory_in_use: 0,
             slots: Vec::new(),
             queue: Vec::new(),
+            draining: false,
         }
     }
 }

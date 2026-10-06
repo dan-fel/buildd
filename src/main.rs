@@ -30,8 +30,17 @@ usage:
         --rustflags FLAGS  pass FLAGS to every rustc, as RUSTFLAGS would
         --rerun-all        nextest: also run test binaries that are unchanged
                            since they passed (they are skipped otherwise)
-    buildd status
+        --os OS            build on OS (linux, macos): on the remote host
+                           config.toml names for it when it is not this one
+  buildd status
       Show the build slots and the queue.
+  buildd drain | undrain
+      Stop taking new builds, letting running and queued ones end (to keep
+      the machine quiet, as for a benchmark), or take them again.
+  buildd serve
+      Pass one request from standard input to this machine's daemon and its
+      answers to standard output: what another machine's daemon runs over
+      SSH. Closing standard input withdraws the request.
   buildd top
       Watch the slots, the queue, what sharing saved and recent events.
   buildd daemon
@@ -49,7 +58,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let command = match name.as_str() {
-        "daemon" | "status" | "top" => None,
+        "daemon" | "status" | "top" | "drain" | "undrain" | "serve" => None,
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -68,6 +77,11 @@ fn main() -> ExitCode {
         None if name == "top" => {
             top::run(|| client::activity(connect(&home)?)).map(|()| ExitCode::SUCCESS)
         }
+        None if name == "drain" || name == "undrain" => {
+            client::drain(connect(&home)?, name == "drain")?;
+            status(&home)
+        }
+        None if name == "serve" => serve(&home),
         None => status(&home),
     });
     result.unwrap_or_else(|message| {
@@ -82,7 +96,7 @@ fn daemon(home: &Path) -> Result<ExitCode, String> {
 }
 
 /// The names of buildd's own options of a build.
-const OPTIONS: [&str; 4] = ["--json", "--copy-to", "--rustflags", "--rerun-all"];
+const OPTIONS: [&str; 5] = ["--json", "--copy-to", "--rustflags", "--rerun-all", "--os"];
 
 /// buildd's own options of a build, which come before Cargo's arguments.
 #[derive(Debug, Default, PartialEq)]
@@ -91,6 +105,7 @@ struct Options {
     copy_to: Option<PathBuf>,
     rustflags: Vec<String>,
     rerun_all: bool,
+    os: Option<String>,
 }
 
 impl Options {
@@ -120,6 +135,7 @@ impl Options {
                 "--json" if inline.is_none() => options.json = true,
                 "--rerun-all" if inline.is_none() => options.rerun_all = true,
                 "--copy-to" => options.copy_to = Some(directory.join(value(&mut taken)?)),
+                "--os" => options.os = Some(value(&mut taken)?),
                 "--rustflags" => {
                     options.rustflags = value(&mut taken)?
                         .split_whitespace()
@@ -165,6 +181,7 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
             .filter(|label| !label.is_empty()),
         copy_to: options.copy_to,
         rerun_all: options.rerun_all,
+        os: options.os,
     };
     let last = if options.json {
         client::build(connect(home)?, request, |message| {
@@ -274,6 +291,7 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         memory_in_use,
         slots,
         queue,
+        draining,
     } = client::status(connect(home)?)?;
     let disk = free_disk.map_or_else(
         || "unknown".to_owned(),
@@ -284,11 +302,16 @@ fn status(home: &Path) -> Result<ExitCode, String> {
     );
     println!(
         "{capacity} slots of {}, jobs: {idle_jobs} of {jobs} idle, memory: {} of {}, \
-         disk: {disk} (floor {})",
+         disk: {disk} (floor {}){}",
         gib(slot_limit),
         gib(memory_in_use),
         gib(memory),
-        gib(min_free)
+        gib(min_free),
+        if draining {
+            ", draining: no new builds"
+        } else {
+            ""
+        }
     );
     for slot in slots {
         let worktree = slot.worktree.map_or_else(String::new, |worktree| {
@@ -343,6 +366,28 @@ fn gib(bytes: u64) -> String {
 
 fn seconds(millis: u64) -> String {
     format!("{}.{} s", millis / 1000, millis % 1000 / 100)
+}
+
+/// Passes one request from standard input to the daemon and everything it
+/// answers to standard output, until either side ends.
+fn serve(home: &Path) -> Result<ExitCode, String> {
+    let stream = connect(home)?;
+    let mut to_daemon = stream
+        .try_clone()
+        .map_err(|error| format!("could not use the daemon's socket: {error}"))?;
+    // Standard input's end is the other side withdrawing: the daemon hears
+    // it as the end of this connection's stream.
+    std::thread::Builder::new()
+        .name("buildd-serve-input".into())
+        .spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_daemon);
+            let _ = to_daemon.shutdown(std::net::Shutdown::Write);
+        })
+        .map_err(|error| format!("could not read standard input: {error}"))?;
+    let mut from_daemon = stream;
+    std::io::copy(&mut from_daemon, &mut std::io::stdout().lock())
+        .map_err(|error| format!("lost the daemon: {error}"))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Connects to the daemon, starting it when none runs.
@@ -429,6 +474,7 @@ mod tests {
                 copy_to: Some("/work/out".into()),
                 rustflags: vec!["-C".into(), "force-frame-pointers=yes".into()],
                 rerun_all: false,
+                os: None,
             }
         );
         assert_eq!(rest, ["--release", "--", "--json"]);
