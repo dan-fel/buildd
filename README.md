@@ -30,8 +30,17 @@ share one CPU budget instead of each assuming it owns the machine.
   from `cargo metadata`, and a lockfile or build-configuration change
   counting all of them. It never waits for a busy slot while another is
   idle.
-- **One CPU budget.** Every Cargo the daemon runs shares one jobserver with
-  `jobs` tokens.
+- **One CPU budget.** `jobs` tokens for every build together. Each build
+  gets a jobserver of its own (a FIFO its Cargo and compilers take tokens
+  from, as GNU make's protocol says), and the daemon deals tokens between
+  them every few milliseconds: one to each compiling build, more to the
+  builds that took more. It knows what each build holds, so a build that
+  is killed returns everything when it ends; with one shared jobserver, a
+  compiler killed while holding tokens took them with it for good. A
+  build's tests run on `test_jobs` threads (`RUST_TEST_THREADS`), and
+  while they run the build is charged at least `test_jobs` tokens, since
+  test threads and the processes they start use the machine without
+  tokens; compilation in other slots shrinks to what is left.
 - **Deduplication and supersession.** A request equal to a queued or running
   build (same repository, tree, directory, command and arguments) waits for
   that build. A newer request from a worktree replaces its own queued older
@@ -240,7 +249,8 @@ State lives in `$BUILDD_HOME`, by default `buildd` in the user cache
 directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 
 ```text
-config.toml        slots = 2, jobs = <CPUs>, slot_limit_gib = 20 by default
+config.toml        slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
+                   slot_limit_gib = 20 by default
 sock               the daemon's socket
 daemon.log         output of a daemon a client started, each line timestamped
 events.jsonl       every event as a JSON line (moves to events.jsonl.1 at 10 MB)

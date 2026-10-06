@@ -243,8 +243,8 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
                 Span::from("  stopping").red()
             } else {
                 Span::from(format!(
-                    "  {phase}compiled {} · reused {}",
-                    build.compiled, build.fresh
+                    "  {phase}{} jobs · compiled {} · reused {}",
+                    build.tokens, build.compiled, build.fresh
                 ))
             };
             Line::from(vec![
@@ -537,7 +537,8 @@ mod tests {
                             compiled: 3,
                             fresh: 412,
                             cancelled: false,
-                            phase: Phase::Compiling,
+                            tokens: 4,
+                            phase: Phase::Testing,
                         }),
                         last: None,
                     },
@@ -646,7 +647,7 @@ mod tests {
         for expected in [
             "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · disk 24.0 GiB",
             "check -p app-ui @ 7f3a9c0d1e",
-            "for agent-1, agent-7  shared by 2  compiled 3 · reused 412",
+            "for agent-1, agent-7  shared by 2  testing · 4 jobs · compiled 3 · reused 412",
             "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use",
             "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s",
             "requests 96 → Cargo runs 61",

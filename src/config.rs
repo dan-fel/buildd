@@ -12,6 +12,9 @@ pub struct Config {
     pub slots: usize,
     /// Compiler jobs shared by all running builds.
     pub jobs: usize,
+    /// Of those, what one build's tests take while they run: their threads
+    /// and the processes they start use the machine without job tokens.
+    pub test_jobs: usize,
     /// Disk one slot's target may keep between builds, in bytes. Build disk
     /// is at most this times `slots` per repository, plus what a running
     /// build adds before it is pruned.
@@ -23,6 +26,7 @@ pub struct Config {
 struct File {
     slots: Option<usize>,
     jobs: Option<usize>,
+    test_jobs: Option<usize>,
     slot_limit_gib: Option<f64>,
 }
 
@@ -30,7 +34,8 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
-    /// two slots, one job per available CPU, and 20 GiB per slot.
+    /// two slots, one job per available CPU, half of them for a build's
+    /// tests, and 20 GiB per slot.
     ///
     /// # Errors
     /// When the file cannot be read or parsed, or a limit is not positive.
@@ -49,11 +54,13 @@ impl Config {
                 path.display()
             ));
         }
+        let jobs = file.jobs.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        });
         let config = Self {
             slots: file.slots.unwrap_or(2),
-            jobs: file.jobs.unwrap_or_else(|| {
-                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-            }),
+            jobs,
+            test_jobs: file.test_jobs.unwrap_or((jobs / 2).max(1)),
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -64,6 +71,12 @@ impl Config {
         if config.slots == 0 || config.jobs == 0 {
             return Err(format!(
                 "{}: slots and jobs must be at least 1",
+                path.display()
+            ));
+        }
+        if !(1..=config.jobs).contains(&config.test_jobs) {
+            return Err(format!(
+                "{}: test_jobs must be between 1 and jobs",
                 path.display()
             ));
         }
@@ -107,16 +120,26 @@ mod tests {
         assert!(defaults.jobs >= 1);
         assert_eq!(defaults.slot_limit, 20 << 30);
         let write = |text: &str| std::fs::write(home.0.join("config.toml"), text).unwrap();
+        assert_eq!(defaults.test_jobs, (defaults.jobs / 2).max(1));
         write("slots = 3\njobs = 6\nslot_limit_gib = 0.5\n");
         let expected = Config {
             slots: 3,
             jobs: 6,
+            test_jobs: 3,
             slot_limit: 1 << 29,
         };
         assert_eq!(Config::load(&home.0).unwrap(), expected);
         write("slot_limit_gib = 12\n");
         assert_eq!(Config::load(&home.0).unwrap().slot_limit, 12 << 30);
-        for invalid in ["slots = 0\n", "slot_limit_gib = 0\n", "slot = 1\n"] {
+        write("jobs = 6\ntest_jobs = 6\n");
+        assert_eq!(Config::load(&home.0).unwrap().test_jobs, 6);
+        for invalid in [
+            "slots = 0\n",
+            "slot_limit_gib = 0\n",
+            "slot = 1\n",
+            "jobs = 4\ntest_jobs = 5\n",
+            "test_jobs = 0\n",
+        ] {
             write(invalid);
             assert!(Config::load(&home.0).is_err(), "{invalid}");
         }

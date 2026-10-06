@@ -15,6 +15,7 @@
 //! its path never changes.
 
 mod activity;
+mod budget;
 pub mod cargo;
 pub mod client;
 pub mod config;

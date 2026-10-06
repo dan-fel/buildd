@@ -567,16 +567,20 @@ impl<D: Distance> Scheduler<D> {
         }
     }
 
-    /// Cargo reported that running job `id` finished compiling.
-    pub(crate) fn compiled(&mut self, id: JobId) {
+    /// Cargo reported that running job `id` finished compiling. Returns
+    /// whether its tests run now.
+    pub(crate) fn compiled(&mut self, id: JobId) -> bool {
         // Like output, a report can arrive after the build ended.
-        if let Some(Job {
+        let Some(Job {
             state: State::Running { compiled_at, .. },
+            operation,
             ..
         }) = self.jobs.get_mut(&id)
-        {
-            compiled_at.get_or_insert_with(Instant::now);
-        }
+        else {
+            return false;
+        };
+        compiled_at.get_or_insert_with(Instant::now);
+        operation.command == Command::Test
     }
 
     /// Cargo succeeded for running job `id`, whose executables are being
@@ -902,8 +906,12 @@ impl<D: Distance> Scheduler<D> {
         Some((self.slots.len() - 1, false))
     }
 
-    /// The slots and the queue, next build first.
-    pub(crate) fn status(&self) -> (Vec<SlotStatus>, Vec<QueuedBuild>) {
+    /// The slots and the queue, next build first, with the jobs each running
+    /// build is charged as `tokens` says.
+    pub(crate) fn status(
+        &self,
+        tokens: impl Fn(JobId) -> usize,
+    ) -> (Vec<SlotStatus>, Vec<QueuedBuild>) {
         let slots = self
             .slots
             .iter()
@@ -914,6 +922,7 @@ impl<D: Distance> Scheduler<D> {
                 maintaining: slot.maintaining,
                 undersized: slot.undersized,
                 build: slot.job.map(|id| {
+                    let tokens = tokens(id);
                     let job = &self.jobs[&id];
                     let State::Running {
                         started,
@@ -933,6 +942,7 @@ impl<D: Distance> Scheduler<D> {
                         compiled: job.compiled,
                         fresh: job.fresh,
                         cancelled,
+                        tokens,
                         phase: if copying {
                             Phase::Copying
                         } else if job.operation.command == Command::Test && compiled_at.is_some() {
@@ -1189,7 +1199,7 @@ mod tests {
         assert!(
             matches!(sent(&newer, 2)[..], [Message::Queued { revision }] if revision.to_string() == "t2")
         );
-        let (_, queue) = scheduler.status();
+        let (_, queue) = scheduler.status(|_| 0);
         let order = queue
             .iter()
             .map(|build| (build.revision.to_string(), build.who.len()))
@@ -1244,7 +1254,7 @@ mod tests {
                 "{other:?}"
             );
         }
-        assert_eq!(scheduler.status().1.len(), 3);
+        assert_eq!(scheduler.status(|_| 0).1.len(), 3);
     }
 
     #[test]
@@ -1259,7 +1269,7 @@ mod tests {
         assert!(
             matches!(reports(&dropped)[..], [EventKind::Dropped { revision, .. }] if revision.to_string() == "t2")
         );
-        assert!(scheduler.status().1.is_empty());
+        assert!(scheduler.status(|_| 0).1.is_empty());
 
         let cancelled = scheduler.withdraw(WaiterId(1));
         assert_eq!(cancelled[0], Effect::Cancel { job });
@@ -1314,7 +1324,7 @@ mod tests {
         assert!(matches!(starts(&c)[..], [(_, 0, _)]));
         assert!(matches!(starts(&d)[..], [(_, 1, _)]));
         assert!(starts(&e).is_empty());
-        assert_eq!(scheduler.status().0.len(), 2);
+        assert_eq!(scheduler.status(|_| 0).0.len(), 2);
     }
 
     #[test]
@@ -1347,7 +1357,7 @@ mod tests {
             copy_to: None,
         });
         assert_eq!(starts(&other).len(), 1);
-        let (slots, queue) = scheduler.status();
+        let (slots, queue) = scheduler.status(|_| 0);
         assert!(slots[0].maintaining && slots[0].build.is_none());
         assert_eq!(queue.len(), 1);
         let ready = scheduler.maintained(SlotKey(0), Some(Pruning::Within { size: 5 }), &[]);
@@ -1355,7 +1365,7 @@ mod tests {
             matches!(starts(&ready)[..], [(_, 0, ref tree)] if tree == "a2"),
             "the waiting build takes its warm slot"
         );
-        assert_eq!(scheduler.status().0[0].size, Some(5));
+        assert_eq!(scheduler.status(|_| 0).0[0].size, Some(5));
     }
 
     #[test]
@@ -1472,7 +1482,7 @@ mod tests {
         scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 9 }), &[]);
         scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }), &[]);
         assert!(scheduler.slots[0].units.is_empty());
-        assert!(scheduler.status().0[0].undersized);
+        assert!(scheduler.status(|_| 0).0[0].undersized);
         assert_eq!(scheduler.slots[0].compilations.len(), 1);
         assert_eq!(scheduler.slots[1].units.len(), 12);
     }
@@ -1576,7 +1586,7 @@ mod tests {
         scheduler.crate_built(job, false, Some("debug/0000000000000001".into()));
         scheduler.crate_built(job, true, Some("debug/0000000000000002".into()));
         scheduler.crate_built(job, true, None);
-        let (slots, _) = scheduler.status();
+        let (slots, _) = scheduler.status(|_| 0);
         let running = slots[0].build.as_ref().expect("t1 runs");
         assert_eq!((running.compiled, running.fresh), (1, 2));
         assert_eq!(running.who, ["agent-1", "b"]);
@@ -1604,12 +1614,12 @@ mod tests {
             panic!("{effects:?}");
         };
         assert_eq!(
-            scheduler.status().0[0].build.as_ref().unwrap().phase,
+            scheduler.status(|_| 0).0[0].build.as_ref().unwrap().phase,
             Phase::Compiling
         );
         scheduler.compiled(job);
         assert_eq!(
-            scheduler.status().0[0].build.as_ref().unwrap().phase,
+            scheduler.status(|_| 0).0[0].build.as_ref().unwrap().phase,
             Phase::Testing
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -1628,7 +1638,7 @@ mod tests {
             *test_ms >= 20 && test_ms <= build_ms,
             "{test_ms} of {build_ms}"
         );
-        let last = scheduler.status().0[0]
+        let last = scheduler.status(|_| 0).0[0]
             .last
             .clone()
             .expect("the slot built");
@@ -1704,7 +1714,7 @@ mod tests {
             SlotRecord::default(),
         );
         scheduler.restore("/repo/.git".into(), 2, revision("y1"), record);
-        let (slots, _) = scheduler.status();
+        let (slots, _) = scheduler.status(|_| 0);
         assert_eq!(slots.len(), 2);
         assert!(slots.iter().all(|slot| slot.size.is_none()));
         // Slot 2 holds what `check` needs, so it wins over slot 0, which is

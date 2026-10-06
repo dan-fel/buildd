@@ -1,5 +1,5 @@
 //! The daemon: accepts clients on a Unix socket, keeps the scheduler, and
-//! runs builds in their slots under one jobserver.
+//! runs builds in their slots under one job budget.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -16,6 +16,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use crate::activity::{ActivityLog, EventFile};
+use crate::budget::{Budget, Lease};
 use crate::cargo;
 use crate::cargo::Line;
 use crate::config::{self, Config};
@@ -114,8 +115,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     }
     let listener = UnixListener::bind(&socket)
         .map_err(|error| format!("could not listen on {}: {error}", socket.display()))?;
-    let jobserver = jobserver::Client::new(config.jobs)
-        .map_err(|error| format!("could not create the jobserver: {error}"))?;
+    let budget = Budget::new(config.jobs, config.test_jobs, &home.join("tmp"))?;
     log!(
         "listening on {} with {} slots of {} and {} jobs",
         socket.display(),
@@ -139,7 +139,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     Daemon {
         home: home.to_owned(),
         config,
-        jobserver,
+        budget,
         events,
         scheduler,
         waiters: HashMap::new(),
@@ -356,7 +356,7 @@ fn write_line(stream: &mut UnixStream, value: &impl serde::Serialize) -> std::io
 struct Daemon {
     home: PathBuf,
     config: Config,
-    jobserver: jobserver::Client,
+    budget: Budget,
     events: Sender<Event>,
     scheduler: Scheduler<GitDistance>,
     waiters: HashMap<WaiterId, Sender<Message>>,
@@ -414,7 +414,11 @@ impl Daemon {
                     Vec::new()
                 }
                 Event::Compiled { job } => {
-                    self.scheduler.compiled(job);
+                    if self.scheduler.compiled(job)
+                        && let Some(run) = self.runs.get(&job)
+                    {
+                        run.testing();
+                    }
                     Vec::new()
                 }
                 Event::Copying { job } => {
@@ -449,13 +453,13 @@ impl Daemon {
     }
 
     fn status(&self) -> Status {
-        let (slots, queue) = self.scheduler.status();
+        let (slots, queue) = self
+            .scheduler
+            .status(|job| self.runs.get(&job).map_or(0, |run| run.charge()));
+        let (jobs, idle_jobs) = self.budget.jobs();
         Status {
-            jobs: self.config.jobs,
-            idle_jobs: self
-                .jobserver
-                .available()
-                .expect("the daemon's own jobserver pipe can be queried"),
+            jobs,
+            idle_jobs,
             capacity: self.config.slots,
             slot_limit: self.config.slot_limit,
             slots,
@@ -492,7 +496,8 @@ impl Daemon {
                 let building = Building {
                     slot: SlotDirectory::new(&self.home, &start.repository, start.slot),
                     start,
-                    jobserver: self.jobserver.clone(),
+                    budget: self.budget.clone(),
+                    test_jobs: self.config.test_jobs,
                     run,
                     events: self.events.clone(),
                 };
@@ -571,6 +576,8 @@ struct RunState {
     group: Option<Pid>,
     /// Cargo has exited; its group id may be reused.
     exited: bool,
+    /// Its account in the job budget, once it has one.
+    lease: Option<Arc<Lease>>,
 }
 
 impl Run {
@@ -578,6 +585,18 @@ impl Run {
         self.0
             .lock()
             .expect("no thread panics holding a run's state")
+    }
+
+    /// The build's tests run: it is charged their share of the machine.
+    fn testing(&self) {
+        if let Some(lease) = &self.lock().lease {
+            lease.testing();
+        }
+    }
+
+    /// The jobs the build is charged now.
+    fn charge(&self) -> usize {
+        self.lock().lease.as_ref().map_or(0, |lease| lease.charge())
     }
 
     /// Stops the build: `SIGTERM` to Cargo's process group now, `SIGKILL`
@@ -671,7 +690,9 @@ fn maintain(
 struct Building {
     start: Start,
     slot: SlotDirectory,
-    jobserver: jobserver::Client,
+    budget: Budget,
+    /// Threads a test build's tests run on.
+    test_jobs: usize,
     run: Arc<Run>,
     events: Sender<Event>,
 }
@@ -695,20 +716,24 @@ impl Building {
         {
             return failed(reason);
         }
-        // The token Cargo itself runs on; it takes the rest from the
-        // jobserver as it goes.
-        let _token = match self.jobserver.acquire() {
-            Ok(token) => token,
-            Err(error) => return failed(format!("could not take a job token: {error}")),
+        // Cargo runs on its implicit job and takes the rest from the build's
+        // account as it goes.
+        let lease = match self.budget.open() {
+            Ok(lease) => Arc::new(lease),
+            Err(reason) => return failed(reason),
         };
         let mut command = cargo::command(
             &self.slot.source().join(&self.start.prefix),
             &self.slot.target(),
             &self.start.operation,
         );
-        self.jobserver.configure(&mut command);
+        lease.configure(&mut command);
+        if self.start.operation.command == cargo::Command::Test {
+            command.env("RUST_TEST_THREADS", self.test_jobs.to_string());
+        }
         let mut child = {
             let mut state = self.run.lock();
+            state.lease = Some(lease);
             if state.cancelled {
                 return failed("cancelled before Cargo started".into());
             }

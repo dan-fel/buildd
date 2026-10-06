@@ -368,9 +368,18 @@ fn a_build_nobody_waits_for_is_stopped_with_everything_it_started() {
     let hold = marks.0.join("hold");
     let pid = marks.0.join("pid");
     std::fs::write(&hold, "").unwrap();
-    // The build script sleeps while `hold` exists, after recording its pid.
+    // The build script takes two job tokens and keeps them, records its
+    // pid, and sleeps while `hold` exists.
     let script = format!(
-        "fn main() {{\n    \
+        "use std::io::Read as _;\n\
+         use std::os::fd::FromRawFd as _;\n\
+         fn main() {{\n    \
+             let flags = std::env::var(\"CARGO_MAKEFLAGS\").unwrap();\n    \
+             let auth = flags.split(' ').find_map(|flag| flag.strip_prefix(\"--jobserver-auth=\")).unwrap();\n    \
+             let read: i32 = auth.split(',').next().unwrap().parse().unwrap();\n    \
+             let mut jobs = unsafe {{ std::fs::File::from_raw_fd(read) }};\n    \
+             jobs.read_exact(&mut [0; 2]).unwrap();\n    \
+             std::mem::forget(jobs);\n    \
              std::fs::write({pid:?}, std::process::id().to_string()).unwrap();\n    \
              if std::path::Path::new({hold:?}).exists() {{\n        \
                  std::thread::sleep(std::time::Duration::from_secs(120));\n    \
@@ -392,6 +401,11 @@ fn a_build_nobody_waits_for_is_stopped_with_everything_it_started() {
     let script_process =
         rustix::process::Pid::from_raw(std::fs::read_to_string(&pid).unwrap().parse().unwrap())
             .expect("a pid is positive");
+    let status = daemon.status();
+    assert!(
+        status.idle_jobs + 3 <= status.jobs,
+        "Cargo's job and the script's two are charged: {status:?}"
+    );
 
     let stopping = Instant::now();
     reader.shutdown(std::net::Shutdown::Both).unwrap();
@@ -410,6 +424,11 @@ fn a_build_nobody_waits_for_is_stopped_with_everything_it_started() {
         "{:?}",
         stopping.elapsed()
     );
+    // The killed script never gave its tokens back; the budget has them.
+    wait_until("every job is free again", || {
+        let status = daemon.status();
+        status.idle_jobs == status.jobs
+    });
 
     // The slot builds again.
     std::fs::remove_file(&hold).unwrap();

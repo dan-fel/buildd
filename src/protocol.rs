@@ -109,7 +109,7 @@ impl Outcome {
 /// The daemon's state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Status {
-    /// Compiler jobs the daemon's jobserver hands out across all builds.
+    /// Jobs the daemon's budget deals out across all builds.
     pub jobs: usize,
     /// Of those, the ones no build holds now.
     pub idle_jobs: usize,
@@ -165,6 +165,9 @@ pub struct RunningBuild {
     pub fresh: u64,
     /// Nobody waits for it any more; it is being stopped.
     pub cancelled: bool,
+    /// Jobs of the budget it is charged now.
+    #[serde(default)]
+    pub tokens: usize,
     pub phase: Phase,
 }
 
