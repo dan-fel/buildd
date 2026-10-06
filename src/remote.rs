@@ -30,9 +30,11 @@ enum Connection {
 /// SSH options: no prompts, and `connection` to each host kept open between
 /// sessions, in a control socket under the daemon's home.
 fn ssh_options(home: &Path, connection: Connection) -> Vec<String> {
+    // Short names: %C is 40 characters, SSH appends 17 while creating the
+    // socket, and a socket path has at most 103 (104 on macOS, with NUL).
     let control = match connection {
         Connection::Builds => "ssh-%C",
-        Connection::Status => "ssh-status-%C",
+        Connection::Status => "ssh-s-%C",
     };
     [
         "-o",

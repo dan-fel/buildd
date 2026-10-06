@@ -247,7 +247,7 @@ events.jsonl         every event as JSON (rotates to .1 at 10 MB)
 slots/               see Slots
 mirrors/<project>    repositories remote machines push into
 ssh-<hash>           SSH connection for builds  ┐ kept open
-ssh-status-<hash>    SSH connection for status  ┘ 10 minutes
+ssh-s-<hash>         SSH connection for status  ┘ 10 minutes
 ```
 
 The daemon reads `config.toml` when it starts: restart it after a change.
