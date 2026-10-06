@@ -6,11 +6,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::cargo::{Command, Operation};
 use crate::log::log;
-use crate::protocol::{Activity, Event, EventKind, Status, Totals};
+use crate::protocol::{Activity, Event, EventKind, KindSpeed, Percentiles, Speed, Status, Totals};
 
 /// How many recent events the log keeps in memory.
 const KEPT_EVENTS: usize = 200;
+/// How far back the speed summary looks.
+const SPEED_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// How large the event file grows before it moves aside.
 const EVENT_FILE_LIMIT: u64 = 10 << 20;
 
@@ -20,6 +23,53 @@ pub(crate) struct ActivityLog {
     events: VecDeque<Event>,
     worktrees: HashSet<PathBuf>,
     file: EventFile,
+    /// Builds that finished within [`SPEED_WINDOW`], oldest first.
+    recent: VecDeque<Finished>,
+}
+
+/// A finished build, as the speed summary counts it.
+struct Finished {
+    at: SystemTime,
+    kind: &'static str,
+    build_ms: u64,
+    queued_ms: u64,
+}
+
+/// What kind of build `operation` is, for the speed summary.
+fn build_kind(operation: &Operation) -> &'static str {
+    match operation.command {
+        Command::Check | Command::Clippy => "checks",
+        Command::Build => "builds",
+        Command::Test | Command::Nextest
+            if operation
+                .args
+                .iter()
+                .any(|argument| argument == "--workspace") =>
+        {
+            "workspace tests"
+        }
+        Command::Test | Command::Nextest => "scoped tests",
+    }
+}
+
+/// The median and 90th percentile of `values`, which must not be empty.
+fn percentiles(mut values: Vec<u64>) -> Percentiles {
+    assert!(!values.is_empty(), "percentiles of something");
+    values.sort_unstable();
+    let at = |fraction: f64| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "an index into a short list"
+        )]
+        let index = ((values.len() - 1) as f64 * fraction).round() as usize;
+        values[index]
+    };
+    Percentiles {
+        median_ms: at(0.5),
+        p90_ms: at(0.9),
+    }
 }
 
 /// `events.jsonl` in the daemon's home: every event as a JSON line, so
@@ -68,6 +118,7 @@ impl ActivityLog {
             events: VecDeque::new(),
             worktrees: HashSet::new(),
             file,
+            recent: VecDeque::new(),
         }
     }
 
@@ -90,12 +141,21 @@ impl ActivityLog {
                 totals.warm_first_builds += u64::from(*first && *warm);
             }
             EventKind::Finished {
+                operation,
                 compiled,
                 fresh,
                 usage,
                 skipped,
+                build_ms,
+                queued_ms,
                 ..
             } => {
+                self.recent.push_back(Finished {
+                    at,
+                    kind: build_kind(operation),
+                    build_ms: *build_ms,
+                    queued_ms: *queued_ms,
+                });
                 totals.skipped += skipped;
                 totals.compiled += compiled;
                 totals.fresh += fresh;
@@ -120,13 +180,58 @@ impl ActivityLog {
     }
 
     /// What `buildd top` shows, with the daemon's current `status`.
-    pub(crate) fn activity(&self, status: Status) -> Activity {
+    pub(crate) fn activity(&mut self, status: Status) -> Activity {
         Activity {
             status,
             started_at_ms: epoch_millis(self.started),
             totals: self.totals.clone(),
             events: self.events.iter().cloned().collect(),
+            speed: self.speed(SystemTime::now()),
             remotes: Vec::new(),
+        }
+    }
+
+    /// How fast the builds that finished within [`SPEED_WINDOW`] of `now`
+    /// went.
+    fn speed(&mut self, now: SystemTime) -> Speed {
+        while self.recent.front().is_some_and(|finished| {
+            now.duration_since(finished.at).unwrap_or_default() > SPEED_WINDOW
+        }) {
+            self.recent.pop_front();
+        }
+        let window_ms = u64::try_from(SPEED_WINDOW.as_millis()).expect("an hour fits");
+        if self.recent.is_empty() {
+            return Speed {
+                window_ms,
+                ..Speed::default()
+            };
+        }
+        let kinds = ["checks", "scoped tests", "workspace tests", "builds"]
+            .into_iter()
+            .filter_map(|kind| {
+                let walls = self
+                    .recent
+                    .iter()
+                    .filter(|finished| finished.kind == kind)
+                    .map(|finished| finished.build_ms)
+                    .collect::<Vec<_>>();
+                (!walls.is_empty()).then(|| KindSpeed {
+                    kind: kind.to_owned(),
+                    builds: walls.len() as u64,
+                    wall: percentiles(walls),
+                })
+            })
+            .collect();
+        Speed {
+            window_ms,
+            builds: self.recent.len() as u64,
+            wait: percentiles(
+                self.recent
+                    .iter()
+                    .map(|finished| finished.queued_ms)
+                    .collect(),
+            ),
+            kinds,
         }
     }
 }
@@ -197,6 +302,7 @@ mod tests {
                 build_ms: 10,
                 test_ms: None,
                 skipped: 0,
+                queued_ms: 0,
                 compiled: 3,
                 fresh: 97,
                 usage: Some(Usage {
@@ -232,6 +338,71 @@ mod tests {
         assert_eq!(file.lines().count(), 5 + KEPT_EVENTS);
         let first: Event = serde_json::from_str(file.lines().next().unwrap()).unwrap();
         assert_eq!(first.kind, requested("/a", false));
+    }
+
+    #[test]
+    fn speed_sums_up_the_last_hours_waits_and_walls_per_kind() {
+        let home = TempDir::new();
+        let mut log = ActivityLog::new(SystemTime::now(), EventFile::new(&home.0));
+        let finished = |at: SystemTime, args: &[&str], build_ms: u64, queued_ms: u64| {
+            (
+                at,
+                EventKind::Finished {
+                    slot: "s/0".into(),
+                    who: vec!["a".into()],
+                    operation: Operation {
+                        command: Command::Test,
+                        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                        rustflags: Vec::new(),
+                    },
+                    revision: tree("t"),
+                    outcome: Outcome::Exited { code: 0 },
+                    build_ms,
+                    test_ms: None,
+                    skipped: 0,
+                    queued_ms,
+                    compiled: 0,
+                    fresh: 0,
+                    usage: None,
+                },
+            )
+        };
+        let now = SystemTime::now();
+        let old = now - SPEED_WINDOW - std::time::Duration::from_secs(1);
+        for (at, kind) in [
+            finished(old, &["--workspace"], 999_000, 999_000),
+            finished(now, &["--workspace"], 400_000, 10),
+            finished(now, &["-p", "x"], 1_000, 0),
+            finished(now, &["-p", "x"], 3_000, 0),
+            finished(now, &["-p", "x"], 2_000, 5_000),
+        ] {
+            log.record(at, kind);
+        }
+        let speed = log.activity(empty_status()).speed;
+        assert_eq!(speed.builds, 4, "the build outside the window is gone");
+        // Nearest rank: of 0, 0, 10 and 5000 ms, the median is 10.
+        assert_eq!(
+            speed.wait,
+            Percentiles {
+                median_ms: 10,
+                p90_ms: 5_000
+            }
+        );
+        let scoped = speed
+            .kinds
+            .iter()
+            .find(|kind| kind.kind == "scoped tests")
+            .unwrap();
+        assert_eq!(
+            (scoped.builds, scoped.wall.median_ms, scoped.wall.p90_ms),
+            (3, 2_000, 3_000)
+        );
+        let full = speed
+            .kinds
+            .iter()
+            .find(|kind| kind.kind == "workspace tests")
+            .unwrap();
+        assert_eq!(full.builds, 1);
     }
 
     #[test]

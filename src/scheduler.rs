@@ -784,6 +784,13 @@ impl<D: Distance> Scheduler<D> {
             build_ms,
             test_ms,
             skipped: job.skipped,
+            queued_ms: job
+                .waiters
+                .iter()
+                .map(|waiter| millis(started.saturating_duration_since(waiter.since)))
+                .max()
+                // A cancelled build has no waiters left.
+                .unwrap_or(0),
             compiled: job.compiled,
             fresh: job.fresh,
             usage,

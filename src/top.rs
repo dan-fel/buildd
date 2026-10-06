@@ -5,7 +5,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use buildd::protocol::{Activity, EventKind, Outcome, Phase, RemoteActivity, SlotStatus};
+use buildd::protocol::{
+    Activity, EventKind, Outcome, Percentiles, Phase, RemoteActivity, SlotStatus, Speed,
+};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -67,7 +69,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
     } else {
         remote_lines.len() + 2
     };
-    let [header, slots, queue, remotes, totals, events, footer] = Layout::vertical([
+    let [header, speed, slots, queue, remotes, totals, events, footer] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(rows(slot_rows + 2)),
         Constraint::Length(rows(queue_rows + 2)),
@@ -104,6 +107,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         ]),
         header,
     );
+
+    frame.render_widget(speed_line(&activity.speed), speed);
 
     let slot_lines = if status.slots.is_empty() {
         vec![Line::from("no slots yet: the first build creates one").dark_gray()]
@@ -231,6 +236,43 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         events,
     );
     frame.render_widget(Line::from(" q quit").dark_gray(), footer);
+}
+
+/// How fast builds went lately: queue wait and wall time per kind, each as
+/// median / 90th percentile.
+fn speed_line(speed: &Speed) -> Line<'static> {
+    let hours = speed.window_ms / 3_600_000;
+    let window = if hours == 1 {
+        "last hour".to_owned()
+    } else {
+        format!("last {hours} h")
+    };
+    if speed.builds == 0 {
+        return Line::from(format!(" {window}: no builds finished")).dark_gray();
+    }
+    let pair = |p: &Percentiles| format!("{} / {}", brief(p.median_ms), brief(p.p90_ms));
+    let mut spans = vec![
+        Span::from(format!(" {window} (median / p90): ")).dark_gray(),
+        Span::from(format!("wait {}", pair(&speed.wait))).bold(),
+    ];
+    for kind in &speed.kinds {
+        spans.push(Span::from(format!(
+            " · {} {} ×{}",
+            kind.kind,
+            pair(&kind.wall),
+            kind.builds
+        )));
+    }
+    Line::from(spans)
+}
+
+/// A duration as people read it at a glance: 0.4 s, 12 s, 7m05s.
+fn brief(millis: u64) -> String {
+    match millis {
+        0..10_000 => format!("{}.{} s", millis / 1000, millis % 1000 / 100),
+        10_000..60_000 => format!("{} s", millis / 1000),
+        _ => format!("{}m{:02}s", millis / 60_000, millis % 60_000 / 1000),
+    }
 }
 
 /// A remote host's lines: its budget, then a line per slot and its queue,
@@ -752,6 +794,22 @@ mod tests {
                 first_builds: 6,
                 warm_first_builds: 6,
             },
+            speed: Speed {
+                window_ms: 3_600_000,
+                builds: 14,
+                wait: Percentiles {
+                    median_ms: 0,
+                    p90_ms: 12_400,
+                },
+                kinds: vec![buildd::protocol::KindSpeed {
+                    kind: "workspace tests".into(),
+                    builds: 2,
+                    wall: Percentiles {
+                        median_ms: 425_000,
+                        p90_ms: 512_000,
+                    },
+                }],
+            },
             remotes: vec![RemoteActivity {
                 name: "pc".into(),
                 os: "linux".into(),
@@ -779,6 +837,7 @@ mod tests {
                         build_ms: 2100,
                         test_ms: None,
                         skipped: 0,
+                        queued_ms: 0,
                         compiled: 2,
                         fresh: 233,
                         usage: Some(Usage {
@@ -827,6 +886,7 @@ mod tests {
             "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s · ~40.0 s · for app-c716/0 (~30.0 s, cold ~300.0 s)",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",
+            "last hour (median / p90): wait 0.0 s / 12 s · workspace tests 7m05s / 8m32s ×2",
             "pc (linux)  unreachable: ssh: connect to host pc port 22: Connection refused",
             "new worktrees starting on a warm slot: 6 of 6",
             "separate targets ≈ 15 × 12.0 GiB = 180.0 GiB (estimate)",

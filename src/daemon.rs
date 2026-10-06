@@ -720,7 +720,8 @@ impl Daemon {
                     Vec::new()
                 }
                 Event::Activity { reply } => {
-                    let _ = reply.send(self.log.activity(self.status()));
+                    let status = self.status();
+                    let _ = reply.send(self.log.activity(status));
                     Vec::new()
                 }
                 Event::Output { job, message } => self.scheduler.output(job, message),

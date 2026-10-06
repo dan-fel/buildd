@@ -285,9 +285,37 @@ pub struct Activity {
     pub totals: Totals,
     /// Its most recent events, oldest first.
     pub events: Vec<Event>,
+    /// How fast builds went lately.
+    #[serde(default)]
+    pub speed: Speed,
     /// What each remote host's daemon does, or why it could not be asked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remotes: Vec<RemoteActivity>,
+}
+
+/// How fast builds went over the last [`Speed::window_ms`]: queue waits, and
+/// wall time per kind of build, as medians and 90th percentiles.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Speed {
+    pub window_ms: u64,
+    pub builds: u64,
+    pub wait: Percentiles,
+    pub kinds: Vec<KindSpeed>,
+}
+
+/// The wall time of one kind of build.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KindSpeed {
+    /// `checks`, `scoped tests`, `workspace tests` or `builds`.
+    pub kind: String,
+    pub builds: u64,
+    pub wall: Percentiles,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Percentiles {
+    pub median_ms: u64,
+    pub p90_ms: u64,
 }
 
 /// A remote host as `buildd top` shows it.
@@ -387,6 +415,9 @@ pub enum EventKind {
         /// Test binaries not run: unchanged since they passed.
         #[serde(default)]
         skipped: u64,
+        /// How long its longest-waiting request waited in the queue.
+        #[serde(default)]
+        queued_ms: u64,
         compiled: u64,
         fresh: u64,
         /// What Cargo and its compilers used, when it ran.
