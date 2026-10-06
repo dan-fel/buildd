@@ -28,6 +28,8 @@ usage:
                            Cargo produced, with their debug information,
                            into DIR
         --rustflags FLAGS  pass FLAGS to every rustc, as RUSTFLAGS would
+        --rerun-all        nextest: also run test binaries that are unchanged
+                           since they passed (they are skipped otherwise)
     buildd status
       Show the build slots and the queue.
   buildd top
@@ -80,7 +82,7 @@ fn daemon(home: &Path) -> Result<ExitCode, String> {
 }
 
 /// The names of buildd's own options of a build.
-const OPTIONS: [&str; 3] = ["--json", "--copy-to", "--rustflags"];
+const OPTIONS: [&str; 4] = ["--json", "--copy-to", "--rustflags", "--rerun-all"];
 
 /// buildd's own options of a build, which come before Cargo's arguments.
 #[derive(Debug, Default, PartialEq)]
@@ -88,6 +90,7 @@ struct Options {
     json: bool,
     copy_to: Option<PathBuf>,
     rustflags: Vec<String>,
+    rerun_all: bool,
 }
 
 impl Options {
@@ -115,6 +118,7 @@ impl Options {
             };
             match name {
                 "--json" if inline.is_none() => options.json = true,
+                "--rerun-all" if inline.is_none() => options.rerun_all = true,
                 "--copy-to" => options.copy_to = Some(directory.join(value(&mut taken)?)),
                 "--rustflags" => {
                     options.rustflags = value(&mut taken)?
@@ -160,6 +164,7 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
             .ok()
             .filter(|label| !label.is_empty()),
         copy_to: options.copy_to,
+        rerun_all: options.rerun_all,
     };
     let last = if options.json {
         client::build(connect(home)?, request, |message| {
@@ -423,6 +428,7 @@ mod tests {
                 json: true,
                 copy_to: Some("/work/out".into()),
                 rustflags: vec!["-C".into(), "force-frame-pointers=yes".into()],
+                rerun_all: false,
             }
         );
         assert_eq!(rest, ["--release", "--", "--json"]);

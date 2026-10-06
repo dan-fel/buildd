@@ -48,6 +48,9 @@ pub(crate) struct SlotRecord {
     /// seconds since the Unix epoch.
     #[serde(default)]
     pub(crate) units: BTreeMap<String, u64>,
+    /// The test binaries that passed in it, as later runs may skip them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) passed: Vec<crate::passed::PassedBinary>,
 }
 
 /// The compiled units, by [`unit_key`], that a slot's latest build of
@@ -1165,6 +1168,7 @@ mod tests {
                 peak_memory: None,
             }],
             units: [("debug/0123456789abcdef".to_owned(), 7)].into(),
+            passed: Vec::new(),
         };
         slot.write_record(&record).unwrap();
 

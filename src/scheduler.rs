@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cargo::{Compilation, Operation};
+use crate::passed::PassedBinary;
 use crate::protocol::{
     EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild, SlotStatus,
     Usage,
@@ -88,6 +89,8 @@ pub(crate) struct Submission {
     pub(crate) label: Option<String>,
     /// Where to copy the executables Cargo produces, when asked.
     pub(crate) copy_to: Option<PathBuf>,
+    /// Run test binaries that passed before and are unchanged too.
+    pub(crate) rerun_all: bool,
 }
 
 /// What the daemon must do.
@@ -142,6 +145,9 @@ pub(crate) struct Start {
     pub(crate) revision: Revision,
     pub(crate) operation: Operation,
     pub(crate) copy_to: Option<PathBuf>,
+    /// The test binaries that passed in the slot, which a run of every test
+    /// may skip; empty when it must run them all.
+    pub(crate) passed: Vec<PassedBinary>,
 }
 
 impl Compilation {
@@ -164,6 +170,7 @@ struct Job {
     revision: Revision,
     operation: Operation,
     copy_to: Option<PathBuf>,
+    rerun_all: bool,
     waiters: Vec<Waiter>,
     /// The job's place in the queue: the earliest submission it carries.
     order: u64,
@@ -179,6 +186,8 @@ struct Job {
     hold: Option<Hold>,
     /// It waits for memory: what it is expected to need at its peak.
     memory_needed: Option<u64>,
+    /// Test binaries it did not run: unchanged since they passed.
+    skipped: u64,
 }
 
 enum State {
@@ -222,6 +231,8 @@ struct Slot {
     last: Option<LastBuild>,
     /// Crates its target holds in several variants, when last counted.
     duplicated: Option<usize>,
+    /// The test binaries that passed in it.
+    passed: Vec<PassedBinary>,
     /// What its latest build of each compilation used.
     compilations: Vec<CompilationRun>,
     /// When a build last used each compiled unit, in seconds since the Unix
@@ -298,6 +309,7 @@ impl Slot {
                     .iter()
                     .map(|(unit, used)| (unit.clone(), *used))
                     .collect(),
+                passed: self.passed.clone(),
             },
         }
     }
@@ -337,6 +349,7 @@ impl Job {
             && self.prefix == submission.source.prefix
             && self.operation.merged(&submission.operation).is_some()
             && self.copy_to == submission.copy_to
+            && self.rerun_all == submission.rerun_all
     }
 
     fn queued(&self) -> bool {
@@ -434,6 +447,7 @@ impl<D: Distance> Scheduler<D> {
             undersized: false,
             last: None,
             duplicated: None,
+            passed: record.passed,
             compilations: record.compilations,
             units: record.units.into_iter().collect(),
         });
@@ -460,6 +474,7 @@ impl<D: Distance> Scheduler<D> {
             mut operation,
             label,
             copy_to,
+            rerun_all,
         } = submission;
         assert!(!self.waiting.contains_key(&waiter), "a waiter submits once");
         self.clock += 1;
@@ -519,6 +534,7 @@ impl<D: Distance> Scheduler<D> {
                     revision,
                     operation: operation.clone(),
                     copy_to,
+                    rerun_all,
                     waiters: Vec::new(),
                     order,
                     state: State::Queued,
@@ -528,6 +544,7 @@ impl<D: Distance> Scheduler<D> {
                     units: HashSet::new(),
                     hold: None,
                     memory_needed: None,
+                    skipped: 0,
                 },
             );
             id
@@ -674,6 +691,24 @@ impl<D: Distance> Scheduler<D> {
         *copying = true;
     }
 
+    /// Running job `id` ran its tests: the binaries in `passed` passed, and
+    /// `skipped` were not run because they had passed unchanged before.
+    pub(crate) fn tested(&mut self, id: JobId, passed: Vec<PassedBinary>, skipped: u64) {
+        let job = self
+            .jobs
+            .get_mut(&id)
+            .expect("a job reports its tests while it runs");
+        let State::Running { slot, .. } = job.state else {
+            panic!("only running jobs test");
+        };
+        job.skipped = skipped;
+        let records = &mut self.slots[slot].passed;
+        for record in passed {
+            records.retain(|kept| kept.id != record.id);
+            records.push(record);
+        }
+    }
+
     /// Running job `id` used compiled `unit`, such as a build script's output.
     pub(crate) fn unit_used(&mut self, id: JobId, unit: String) {
         // Like output, a report can arrive after the build ended.
@@ -748,6 +783,7 @@ impl<D: Distance> Scheduler<D> {
             outcome: outcome.clone(),
             build_ms,
             test_ms,
+            skipped: job.skipped,
             compiled: job.compiled,
             fresh: job.fresh,
             usage,
@@ -1005,6 +1041,11 @@ impl<D: Distance> Scheduler<D> {
                 revision: job.revision.clone(),
                 operation: job.operation.clone(),
                 copy_to: job.copy_to.clone(),
+                passed: if job.operation.runs_every_test() && !job.rerun_all {
+                    self.slots[slot].passed.clone()
+                } else {
+                    Vec::new()
+                },
             }));
         }
         effects
@@ -1160,6 +1201,7 @@ impl<D: Distance> Scheduler<D> {
             undersized: false,
             last: None,
             duplicated: None,
+            passed: Vec::new(),
             compilations: Vec::new(),
             units: HashMap::new(),
         });
@@ -1422,6 +1464,7 @@ mod tests {
             operation: check(),
             label: None,
             copy_to: None,
+            rerun_all: false,
         })
     }
 
@@ -1444,6 +1487,7 @@ mod tests {
             },
             label: None,
             copy_to: None,
+            rerun_all: false,
         })
     }
 
@@ -1571,6 +1615,7 @@ mod tests {
             },
             label: None,
             copy_to: copy_to.map(PathBuf::from),
+            rerun_all: false,
         };
         let first = scheduler.submit(request(1, Some("/out"), &[]));
         assert_eq!(starts(&first).len(), 1);
@@ -1769,6 +1814,7 @@ mod tests {
             operation: check(),
             label: None,
             copy_to: None,
+            rerun_all: false,
         });
         assert_eq!(starts(&other).len(), 1);
         let (slots, queue) = scheduler.status(|_| 0);
@@ -2062,6 +2108,7 @@ mod tests {
             operation: check(),
             label: Some("agent-1".into()),
             copy_to: None,
+            rerun_all: false,
         });
         let [(job, ..)] = starts(&first)[..] else {
             panic!("{first:?}");
@@ -2214,6 +2261,7 @@ mod tests {
                 peak_memory: None,
             }],
             units: units("c", 12).into_iter().map(|unit| (unit, 1)).collect(),
+            passed: Vec::new(),
         };
         scheduler.restore(
             "/repo/.git".into(),

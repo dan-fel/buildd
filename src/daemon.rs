@@ -19,10 +19,13 @@ use crate::activity::{ActivityLog, EventFile};
 use crate::budget::{Budget, Lease};
 use crate::cargo;
 use crate::cargo::Line;
+use crate::cargo::{Compilation, Operation};
 use crate::config::{self, Config};
 use crate::distance::{GitDistance, Workspace};
+use crate::git;
 use crate::log::log;
 use crate::memory;
+use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
     Activity, BuildRequest, EventKind, Message, Outcome, Request, Status, Usage,
@@ -79,6 +82,13 @@ enum Event {
     /// Cargo succeeded for `job`; its executables are copied out now.
     Copying {
         job: JobId,
+    },
+    /// `job` ran every test: the binaries in `passed` passed, and `skipped`
+    /// were not run because they had passed unchanged before.
+    Tested {
+        job: JobId,
+        passed: Vec<PassedBinary>,
+        skipped: u64,
     },
     /// Cargo ended, having used `usage` when it ran.
     Exited {
@@ -322,6 +332,7 @@ impl Connection {
             operation: request.operation,
             label: request.label,
             copy_to,
+            rerun_all: request.rerun_all,
         };
         if self
             .events
@@ -443,6 +454,14 @@ impl Daemon {
                 }
                 Event::Copying { job } => {
                     self.scheduler.copying(job);
+                    Vec::new()
+                }
+                Event::Tested {
+                    job,
+                    passed,
+                    skipped,
+                } => {
+                    self.scheduler.tested(job, passed, skipped);
                     Vec::new()
                 }
                 Event::Exited {
@@ -582,11 +601,17 @@ impl Daemon {
             Effect::Start(start) => {
                 let run = Arc::new(Run::default());
                 self.runs.insert(start.job, Arc::clone(&run));
+                let workspace = self
+                    .scheduler
+                    .distance_mut()
+                    .workspace(&start.repository)
+                    .cloned();
                 let building = Building {
                     slot: SlotDirectory::new(&self.home, &start.repository, start.slot),
                     start,
                     budget: self.budget.clone(),
                     test_jobs: self.config.test_jobs,
+                    workspace,
                     run,
                     events: self.events.clone(),
                 };
@@ -864,6 +889,9 @@ struct Building {
     budget: Budget,
     /// Threads a test build's tests run on.
     test_jobs: usize,
+    /// The repository's workspace, once known: what decides which test
+    /// binaries a run of every test may skip.
+    workspace: Option<Workspace>,
     run: Arc<Run>,
     events: Sender<Event>,
 }
@@ -893,24 +921,135 @@ impl Building {
             Ok(lease) => Arc::new(lease),
             Err(reason) => return failed(reason),
         };
+        self.run.lock().lease = Some(Arc::clone(&lease));
+        let operation = &self.start.operation;
+        let skipping = match &self.workspace {
+            Some(workspace) if !self.start.passed.is_empty() => Some(workspace),
+            _ => None,
+        };
+        let (step, usage, products, skipped) = match skipping {
+            Some(workspace) => match self.run_unpassed(&lease, workspace) {
+                Ok(ran) => ran,
+                Err(outcome) => return (outcome, None),
+            },
+            None => match self.cargo(&lease, operation) {
+                Ok((status, usage, products)) => (outcome(status), usage, products, Vec::new()),
+                Err(reason) => return failed(reason),
+            },
+        };
+        if step.success() && operation.runs_every_test() {
+            let checkout = self.slot.source();
+            let passed = passed::test_binaries(&products, &checkout)
+                .iter()
+                .filter(|binary| !skipped.contains(&binary.id))
+                .filter_map(|binary| binary.passed(&self.start.revision))
+                .collect();
+            let _ = self.events.send(Event::Tested {
+                job: self.start.job,
+                passed,
+                skipped: skipped.len() as u64,
+            });
+        }
+        let outcome = match &self.start.copy_to {
+            Some(directory) if step.success() => self.copy(&products, directory).unwrap_or(step),
+            _ => step,
+        };
+        (outcome, Some(usage))
+    }
+
+    /// A `nextest` run of every test that skips the test binaries unchanged
+    /// since they passed: compiles the tests first to learn which binaries
+    /// changed, then runs nextest for the rest. Returns how the build
+    /// ended, what it used, Cargo's executables and the ids skipped.
+    fn run_unpassed(
+        &self,
+        lease: &Lease,
+        workspace: &Workspace,
+    ) -> Result<(Outcome, Usage, Vec<Product>, Vec<String>), Outcome> {
+        let failed = |reason| Outcome::Failed { reason };
+        let compile = Operation {
+            command: cargo::Command::Test,
+            args: Compilation::new(&self.start.prefix, &self.start.operation)
+                .args
+                .into_iter()
+                .chain(["--no-run".to_owned()])
+                .collect(),
+            rustflags: self.start.operation.rustflags.clone(),
+        };
+        let (status, compiled, products) = self.cargo(lease, &compile).map_err(failed)?;
+        if !status.success() {
+            return Ok((outcome(status), compiled, products, Vec::new()));
+        }
+        let checkout = self.slot.source();
+        let binaries = passed::test_binaries(&products, &checkout);
+        let repository = &self.start.repository;
+        let skipped = passed::skippable(
+            &binaries,
+            &self.start.passed,
+            &self.start.revision,
+            workspace,
+            |earlier| git::changed_paths(repository, earlier, &self.start.revision),
+        );
+        let ids = skipped
+            .iter()
+            .map(|binary| binary.id.clone())
+            .collect::<Vec<_>>();
+        self.tell(format!(
+            "buildd: {} of {} test binaries are unchanged since they passed; \
+             running the rest (--rerun-all runs them too)",
+            skipped.len(),
+            binaries.len()
+        ));
+        if skipped.len() == binaries.len() {
+            return Ok((Outcome::Exited { code: 0 }, compiled, products, ids));
+        }
+        let mut run = self.start.operation.clone();
+        if !skipped.is_empty() {
+            run.args.extend([
+                "--no-tests=pass".to_owned(),
+                "-E".to_owned(),
+                passed::excluding(&skipped),
+            ]);
+        }
+        let (status, mut usage, _) = self.cargo(lease, &run).map_err(failed)?;
+        usage.cpu_ms += compiled.cpu_ms;
+        usage.peak_memory = usage.peak_memory.max(compiled.peak_memory);
+        Ok((outcome(status), usage, products, ids))
+    }
+
+    /// Tells the build's waiters `line`, as standard error.
+    fn tell(&self, line: String) {
+        let _ = self.events.send(Event::Output {
+            job: self.start.job,
+            message: Message::Stderr { line },
+        });
+    }
+
+    /// Runs Cargo for `operation` in the slot as a client of `lease`,
+    /// forwarding its output; returns how it exited, what it used and the
+    /// executables it reported.
+    fn cargo(
+        &self,
+        lease: &Lease,
+        operation: &Operation,
+    ) -> Result<(ExitStatus, Usage, Vec<Product>), String> {
         let mut command = cargo::command(
             &self.slot.source().join(&self.start.prefix),
             &self.slot.target(),
-            &self.start.operation,
+            operation,
             self.test_jobs,
         );
         lease.configure(&mut command);
         let mut child = {
             let mut state = self.run.lock();
-            state.lease = Some(lease);
             if state.cancelled {
-                return failed("cancelled before Cargo started".into());
+                return Err("cancelled before Cargo started".into());
             }
-            let child = match command.spawn() {
-                Ok(child) => child,
-                Err(error) => return failed(format!("could not start cargo: {error}")),
-            };
+            let child = command
+                .spawn()
+                .map_err(|error| format!("could not start cargo: {error}"))?;
             state.group = Some(Pid::from_child(&child));
+            state.exited = false;
             child
         };
         let (done, finished) = crossbeam_channel::bounded(2);
@@ -948,18 +1087,12 @@ impl Building {
                 break;
             }
         }
-        let outcome = match (outcome(status), &self.start.copy_to) {
-            (outcome, Some(directory)) if outcome.success() => {
-                let products = std::mem::take(
-                    &mut *products
-                        .lock()
-                        .expect("no thread panics holding a build's products"),
-                );
-                self.copy(&products, directory).unwrap_or(outcome)
-            }
-            (outcome, _) => outcome,
-        };
-        (outcome, Some(usage))
+        let products = std::mem::take(
+            &mut *products
+                .lock()
+                .expect("no thread panics holding a build's products"),
+        );
+        Ok((status, usage, products))
     }
 
     /// Samples the resident memory of Cargo's process group `group` every

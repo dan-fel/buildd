@@ -261,6 +261,18 @@ nextest does not run doctests (run `buildd test --doc` for those) and
 reads arguments after `--` as filters and libtest flags, so test binaries
 with their own harness that take data arguments stay with `buildd test`.
 
+A `buildd nextest` run of every test (no test name filters, filtersets or
+arguments after `--`) skips the test binaries that already passed in the
+slot and cannot have changed: buildd compiles the tests first, and a
+binary is skipped when its executable is the same file that passed and no
+path changed since then in its package, in a workspace package it depends
+on, or outside every package (fixtures, the lockfile, the toolchain).
+Cargo rewrites an executable whenever any Rust input of it changes; the
+path rule covers data its tests read at run time. The output says how
+many were skipped; `--rerun-all` runs them too. A test that reads files of
+a package it does not depend on is outside this rule: keep such data in
+its own package or outside every package.
+
 buildd's own options come before Cargo's arguments:
 
 - `--copy-to DIR`: after a successful build, copy the executables Cargo

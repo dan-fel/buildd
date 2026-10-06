@@ -107,6 +107,7 @@ fn request(directory: &Path, command: Command, args: &[&str]) -> BuildRequest {
         },
         label: None,
         copy_to: None,
+        rerun_all: false,
     }
 }
 
@@ -342,6 +343,83 @@ fn nextest_runs_the_tests_test_compiles_and_reports_the_phase() {
         [false, true],
         "nextest reuses what test --no-run compiled"
     );
+}
+
+/// A committed workspace of two independent packages, `a` and `b`, each
+/// with a unit test.
+fn two_package_workspace() -> TempDir {
+    let directory = TempDir::new();
+    std::fs::write(
+        directory.0.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for name in ["a", "b"] {
+        std::fs::create_dir_all(directory.0.join(name).join("src")).unwrap();
+        std::fs::write(
+            directory.0.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.0.join(name).join("src/lib.rs"),
+            "#[test]\nfn works() {}\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(directory.0.join(".gitignore"), "/target/\n").unwrap();
+    git(&directory.0, &["init", "-q", "-b", "main"]);
+    git(&directory.0, &["add", "--all"]);
+    git(&directory.0, &["commit", "-q", "-m", "workspace"]);
+    directory
+}
+
+#[test]
+fn test_binaries_that_passed_unchanged_are_skipped_until_their_package_changes() {
+    let daemon = Daemon::start(1);
+    let repository = two_package_workspace();
+    let skipped = |messages: &[Message]| {
+        messages.iter().find_map(|message| match message {
+            Message::Stderr { line } if line.contains("unchanged since they passed") => {
+                Some(line.split(' ').nth(1).unwrap().to_owned())
+            }
+            _ => None,
+        })
+    };
+    let first = daemon.build(&repository.0, Command::Nextest, &["--workspace"]);
+    assert!(outcome(&first).success(), "{first:#?}");
+    assert_eq!(skipped(&first), None, "nothing passed before");
+    // The slot is measured once quiet, which reads the workspace's packages.
+    wait_until("the workspace is known", || {
+        daemon.status().slots[0].size.is_some()
+    });
+    let second = daemon.build(&repository.0, Command::Nextest, &["--workspace"]);
+    assert!(outcome(&second).success(), "{second:#?}");
+    assert_eq!(skipped(&second).as_deref(), Some("2"), "{second:#?}");
+
+    std::fs::write(
+        repository.0.join("b/src/lib.rs"),
+        "#[test]\nfn works() {}\n\n#[test]\nfn also() {}\n",
+    )
+    .unwrap();
+    let third = daemon.build(&repository.0, Command::Nextest, &["--workspace"]);
+    assert!(outcome(&third).success(), "{third:#?}");
+    assert_eq!(
+        skipped(&third).as_deref(),
+        Some("1"),
+        "a stays skipped: {third:#?}"
+    );
+
+    let mut request = request(&repository.0, Command::Nextest, &["--workspace"]);
+    request.rerun_all = true;
+    let mut all = Vec::new();
+    client::build(daemon.connect(), request, |message| {
+        all.push(message.clone())
+    })
+    .unwrap();
+    assert!(outcome(&all).success(), "{all:#?}");
+    assert_eq!(skipped(&all), None, "--rerun-all runs everything");
+    assert_eq!(daemon.activity().totals.skipped, 3);
 }
 
 #[test]

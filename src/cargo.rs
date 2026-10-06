@@ -259,6 +259,29 @@ impl Operation {
         })
     }
 
+    /// Whether it is a `nextest` run of every test it compiles: no test name
+    /// filters, filtersets or arguments after `--`.
+    #[must_use]
+    pub fn runs_every_test(&self) -> bool {
+        if self.command != Command::Nextest {
+            return false;
+        }
+        let mut arguments = self.args.iter();
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--" | "-E" | "--filterset" | "--run-ignored" | "--partition" => return false,
+                "-p" | "--package" | "--exclude" | "--bin" | "--example" | "--test" | "--bench"
+                | "-F" | "--features" | "--cargo-profile" | "--target" | "-P" | "--profile"
+                | "--retries" | "--max-fail" | "--color" => {
+                    arguments.next();
+                }
+                _ if !argument.starts_with('-') => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
     /// The operation without `--no-fail-fast` before `--`, and whether it
     /// had it.
     fn without_no_fail_fast(&self) -> (Self, bool) {
@@ -506,6 +529,19 @@ mod tests {
         ] {
             assert_eq!(Line::of(forwarded), Line::Forward, "{forwarded}");
         }
+    }
+
+    #[test]
+    fn only_unfiltered_nextest_runs_run_every_test() {
+        let nextest = |args: &[&str]| Operation {
+            command: Command::Nextest,
+            ..operation(args)
+        };
+        assert!(nextest(&["--workspace", "--no-fail-fast", "-p", "x"]).runs_every_test());
+        for filtered in [&["name"][..], &["-E", "test(x)"], &["--", "--exact", "x"]] {
+            assert!(!nextest(filtered).runs_every_test(), "{filtered:?}");
+        }
+        assert!(!operation(&["--workspace"]).runs_every_test());
     }
 
     #[test]

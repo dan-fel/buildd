@@ -24,6 +24,7 @@ mod distance;
 mod git;
 pub mod log;
 mod memory;
+mod passed;
 mod products;
 pub mod protocol;
 mod scheduler;

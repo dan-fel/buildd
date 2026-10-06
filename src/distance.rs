@@ -31,6 +31,11 @@ pub(crate) struct GitDistance {
 }
 
 impl GitDistance {
+    /// The workspace of `repository`, once it is known.
+    pub(crate) fn workspace(&self, repository: &Path) -> Option<&Workspace> {
+        self.workspaces.get(repository)
+    }
+
     /// Weighs distances in `repository` by `workspace` from now on.
     pub(crate) fn learn(&mut self, repository: PathBuf, workspace: Workspace) {
         if self.workspaces.get(&repository) != Some(&workspace) {
@@ -50,14 +55,7 @@ impl Distance for GitDistance {
         if let Some(distance) = self.known.get(&key) {
             return *distance;
         }
-        let mut command = git::command(repository);
-        command
-            .arg("--git-dir")
-            .arg(repository)
-            .args(["diff-tree", "-r", "--name-only", "--no-renames"])
-            .arg(low.to_string())
-            .arg(high.to_string());
-        let paths = match git::run(command) {
+        let paths = match git::changed_paths(repository, low, high) {
             Ok(paths) => paths,
             // An unknown distance ranks behind every known one.
             Err(error) => {
@@ -66,8 +64,8 @@ impl Distance for GitDistance {
             }
         };
         let distance = match self.workspaces.get(repository) {
-            Some(workspace) => workspace.weigh(paths.lines()),
-            None => paths.lines().count() as u64,
+            Some(workspace) => workspace.weigh(paths.iter().map(String::as_str)),
+            None => paths.len() as u64,
         };
         if self.known.len() >= KNOWN_DISTANCES {
             self.known.clear();
@@ -221,6 +219,32 @@ impl Workspace {
             }
         }
         rebuilt.len() as u64 + outside
+    }
+
+    /// Whether changing `paths` can change what the tests of the package in
+    /// directory `package` (relative to the top) see: a change in it or in a
+    /// workspace package it depends on, outside every package, or to the
+    /// build configuration. An unknown package is always affected.
+    pub(crate) fn invalidates<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+        package: &Path,
+    ) -> bool {
+        let Some(&(_, tested)) = self
+            .directories
+            .iter()
+            .find(|(directory, _)| directory == package)
+        else {
+            return true;
+        };
+        paths.into_iter().any(|path| {
+            is_build_configuration(path)
+                || self
+                    .directories
+                    .iter()
+                    .find(|(directory, _)| Path::new(path).starts_with(directory))
+                    .is_none_or(|(_, owner)| self.rebuilds[*owner].contains(&tested))
+        })
     }
 }
 

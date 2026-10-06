@@ -168,9 +168,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
             ])
         },
         Line::from(format!(
-            "CPU {} across {} Cargo runs",
+            "CPU {} across {} Cargo runs · test binaries skipped as passed and unchanged {}",
             seconds(t.cpu_ms),
-            t.builds
+            t.builds,
+            t.skipped
         )),
         Line::from(format!(
             "new worktrees starting on a warm slot: {} of {}",
@@ -371,6 +372,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             outcome,
             build_ms,
             test_ms,
+            skipped,
             compiled,
             fresh,
             usage,
@@ -382,9 +384,14 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
                 Outcome::Signaled { .. } => ("was killed", Style::new().fg(Color::Red)),
                 Outcome::Failed { .. } => ("could not run", Style::new().fg(Color::Red)),
             };
-            let cpu = usage.map_or_else(String::new, |usage| {
+            let mut cpu = usage.map_or_else(String::new, |usage| {
                 format!(", CPU {}", seconds(usage.cpu_ms))
             });
+            if *skipped > 0 {
+                cpu.push_str(&format!(
+                    ", {skipped} test binaries unchanged since they passed"
+                ));
+            }
             (
                 format!(
                     "{slot} {ended} {operation} in {}: compiled {compiled}, reused {fresh}{cpu}",
@@ -664,6 +671,7 @@ mod tests {
                 compiled: 1204,
                 fresh: 54106,
                 cpu_ms: 412_000,
+                skipped: 150,
                 worktrees: 15,
                 first_builds: 6,
                 warm_first_builds: 6,
@@ -689,6 +697,7 @@ mod tests {
                         outcome: Outcome::Exited { code: 0 },
                         build_ms: 2100,
                         test_ms: None,
+                        skipped: 0,
                         compiled: 2,
                         fresh: 233,
                         usage: Some(Usage {

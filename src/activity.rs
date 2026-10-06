@@ -93,8 +93,10 @@ impl ActivityLog {
                 compiled,
                 fresh,
                 usage,
+                skipped,
                 ..
             } => {
+                totals.skipped += skipped;
                 totals.compiled += compiled;
                 totals.fresh += fresh;
                 totals.cpu_ms += usage.map_or(0, |usage| usage.cpu_ms);
@@ -193,6 +195,7 @@ mod tests {
                 outcome: Outcome::Exited { code: 0 },
                 build_ms: 10,
                 test_ms: None,
+                skipped: 0,
                 compiled: 3,
                 fresh: 97,
                 usage: Some(Usage {

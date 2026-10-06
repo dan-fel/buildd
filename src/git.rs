@@ -46,3 +46,19 @@ pub(crate) fn run(mut command: Command) -> Result<String, String> {
     }
     String::from_utf8(output.stdout).map_err(|_| "git printed output that is not UTF-8".to_owned())
 }
+
+/// The paths that differ between trees `from` and `to` of the repository
+/// whose git directory is `repository`, relative to its top.
+pub(crate) fn changed_paths(
+    repository: &Path,
+    from: &crate::snapshot::Revision,
+    to: &crate::snapshot::Revision,
+) -> Result<Vec<String>, String> {
+    let mut diff = command(repository);
+    diff.arg("--git-dir")
+        .arg(repository)
+        .args(["diff-tree", "-r", "--name-only", "--no-renames"])
+        .arg(from.to_string())
+        .arg(to.to_string());
+    run(diff).map(|paths| paths.lines().map(str::to_owned).collect())
+}

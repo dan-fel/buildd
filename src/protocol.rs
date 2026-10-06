@@ -43,6 +43,10 @@ pub struct BuildRequest {
     /// copy elsewhere are different builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_to: Option<PathBuf>,
+    /// For a `nextest` run of every test: run the test binaries that passed
+    /// before and are unchanged too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rerun_all: bool,
 }
 
 /// What the daemon tells a client about its build.
@@ -261,6 +265,9 @@ pub struct Totals {
     pub fresh: u64,
     /// CPU time of every Cargo run and the compilers it started.
     pub cpu_ms: u64,
+    /// Test binaries not run because they were unchanged since they passed.
+    #[serde(default)]
+    pub skipped: u64,
     /// Worktrees that asked for a build.
     pub worktrees: u64,
     /// Builds that were the first of their worktree, and of those, the ones
@@ -324,6 +331,9 @@ pub enum EventKind {
         /// For `test`, the part of `build_ms` spent running the tests.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         test_ms: Option<u64>,
+        /// Test binaries not run: unchanged since they passed.
+        #[serde(default)]
+        skipped: u64,
         compiled: u64,
         fresh: u64,
         /// What Cargo and its compilers used, when it ran.
@@ -392,6 +402,7 @@ mod tests {
             },
             label: None,
             copy_to: None,
+            rerun_all: false,
         });
         let text = serde_json::to_string(&request).unwrap();
         assert_eq!(
