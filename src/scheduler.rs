@@ -6,6 +6,9 @@
 //!
 //! - **Deduplication.** A request equal to a queued or running build (same
 //!   repository, revision, directory and operation) waits for that build.
+//! - **Merging.** `test` operations differing only in `--no-fail-fast`
+//!   are one request; the build runs with the flag. A running build without
+//!   it is not joined by a request that has it.
 //! - **Supersession.** A request from a worktree replaces that worktree's
 //!   queued requests for the same directory and operation at older
 //!   revisions: their waiters wait for the new revision instead, at the
@@ -283,15 +286,21 @@ pub(crate) struct Scheduler<D> {
 }
 
 impl Job {
+    /// Whether `submission` can wait for this job: it builds the same tree,
+    /// and a running job already does all `submission` asks.
     fn same_build(&self, submission: &Submission) -> bool {
-        self.same_request(submission) && self.revision == submission.revision
+        self.same_request(submission)
+            && self.revision == submission.revision
+            && (self.queued()
+                || self.operation.merged(&submission.operation).as_ref() == Some(&self.operation))
     }
 
-    /// Whether the job does what `submission` asks, maybe of another tree.
+    /// Whether one build can do what the job and `submission` ask, maybe
+    /// of another tree.
     fn same_request(&self, submission: &Submission) -> bool {
         self.repository == submission.source.repository
             && self.prefix == submission.source.prefix
-            && self.operation == submission.operation
+            && self.operation.merged(&submission.operation).is_some()
             && self.copy_to == submission.copy_to
     }
 
@@ -401,7 +410,7 @@ impl<D: Distance> Scheduler<D> {
             waiter,
             source,
             revision,
-            operation,
+            mut operation,
             label,
             copy_to,
         } = submission;
@@ -429,6 +438,9 @@ impl<D: Distance> Scheduler<D> {
             job.waiters = others;
             if !mine.is_empty() {
                 order = order.min(job.order);
+                operation = operation
+                    .merged(&job.operation)
+                    .expect("a superseded job does what this one asks");
                 reports.extend(mine.iter().map(|moved| EventKind::Replaced {
                     who: moved.who.clone(),
                     operation: job.operation.clone(),
@@ -458,7 +470,7 @@ impl<D: Distance> Scheduler<D> {
                     repository: source.repository.clone(),
                     prefix: source.prefix.clone(),
                     revision,
-                    operation,
+                    operation: operation.clone(),
                     copy_to,
                     waiters: Vec::new(),
                     order,
@@ -477,6 +489,12 @@ impl<D: Distance> Scheduler<D> {
             .map(Effect::Report)
             .collect::<Vec<_>>();
         let job = self.jobs.get_mut(&id).expect("found or inserted above");
+        if job.queued() {
+            job.operation = job
+                .operation
+                .merged(&operation)
+                .expect("a joined job does what this one asks");
+        }
         job.order = job.order.min(order);
         for waiter in joining {
             self.waiting.insert(waiter.id, id);
@@ -1284,6 +1302,81 @@ mod tests {
             );
         }
         assert_eq!(scheduler.status(|_| 0).1.len(), 3);
+    }
+
+    #[test]
+    fn test_requests_differing_in_no_fail_fast_merge_and_the_build_has_it() {
+        let mut scheduler = scheduler(1);
+        let busy = submit(&mut scheduler, 1, "/busy", "t0");
+        let [(running, ..)] = starts(&busy)[..] else {
+            panic!("{busy:?}");
+        };
+        submit_operation(
+            &mut scheduler,
+            2,
+            "/a",
+            "t1",
+            Command::Test,
+            &["--workspace"],
+        );
+        let newer = submit_operation(
+            &mut scheduler,
+            3,
+            "/a",
+            "t2",
+            Command::Test,
+            &["--workspace", "--no-fail-fast"],
+        );
+        assert!(matches!(
+            reports(&newer)[..],
+            [_, EventKind::Replaced { .. }]
+        ));
+        // Another worktree at the same tree, without the flag, joins.
+        let joined = submit_operation(
+            &mut scheduler,
+            4,
+            "/b",
+            "t2",
+            Command::Test,
+            &["--workspace"],
+        );
+        assert!(matches!(
+            reports(&joined)[..],
+            [EventKind::Requested { shared: true, .. }]
+        ));
+        let (_, queue) = scheduler.status(|_| 0);
+        let [build] = &queue[..] else {
+            panic!("{queue:?}");
+        };
+        assert_eq!(build.operation.args, ["--no-fail-fast", "--workspace"]);
+        assert_eq!(build.who.len(), 3);
+        let next = scheduler.exited(running, &ok(), None);
+        let [(job, ..)] = starts(&next)[..] else {
+            panic!("{next:?}");
+        };
+        scheduler.exited(job, &ok(), None);
+        // A running fail-fast build is not joined by a request wanting more.
+        let running = submit_operation(
+            &mut scheduler,
+            5,
+            "/c",
+            "t3",
+            Command::Test,
+            &["--workspace"],
+        );
+        assert_eq!(starts(&running).len(), 1);
+        let wanting_more = submit_operation(
+            &mut scheduler,
+            6,
+            "/d",
+            "t3",
+            Command::Test,
+            &["--no-fail-fast", "--workspace"],
+        );
+        assert!(matches!(
+            reports(&wanting_more)[..],
+            [EventKind::Requested { shared: false, .. }]
+        ));
     }
 
     #[test]

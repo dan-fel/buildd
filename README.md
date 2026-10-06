@@ -44,7 +44,9 @@ share one CPU budget instead of each assuming it owns the machine.
 - **Deduplication and supersession.** A request equal to a queued or running
   build (same repository, tree, directory, command and arguments) waits for
   that build. A newer request from a worktree replaces its own queued older
-  ones at their place in the queue.
+  ones at their place in the queue. `test` requests that differ only in
+  `--no-fail-fast` are one request: the build runs with it, and its exit
+  status answers both.
 - **Cancellation.** Closing the client (Ctrl-C) withdraws the request. A
   build nobody waits for any more is stopped with its whole process group.
 - **Restarts keep slots warm.** Each slot records the compilations it ran

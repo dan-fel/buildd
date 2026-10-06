@@ -189,6 +189,57 @@ impl Operation {
     }
 }
 
+impl Operation {
+    /// The operation that serves both `self` and `other`, when one does: they
+    /// are equal, or `test` runs that differ only in `--no-fail-fast`, which
+    /// the run serving both has. Its exit status answers both: a run that
+    /// does not stop at the first failing test binary fails exactly when one
+    /// that does would.
+    #[must_use]
+    pub fn merged(&self, other: &Self) -> Option<Self> {
+        if self == other {
+            return Some(self.clone());
+        }
+        if self.command != Command::Test || other.command != Command::Test {
+            return None;
+        }
+        let (mine, my_flag) = self.without_no_fail_fast();
+        let (theirs, their_flag) = other.without_no_fail_fast();
+        (mine == theirs).then(|| {
+            let mut merged = mine;
+            if my_flag || their_flag {
+                merged.args.insert(0, "--no-fail-fast".into());
+            }
+            merged
+        })
+    }
+
+    /// The operation without `--no-fail-fast` before `--`, and whether it
+    /// had it.
+    fn without_no_fail_fast(&self) -> (Self, bool) {
+        let separator = self
+            .args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(self.args.len());
+        let (cargo, harness) = self.args.split_at(separator);
+        let kept = cargo
+            .iter()
+            .filter(|argument| *argument != "--no-fail-fast")
+            .chain(harness)
+            .cloned()
+            .collect::<Vec<_>>();
+        let had = kept.len() != self.args.len();
+        (
+            Self {
+                args: kept,
+                ..self.clone()
+            },
+            had,
+        )
+    }
+}
+
 impl fmt::Display for Operation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.rustflags.is_empty() {
@@ -306,6 +357,35 @@ mod tests {
             args: args.iter().map(|argument| (*argument).to_owned()).collect(),
             rustflags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_runs_differing_only_in_no_fail_fast_merge_into_one_that_has_it() {
+        let merged = operation(&["--workspace"])
+            .merged(&operation(&["--workspace", "--no-fail-fast"]))
+            .unwrap();
+        assert_eq!(merged.args, ["--no-fail-fast", "--workspace"]);
+        assert_eq!(
+            merged.merged(&operation(&["--workspace"])),
+            Some(merged.clone())
+        );
+        // A test name, a harness argument or another command never merges.
+        assert_eq!(operation(&["--workspace"]).merged(&operation(&["x"])), None);
+        assert_eq!(
+            operation(&["--", "--no-fail-fast"]).merged(&operation(&[])),
+            None
+        );
+        let check = Operation {
+            command: Command::Check,
+            ..operation(&["--no-fail-fast"])
+        };
+        assert_eq!(
+            check.merged(&Operation {
+                command: Command::Check,
+                ..operation(&[])
+            }),
+            None
+        );
     }
 
     #[test]
