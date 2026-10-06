@@ -233,6 +233,24 @@ slots/<repo>-<hash>/repository     the repository these slots build
 slots/<repo>-<hash>/<n>/{src,target,record.json}
 ```
 
+## macOS: exempt the daemon from first-run scans
+
+macOS scans every new executable the first time it runs unless the app
+responsible for the process is a developer tool. Test binaries are new
+after every link, so each test build pays the scan per binary: measured
+inside a slot, about 0.1 s for a 1 MB test binary and 2.4 s for a 175 MB
+one, in series because Cargo runs test binaries one after another.
+
+The daemon is attributed to the app whose `buildd` client first started
+it: usually your terminal. Add that app (and any other app that starts
+buildd clients, such as an editor or agent host) under System Settings →
+Privacy & Security → Developer Tools, then restart the daemon so a client
+from that app starts it again. `spctl developer-mode enable-terminal`
+makes Terminal appear in that list. Linux has no such scan.
+
+To check, run a test that copies its own executable and times the copy's
+first and second runs; with the exemption both take milliseconds.
+
 ## Load test
 
 `bench/load.py` runs many sessions against one Cargo workspace, each in its
