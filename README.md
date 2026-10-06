@@ -320,7 +320,9 @@ sock               the daemon's socket
 daemon.log         output of a daemon a client started, each line timestamped
 events.jsonl       every event as a JSON line (moves to events.jsonl.1 at 10 MB)
 mirrors/<project>  bare repositories other machines' daemons push trees into
-ssh-<hash>         SSH control sockets to remote hosts, kept open 10 minutes
+ssh-<hash>         SSH control sockets to remote hosts, kept open 10 minutes:
+ssh-status-<hash>  one for builds, one for status, so top never waits behind
+                   a build's push or output
 slots/<repo>-<hash>/repository     the repository these slots build
 slots/<repo>-<hash>/<n>/{src,target,record.json}
 ```

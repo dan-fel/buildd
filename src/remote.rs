@@ -18,9 +18,22 @@ use crate::git;
 use crate::protocol::{Activity, Message, Mirror, Request, RevisionRequest};
 use crate::snapshot::{Revision, Source};
 
-/// SSH options: no prompts, and one connection per host kept open between
-/// builds, in a control socket under the daemon's home.
-fn ssh_options(home: &Path) -> Vec<String> {
+/// Which of the two SSH connections to a host a session goes over: builds
+/// push trees and stream output, so status questions get a connection of
+/// their own instead of queueing behind that traffic.
+#[derive(Clone, Copy)]
+enum Connection {
+    Builds,
+    Status,
+}
+
+/// SSH options: no prompts, and `connection` to each host kept open between
+/// sessions, in a control socket under the daemon's home.
+fn ssh_options(home: &Path, connection: Connection) -> Vec<String> {
+    let control = match connection {
+        Connection::Builds => "ssh-%C",
+        Connection::Status => "ssh-status-%C",
+    };
     [
         "-o",
         "BatchMode=yes",
@@ -35,15 +48,15 @@ fn ssh_options(home: &Path) -> Vec<String> {
     .map(str::to_owned)
     .chain([
         "-o".to_owned(),
-        format!("ControlPath={}", home.join("ssh-%C").display()),
+        format!("ControlPath={}", home.join(control).display()),
     ])
     .collect()
 }
 
 /// `buildd serve` on `remote`, with its standard input and output piped.
-fn serve(home: &Path, remote: &Remote) -> Result<Child, String> {
+fn serve(home: &Path, remote: &Remote, connection: Connection) -> Result<Child, String> {
     Command::new("ssh")
-        .args(ssh_options(home))
+        .args(ssh_options(home, connection))
         .arg(&remote.ssh)
         .arg(&remote.command)
         .stdin(Stdio::piped())
@@ -54,8 +67,13 @@ fn serve(home: &Path, remote: &Remote) -> Result<Child, String> {
 }
 
 /// Sends `request` to `remote`'s daemon and reads its one-line answer.
-fn ask<T: DeserializeOwned>(home: &Path, remote: &Remote, request: &Request) -> Result<T, String> {
-    let mut child = serve(home, remote)?;
+fn ask<T: DeserializeOwned>(
+    home: &Path,
+    remote: &Remote,
+    connection: Connection,
+    request: &Request,
+) -> Result<T, String> {
+    let mut child = serve(home, remote, connection)?;
     send(&mut child, request)?;
     let mut line = String::new();
     BufReader::new(child.stdout.take().expect("piped"))
@@ -96,7 +114,7 @@ fn failure(child: &mut Child, remote: &Remote, line: &str) -> String {
 
 /// What `remote`'s daemon is doing.
 pub(crate) fn activity(home: &Path, remote: &Remote) -> Result<Activity, String> {
-    ask(home, remote, &Request::Activity)
+    ask(home, remote, Connection::Status, &Request::Activity)
 }
 
 /// Pushes tree `revision` of `source`'s repository into `remote`'s mirror
@@ -111,6 +129,7 @@ fn push(
     let mirror: Mirror = ask(
         home,
         remote,
+        Connection::Builds,
         &Request::Mirror {
             project: project.clone(),
         },
@@ -121,7 +140,7 @@ fn push(
     };
     let commit = git::snapshot_commit(git_dir(git::command(&source.repository)), revision)?;
     let ssh = std::iter::once("ssh".to_owned())
-        .chain(ssh_options(home))
+        .chain(ssh_options(home, Connection::Builds))
         .collect::<Vec<_>>()
         .join(" ");
     let mut push = git_dir(git::command(&source.repository));
@@ -147,7 +166,7 @@ pub(crate) fn build(
     mut pass: impl FnMut(&Message) -> bool,
 ) -> Result<(), String> {
     let project = push(home, remote, source, revision)?;
-    let mut child = serve(home, remote)?;
+    let mut child = serve(home, remote, Connection::Builds)?;
     send(
         &mut child,
         &Request::BuildRevision(RevisionRequest { project, ..request }),
