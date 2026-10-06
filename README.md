@@ -2,12 +2,14 @@
 
 Coordinates the Cargo builds of many concurrent sessions (coding agents,
 editors, people) on one machine, so that build disk stays fixed and builds
-share one CPU budget instead of each assuming it owns the machine.
+share one budget of CPU and memory instead of each assuming it owns the
+machine. On request it builds on another machine's daemon instead, for an
+OS this one is not, with the same command and output.
 
 ## How it works
 
 - **Sessions never build in their worktree.** `buildd check` (or `clippy`,
-  `build`, `test`) snapshots the worktree's current content, committed or
+  `build`, `test`, `nextest`) snapshots the worktree's current content, committed or
   not, as a git tree. Tracked files and untracked files git does not ignore
   are included. The tree id is the revision every result reports.
 - **Build slots.** The daemon checks that tree out into a slot: a checkout at
@@ -48,8 +50,9 @@ share one CPU budget instead of each assuming it owns the machine.
 - **One CPU budget.** `jobs` tokens for every build together. Each build
   gets a jobserver of its own (a FIFO its Cargo and compilers take tokens
   from, as GNU make's protocol says), and the daemon deals tokens between
-  them every few milliseconds: one to each compiling build, more to the
-  builds that took more. It knows what each build holds, so a build that
+  them every few milliseconds: it takes back the tokens waiting unclaimed
+  and deals every free one again, a token at a time to each compiling
+  build in turn. It knows what each build holds, so a build that
   is killed returns everything when it ends; with one shared jobserver, a
   compiler killed while holding tokens took them with it for good. A
   build's tests run on `test_jobs` threads (`RUST_TEST_THREADS`), and
@@ -62,6 +65,10 @@ share one CPU budget instead of each assuming it owns the machine.
   ones at their place in the queue. `test` requests that differ only in
   `--no-fail-fast` are one request: the build runs with it, and its exit
   status answers both.
+- **Tests that cannot have changed are skipped.** A `buildd nextest` run
+  of every test skips the test binaries that passed in the slot and whose
+  executable and inputs are unchanged since (see Use). Repeated full suites
+  run only what an edit could affect.
 - **Cancellation.** Closing the client (Ctrl-C) withdraws the request. A
   build nobody waits for any more is stopped with its whole process group.
 - **Restarts keep slots warm.** Each slot records the compilations it ran
@@ -230,7 +237,19 @@ stale compiled units instead of clearing a target, and the daemon estimates
 that one target per worktree would have taken 430 GiB against the slots'
 117 GiB.
 
-What the numbers mean, all measured by the daemon since it started:
+The image predates some of the lines described here. Under the header,
+a line shows how fast builds went in the last hour: the queue wait, then
+the wall time of each kind of build (checks, scoped tests, workspace tests,
+builds), each as median / 90th percentile with its count. That line answers
+"are builds fast right now"; a rising p90 wait means the machine is
+oversubscribed. The header also shows jobs in use, the memory the running
+builds are expected to use against `memory_gib`, and free disk against the
+floor. A running build shows its phase (testing, copying) and the jobs it
+holds; a queued one shows its expected duration and why it waits (memory,
+or a busy warm slot with both estimates). Remote hosts appear in a block of
+their own, or as unreachable with the reason.
+
+What the totals mean, all measured by the daemon since it started:
 
 - **requests → Cargo runs.** The difference is work that never ran: requests
   that joined an equal build (shared), queued requests that moved to a newer
@@ -242,6 +261,8 @@ What the numbers mean, all measured by the daemon since it started:
   started.
 - **compile · tests.** A `test` build's wall time, split at Cargo's
   `build-finished` message: compiling before it, running tests after.
+- **test binaries skipped.** Binaries a `nextest` run of every test did
+  not run because they had passed unchanged.
 - **new worktrees starting on a warm slot.** The first build of a worktree
   that ran in a slot which had already done its compilation, instead of a
   cold build in a fresh target.
@@ -294,10 +315,12 @@ directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 ```text
 config.toml        slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
                    slot_limit_gib = 20, min_free_gib = 15,
-                   memory_gib = <physical> - 6 by default
+                   memory_gib = <physical> - 6 by default; [[remote]] hosts
 sock               the daemon's socket
 daemon.log         output of a daemon a client started, each line timestamped
 events.jsonl       every event as a JSON line (moves to events.jsonl.1 at 10 MB)
+mirrors/<project>  bare repositories other machines' daemons push trees into
+ssh-<hash>         SSH control sockets to remote hosts, kept open 10 minutes
 slots/<repo>-<hash>/repository     the repository these slots build
 slots/<repo>-<hash>/<n>/{src,target,record.json}
 ```
@@ -385,5 +408,7 @@ library's `client` module is what other programs integrate with.
 - Ignored files are not part of a snapshot; a build that needs a generated,
   ignored file fails in a slot.
 - A timeline of recent builds per slot in `buildd top`.
+- Building for every OS in one request (`--os all`), or letting the daemon
+  pick the free machine when either OS's answer will do (`--os any`).
 
 Unix only (Unix sockets, process groups).
