@@ -312,8 +312,12 @@ not. Name the host in `config.toml`:
 name = "pc"
 ssh = "me@192.168.0.10"
 os = "linux"
-command = ". ~/.cargo/env; ~/.local/bin/buildd serve"
+command = "bash -lc 'buildd serve'"
 ```
+
+`command` runs in the remote user's login shell here, so the daemon it
+starts, on first use, sees the same tools (Cargo, linkers, build tools
+such as Zig) as a terminal there.
 
 and ask for the OS: `buildd test --os linux --workspace`. Everything else
 is the same command and the same output. The local daemon snapshots the

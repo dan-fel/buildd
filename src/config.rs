@@ -40,7 +40,7 @@ pub struct Remote {
     /// The OS its builds run on, as Rust names it: `linux`, `macos`.
     pub os: String,
     /// The shell command that runs `buildd serve` there, with whatever
-    /// environment it needs: `. ~/.cargo/env; ~/.local/bin/buildd serve`.
+    /// environment it needs: `bash -lc 'buildd serve'`.
     pub command: String,
 }
 
