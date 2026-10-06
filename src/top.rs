@@ -72,12 +72,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
     let in_use = status.jobs - status.idle_jobs;
     let uptime = ago(activity.started_at_ms, now);
     let free = match status.free_disk {
-        Some(free) if free < status.min_free => Span::from(format!(
-            " · {} free, below the floor of {}",
-            gib(free),
-            gib(status.min_free)
-        ))
-        .red(),
+        Some(free) if free < status.min_free => {
+            Span::from(format!(" · {} free, below the floor", gib(free))).red()
+        }
         Some(free) => Span::from(format!(" · {} free", gib(free))),
         None => Span::from(" · free disk unknown").red(),
     };
@@ -85,11 +82,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         Line::from(vec![
             Span::from(" buildd ").bold().reversed(),
             Span::from(format!(
-                "  up {uptime} · {} slots × {} · jobs {in_use}/{} in use · slots {}",
+                "  up {uptime} · {} slots × {} · jobs {in_use}/{} · memory {:.1}/{}",
                 status.capacity,
                 gib(status.slot_limit),
                 status.jobs,
-                gib(disk),
+                gib_number(status.memory_in_use),
+                gib(status.memory),
             )),
             free,
         ]),
@@ -121,6 +119,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
                 let estimate = build
                     .estimate_ms
                     .map_or_else(String::new, |estimate| format!(" · ~{}", seconds(estimate)));
+                let memory = build.memory_needed.map_or_else(String::new, |needed| {
+                    format!(" · waiting for memory (needs {})", gib(needed))
+                });
                 let held = build.held.as_ref().map_or_else(String::new, |hold| {
                     format!(
                         " · for {} (~{}, cold ~{})",
@@ -130,7 +131,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
                     )
                 });
                 Line::from(format!(
-                    "{}. {}  {} @ {}  waiting {}{estimate}{held}",
+                    "{}. {}  {} @ {}  waiting {}{estimate}{memory}{held}",
                     position + 1,
                     build.who.join(", "),
                     build.operation,
@@ -524,9 +525,13 @@ fn seconds(millis: u64) -> String {
     format!("{}.{} s", millis / 1000, millis % 1000 / 100)
 }
 
-#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
 fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
+    format!("{:.1} GiB", gib_number(bytes))
+}
+
+#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
+fn gib_number(bytes: u64) -> f64 {
+    bytes as f64 / f64::from(1 << 30)
 }
 
 #[expect(clippy::cast_precision_loss, reason = "a share for people")]
@@ -582,6 +587,8 @@ mod tests {
                 slot_limit: 20 << 30,
                 free_disk: Some(10 << 30),
                 min_free: 15 << 30,
+                memory: 18 << 30,
+                memory_in_use: 14 << 30,
                 slots: vec![
                     SlotStatus {
                         name: "app-c716/0".into(),
@@ -627,6 +634,7 @@ mod tests {
                     who: vec!["agent-5".into()],
                     waited_ms: 2100,
                     estimate_ms: Some(40_000),
+                    memory_needed: None,
                     held: Some(Hold {
                         slot: "app-c716/0".into(),
                         wait_ms: 30_000,
@@ -711,7 +719,7 @@ mod tests {
         let now = SystemTime::now();
         let text = screen(&Ok(sample(now)), now);
         for expected in [
-            "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · slots 24.0 GiB · 10.0 GiB free, below the floor of 15.0 GiB",
+            "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free, below the floor",
             "check -p app-ui @ 7f3a9c0d1e",
             "for agent-1, agent-7  shared by 2  testing · 4 jobs · compiled 3 · reused 412",
             "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use",

@@ -22,6 +22,7 @@ use crate::cargo::Line;
 use crate::config::{self, Config};
 use crate::distance::{GitDistance, Workspace};
 use crate::log::log;
+use crate::memory;
 use crate::products::{self, Product};
 use crate::protocol::{
     Activity, BuildRequest, EventKind, Message, Outcome, Request, Status, Usage,
@@ -33,6 +34,8 @@ use crate::snapshot;
 /// How long a cancelled build may take to stop after `SIGTERM` before its
 /// process group is killed.
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
+/// How often a build's memory is sampled.
+const MEMORY_SAMPLE: Duration = Duration::from_secs(1);
 /// How long output is still read after Cargo exits. Only a process that left
 /// the build's process group can hold the output open longer; its remaining
 /// output is abandoned.
@@ -142,7 +145,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .name("buildd-accept".into())
         .spawn(move || accepting.accept(&listener))
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
-    let mut scheduler = Scheduler::new(config.slots, GitDistance::default());
+    let mut scheduler = Scheduler::new(config.slots, config.memory, GitDistance::default());
     restore_slots(home, config, &mut scheduler)?;
     Daemon {
         home: home.to_owned(),
@@ -529,6 +532,7 @@ impl Daemon {
             .scheduler
             .status(|job| self.runs.get(&job).map_or(0, |run| run.charge()));
         let (jobs, idle_jobs) = self.budget.jobs();
+        let (memory, memory_in_use) = self.scheduler.memory();
         Status {
             jobs,
             idle_jobs,
@@ -536,6 +540,8 @@ impl Daemon {
             slot_limit: self.config.slot_limit,
             free_disk: slot::free_disk(&self.home).ok(),
             min_free: self.config.min_free,
+            memory,
+            memory_in_use,
             slots,
             queue,
         }
@@ -906,6 +912,7 @@ impl Building {
         self.forward(stderr, None, done);
 
         let pid = Pid::from_child(&child);
+        let peak = self.sample_memory(pid);
         // Wait without reaping, so Cargo's process group id cannot be reused
         // while the group's remaining processes are killed and before a
         // pending cancellation learns that Cargo exited.
@@ -923,7 +930,8 @@ impl Building {
         }
         kill_leftovers(pid);
         self.run.lock().exited = true;
-        let (status, usage) = reap(&child);
+        let (status, mut usage) = reap(&child);
+        usage.peak_memory = usage.peak_memory.max(peak.load(Ordering::Relaxed));
         let deadline = std::time::Instant::now() + OUTPUT_GRACE;
         for _ in 0..2 {
             if finished.recv_deadline(deadline).is_err() {
@@ -942,6 +950,29 @@ impl Building {
             (outcome, _) => outcome,
         };
         (outcome, Some(usage))
+    }
+
+    /// Samples the resident memory of Cargo's process group `group` every
+    /// [`MEMORY_SAMPLE`] until Cargo exits, keeping the peak.
+    fn sample_memory(&self, group: Pid) -> Arc<AtomicU64> {
+        let peak = Arc::new(AtomicU64::new(0));
+        let sampled = Arc::clone(&peak);
+        let run = Arc::clone(&self.run);
+        let spawned = std::thread::Builder::new()
+            .name("buildd-memory".into())
+            .spawn(move || {
+                while !run.lock().exited {
+                    sampled.fetch_max(
+                        memory::group_resident(group.as_raw_nonzero().get()),
+                        Ordering::Relaxed,
+                    );
+                    std::thread::sleep(MEMORY_SAMPLE);
+                }
+            });
+        if let Err(error) = spawned {
+            log!("could not sample a build's memory: {error}");
+        }
+        peak
     }
 
     /// Copies `products` into `directory` and tells the build's waiters

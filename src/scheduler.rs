@@ -177,6 +177,8 @@ struct Job {
     units: HashSet<String>,
     /// It waits for a busy slot although another is idle, and why.
     hold: Option<Hold>,
+    /// It waits for memory: what it is expected to need at its peak.
+    memory_needed: Option<u64>,
 }
 
 enum State {
@@ -190,6 +192,8 @@ enum State {
         /// Cargo succeeded and its executables are being copied out.
         copying: bool,
         cancelled: bool,
+        /// The memory admission charged it: its expected peak.
+        memory: u64,
     },
 }
 
@@ -237,6 +241,7 @@ impl Slot {
         units: HashSet<String>,
         succeeded: bool,
         build_ms: u64,
+        peak_memory: Option<u64>,
     ) {
         // A build that used no units says nothing about what it needs.
         if units.is_empty() {
@@ -253,6 +258,9 @@ impl Slot {
                     run.units.clear();
                     run.build_ms = Some(build_ms);
                 }
+                if peak_memory.is_some() {
+                    run.peak_memory = peak_memory;
+                }
                 run.units.extend(units);
                 run.at = at;
             }
@@ -261,6 +269,7 @@ impl Slot {
                 at,
                 units: units.into_iter().collect(),
                 build_ms: succeeded.then_some(build_ms),
+                peak_memory,
             }),
         }
     }
@@ -294,6 +303,8 @@ impl Slot {
 
 pub(crate) struct Scheduler<D> {
     capacity: usize,
+    /// Memory running builds may use together, by their expected peaks.
+    memory: u64,
     distance: D,
     /// Worktrees a build has started for.
     built_worktrees: HashSet<PathBuf>,
@@ -370,10 +381,11 @@ impl<D: Distance> Scheduler<D> {
         &mut self.distance
     }
 
-    pub(crate) fn new(capacity: usize, distance: D) -> Self {
+    pub(crate) fn new(capacity: usize, memory: u64, distance: D) -> Self {
         assert!(capacity > 0, "a scheduler runs at least one build");
         Self {
             capacity,
+            memory,
             distance,
             built_worktrees: HashSet::new(),
             clock: 0,
@@ -512,6 +524,7 @@ impl<D: Distance> Scheduler<D> {
                     fresh: 0,
                     units: HashSet::new(),
                     hold: None,
+                    memory_needed: None,
                 },
             );
             id
@@ -703,6 +716,7 @@ impl<D: Distance> Scheduler<D> {
                 std::mem::take(&mut job.units),
                 *code == 0,
                 build_ms,
+                usage.map(|usage| usage.peak_memory),
             );
         }
         let persist = entry.persist();
@@ -876,8 +890,17 @@ impl<D: Distance> Scheduler<D> {
     /// repositories go first.
     fn start_ready(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
+        let mut in_use = self.memory_in_use();
         for id in self.queue_order() {
             if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
+                break;
+            }
+            // A build that does not fit waits, and so does everything behind
+            // it: smaller builds slipping past would keep it waiting for good.
+            // With nothing running, it runs whatever it needs.
+            let memory = self.memory_estimate(&self.jobs[&id]);
+            if in_use > 0 && in_use.saturating_add(memory) > self.memory {
+                self.jobs.get_mut(&id).expect("queued above").memory_needed = Some(memory);
                 break;
             }
             let (slot, warm) = match self.choose_slot(id) {
@@ -899,6 +922,7 @@ impl<D: Distance> Scheduler<D> {
                     continue;
                 }
             };
+            in_use += memory;
             self.clock += 1;
             let job = &self.jobs[&id];
             let first = self.built_worktrees.insert(job.waiters[0].worktree.clone());
@@ -914,6 +938,7 @@ impl<D: Distance> Scheduler<D> {
                 compiled_at: None,
                 copying: false,
                 cancelled: false,
+                memory,
             };
             let name = slot_name(&self.slots[slot].repository, self.slots[slot].index);
             let started = Message::Started {
@@ -962,6 +987,47 @@ impl<D: Distance> Scheduler<D> {
             .collect::<Vec<_>>();
         queued.sort_unstable();
         queued.into_iter().map(|(_, _, id)| id).collect()
+    }
+
+    /// What the running builds are expected to use at their peaks.
+    fn memory_in_use(&self) -> u64 {
+        self.jobs
+            .values()
+            .filter_map(|job| match job.state {
+                State::Running { memory, .. } => Some(memory),
+                State::Queued => None,
+            })
+            .sum()
+    }
+
+    /// Memory running builds may use together, and what the running builds
+    /// are expected to use.
+    pub(crate) fn memory(&self) -> (u64, u64) {
+        (self.memory, self.memory_in_use())
+    }
+
+    /// What a build of `job` is expected to use at its peak: what the latest
+    /// build of its compilation used, or the most any build of the same
+    /// command used; nothing when no build of it ran.
+    fn memory_estimate(&self, job: &Job) -> u64 {
+        let compilation = Compilation::of(job);
+        let runs = || {
+            self.slots
+                .iter()
+                .filter(|slot| slot.repository == job.repository)
+                .flat_map(|slot| &slot.compilations)
+        };
+        runs()
+            .filter(|run| run.compilation == compilation && run.peak_memory.is_some())
+            .max_by_key(|run| run.at)
+            .and_then(|run| run.peak_memory)
+            .or_else(|| {
+                runs()
+                    .filter(|run| run.compilation.command == compilation.command)
+                    .filter_map(|run| run.peak_memory)
+                    .max()
+            })
+            .unwrap_or(0)
     }
 
     /// How long a build of `job` is expected to take: the latest successful
@@ -1168,6 +1234,7 @@ impl<D: Distance> Scheduler<D> {
                     waited_ms: job.waited_ms(),
                     estimate_ms: self.estimate(job),
                     held: job.hold.clone(),
+                    memory_needed: job.memory_needed,
                 }
             })
             .collect();
@@ -1273,7 +1340,7 @@ mod tests {
     }
 
     fn scheduler(capacity: usize) -> Scheduler<Table> {
-        Scheduler::new(capacity, Table::default())
+        Scheduler::new(capacity, u64::MAX, Table::default())
     }
 
     fn source(worktree: &str) -> Source {
@@ -1828,6 +1895,28 @@ mod tests {
     }
 
     #[test]
+    fn a_build_that_would_not_fit_in_memory_waits_and_so_does_everything_behind_it() {
+        let mut scheduler = checked_and_tested();
+        scheduler.memory = 10;
+        scheduler.slots[0].compilations[0].peak_memory = Some(4);
+        scheduler.slots[1].compilations[0].peak_memory = Some(8);
+        let first = submit(&mut scheduler, 3, "/a", "a2");
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}");
+        };
+        // 4 run; a test needs 8 and waits, and a check behind it waits too.
+        let test = submit_operation(&mut scheduler, 4, "/t", "t1", Command::Test, &[]);
+        assert!(starts(&test).is_empty());
+        let check = submit(&mut scheduler, 5, "/c", "c1");
+        assert!(starts(&check).is_empty(), "{check:?}");
+        let (_, queue) = scheduler.status(|_| 0);
+        assert_eq!(queue[0].memory_needed, Some(8), "{queue:?}");
+        assert_eq!(scheduler.memory(), (10, 4));
+        let next = scheduler.exited(job, &ok(), None);
+        assert_eq!(starts(&next).len(), 1, "the test runs alone: {next:?}");
+    }
+
+    #[test]
     fn evicted_units_count_as_missing() {
         let mut scheduler = checked_and_tested();
         scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
@@ -2077,6 +2166,7 @@ mod tests {
                 at: 1,
                 units: units("c", 12).into_iter().collect(),
                 build_ms: None,
+                peak_memory: None,
             }],
             units: units("c", 12).into_iter().map(|unit| (unit, 1)).collect(),
         };

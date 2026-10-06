@@ -23,6 +23,7 @@ pub mod daemon;
 mod distance;
 mod git;
 pub mod log;
+mod memory;
 mod products;
 pub mod protocol;
 mod scheduler;

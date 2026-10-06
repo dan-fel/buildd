@@ -263,6 +263,8 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         slot_limit,
         free_disk,
         min_free,
+        memory,
+        memory_in_use,
         slots,
         queue,
     } = client::status(connect(home)?)?;
@@ -274,8 +276,11 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         },
     );
     println!(
-        "{capacity} slots of {}, jobs: {idle_jobs} of {jobs} idle, disk: {disk} (floor {})",
+        "{capacity} slots of {}, jobs: {idle_jobs} of {jobs} idle, memory: {} of {}, \
+         disk: {disk} (floor {})",
         gib(slot_limit),
+        gib(memory_in_use),
+        gib(memory),
         gib(min_free)
     );
     for slot in slots {
@@ -307,8 +312,13 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         }
     }
     for (position, build) in queue.iter().enumerate() {
+        let why = match (&build.memory_needed, &build.held) {
+            (Some(needed), _) => format!(", waiting for memory (needs {})", gib(*needed)),
+            (None, Some(hold)) => format!(", waiting for slot {}", hold.slot),
+            (None, None) => String::new(),
+        };
         println!(
-            "queued {}: {} {} (waited {}) for {}",
+            "queued {}: {} {} (waited {}{why}) for {}",
             position + 1,
             build.revision.short(),
             build.operation,

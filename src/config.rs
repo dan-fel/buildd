@@ -22,6 +22,9 @@ pub struct Config {
     /// Disk the volume holding the home keeps free, in bytes: below it,
     /// idle slots give up what builds used longest ago.
     pub min_free: u64,
+    /// Memory running builds may use together, in bytes, by their recorded
+    /// peaks: a build that would not fit waits.
+    pub memory: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -32,6 +35,7 @@ struct File {
     test_jobs: Option<usize>,
     slot_limit_gib: Option<f64>,
     min_free_gib: Option<f64>,
+    memory_gib: Option<f64>,
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -39,7 +43,8 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
     /// two slots, one job per available CPU, half of them for a build's
-    /// tests, 20 GiB per slot, and 15 GiB of free disk.
+    /// tests, 20 GiB per slot, 15 GiB of free disk, and the machine's memory
+    /// less 6 GiB for builds.
     ///
     /// # Errors
     /// When the file cannot be read or parsed, or a limit is not positive.
@@ -57,6 +62,12 @@ impl Config {
                 "{}: slot_limit_gib must be positive",
                 path.display()
             ));
+        }
+        #[expect(clippy::cast_precision_loss, reason = "memory in GiB")]
+        let physical_gib = crate::memory::physical() as f64 / GIB;
+        let memory_gib = file.memory_gib.unwrap_or((physical_gib - 6.0).max(1.0));
+        if !(memory_gib.is_finite() && memory_gib > 0.0) {
+            return Err(format!("{}: memory_gib must be positive", path.display()));
         }
         let min_free_gib = file.min_free_gib.unwrap_or(15.0);
         if !(min_free_gib.is_finite() && min_free_gib >= 0.0) {
@@ -84,6 +95,12 @@ impl Config {
                 reason = "a non-negative, finite number of GiB rounds to bytes"
             )]
             min_free: (min_free_gib * GIB).round() as u64,
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a positive, finite number of GiB rounds to bytes"
+            )]
+            memory: (memory_gib * GIB).round() as u64,
         };
         if config.slots == 0 || config.jobs == 0 {
             return Err(format!(
@@ -139,13 +156,15 @@ mod tests {
         let write = |text: &str| std::fs::write(home.0.join("config.toml"), text).unwrap();
         assert_eq!(defaults.test_jobs, (defaults.jobs / 2).max(1));
         assert_eq!(defaults.min_free, 15 << 30);
-        write("slots = 3\njobs = 6\nslot_limit_gib = 0.5\nmin_free_gib = 0\n");
+        assert!(defaults.memory >= 1 << 30);
+        write("slots = 3\njobs = 6\nslot_limit_gib = 0.5\nmin_free_gib = 0\nmemory_gib = 8\n");
         let expected = Config {
             slots: 3,
             jobs: 6,
             test_jobs: 3,
             slot_limit: 1 << 29,
             min_free: 0,
+            memory: 8 << 30,
         };
         assert_eq!(Config::load(&home.0).unwrap(), expected);
         write("slot_limit_gib = 12\n");
@@ -159,6 +178,7 @@ mod tests {
             "jobs = 4\ntest_jobs = 5\n",
             "test_jobs = 0\n",
             "min_free_gib = -1\n",
+            "memory_gib = 0\n",
         ] {
             write(invalid);
             assert!(Config::load(&home.0).is_err(), "{invalid}");

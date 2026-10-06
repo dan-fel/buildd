@@ -124,6 +124,12 @@ pub struct Status {
     pub free_disk: Option<u64>,
     #[serde(default)]
     pub min_free: u64,
+    /// Memory running builds may use together, in bytes, and what the
+    /// running builds are expected to use at their peaks.
+    #[serde(default)]
+    pub memory: u64,
+    #[serde(default)]
+    pub memory_in_use: u64,
     pub slots: Vec<SlotStatus>,
     /// Waiting builds, next first.
     pub queue: Vec<QueuedBuild>,
@@ -204,6 +210,10 @@ pub struct QueuedBuild {
     /// slot is idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<Hold>,
+    /// It waits for memory: it is expected to need this many bytes at its
+    /// peak, more than running builds leave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_needed: Option<u64>,
 }
 
 /// Why a build waits for a busy slot: building cold in an idle one was
@@ -355,7 +365,8 @@ pub enum EventKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub cpu_ms: u64,
-    /// The largest resident memory of any one of its processes, in bytes.
+    /// The largest resident memory of its process group, summed over its
+    /// processes and sampled every second, in bytes.
     pub peak_memory: u64,
 }
 

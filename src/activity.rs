@@ -255,6 +255,8 @@ mod tests {
             slot_limit: 1,
             free_disk: None,
             min_free: 0,
+            memory: 1,
+            memory_in_use: 0,
             slots: Vec::new(),
             queue: Vec::new(),
         }

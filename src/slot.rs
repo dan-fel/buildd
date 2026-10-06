@@ -62,6 +62,9 @@ pub(crate) struct CompilationRun {
     /// The wall time of the latest successful build, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) build_ms: Option<u64>,
+    /// The peak memory of the latest build, its processes summed, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) peak_memory: Option<u64>,
 }
 
 /// A slot directory a daemon left behind.
@@ -1104,6 +1107,7 @@ mod tests {
                 at: 7,
                 units: ["debug/0123456789abcdef".to_owned()].into(),
                 build_ms: Some(4200),
+                peak_memory: None,
             }],
             units: [("debug/0123456789abcdef".to_owned(), 7)].into(),
         };

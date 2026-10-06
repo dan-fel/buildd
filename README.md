@@ -33,6 +33,13 @@ share one CPU budget instead of each assuming it owns the machine.
   plus its share there beats the idle slot compiling its share cold, at
   what a compiled unit cost lately. `top` shows such a build as waiting
   for that slot, with both estimates.
+- **Memory admission.** The daemon samples each build's process group
+  every second and records the summed peak with its compilation. A queued
+  build starts only when the running builds' recorded peaks plus its own
+  fit `memory_gib` (default: physical memory less 6 GiB); a compilation
+  never seen is estimated at the largest peak of its command. A build
+  that does not fit holds the queue behind it, so smaller builds cannot
+  starve it, and with nothing running it starts whatever it needs.
 - **Shortest expected build first.** The queue is ordered by each build's
   expected wall time (the last successful build of its compilation, or of
   its command in its directory) less the time it has waited, so a short
@@ -266,7 +273,8 @@ directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 
 ```text
 config.toml        slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
-                   slot_limit_gib = 20, min_free_gib = 15 by default
+                   slot_limit_gib = 20, min_free_gib = 15,
+                   memory_gib = <physical> - 6 by default
 sock               the daemon's socket
 daemon.log         output of a daemon a client started, each line timestamped
 events.jsonl       every event as a JSON line (moves to events.jsonl.1 at 10 MB)
@@ -314,8 +322,6 @@ library's `client` module is what other programs integrate with.
 
 ## Not yet
 
-- Memory-aware admission: at most `slots` builds run at once, whatever
-  they need.
 - A `cargo` shim that routes agents' own Cargo calls to the daemon.
 - Client environment: Cargo runs with the daemon's environment, so a
   client's `RUSTFLAGS` or `RUST_LOG` do not reach the build; flags for
