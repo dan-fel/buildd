@@ -71,16 +71,27 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
     let disk = measured.clone().sum::<u64>();
     let in_use = status.jobs - status.idle_jobs;
     let uptime = ago(activity.started_at_ms, now);
+    let free = match status.free_disk {
+        Some(free) if free < status.min_free => Span::from(format!(
+            " · {} free, below the floor of {}",
+            gib(free),
+            gib(status.min_free)
+        ))
+        .red(),
+        Some(free) => Span::from(format!(" · {} free", gib(free))),
+        None => Span::from(" · free disk unknown").red(),
+    };
     frame.render_widget(
         Line::from(vec![
             Span::from(" buildd ").bold().reversed(),
             Span::from(format!(
-                "  up {uptime} · {} slots × {} · jobs {in_use}/{} in use · disk {}",
+                "  up {uptime} · {} slots × {} · jobs {in_use}/{} in use · slots {}",
                 status.capacity,
                 gib(status.slot_limit),
                 status.jobs,
                 gib(disk),
             )),
+            free,
         ]),
         header,
     );
@@ -388,6 +399,26 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             ),
             Style::new().fg(Color::Yellow),
         ),
+        EventKind::Reclaimed {
+            needed,
+            freed,
+            floor,
+            caches,
+            units,
+        } => (
+            format!(
+                "disk {} short of the floor of {}: idle slots gave up {caches} caches, \
+                 {units} compiled units, {}",
+                gib(*needed),
+                gib(*floor),
+                gib(*freed)
+            ),
+            if freed < needed {
+                Style::new().fg(Color::Red)
+            } else {
+                Style::new().fg(Color::Blue)
+            },
+        ),
         EventKind::Pruned {
             slot,
             before,
@@ -522,6 +553,8 @@ mod tests {
                 idle_jobs: 6,
                 capacity: 2,
                 slot_limit: 20 << 30,
+                free_disk: Some(10 << 30),
+                min_free: 15 << 30,
                 slots: vec![
                     SlotStatus {
                         name: "app-c716/0".into(),
@@ -645,7 +678,7 @@ mod tests {
         let now = SystemTime::now();
         let text = screen(&Ok(sample(now)), now);
         for expected in [
-            "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · disk 24.0 GiB",
+            "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · slots 24.0 GiB · 10.0 GiB free, below the floor of 15.0 GiB",
             "check -p app-ui @ 7f3a9c0d1e",
             "for agent-1, agent-7  shared by 2  testing · 4 jobs · compiled 3 · reused 412",
             "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use",

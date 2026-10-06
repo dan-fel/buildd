@@ -14,9 +14,9 @@
 //! taking tokens, so compilation elsewhere shrinks to what is left.
 //!
 //! Every [`TICK`] the daemon takes back the tokens waiting in each FIFO and
-//! deals what is free again: one to each compiling build, then more to the
-//! builds that took tokens since the last tick, a round at a time, starting
-//! with a different build each tick.
+//! deals every free token again, one at a time to each compiling build in
+//! turn, starting with a different build each tick. A token a build does
+//! not take waits in its FIFO for one tick at most.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -67,8 +67,6 @@ struct Account {
     /// Tokens written into the FIFO and not taken back: held by the build's
     /// processes or waiting in the FIFO.
     deposited: usize,
-    /// Tokens its processes held at the latest tick.
-    held: usize,
     testing: bool,
 }
 
@@ -82,14 +80,6 @@ impl Account {
         } else {
             charge
         }
-    }
-
-    /// Tokens waiting in the FIFO.
-    fn waiting(&self) -> usize {
-        rustix::io::ioctl_fionread(&self.reader).map_or_else(
-            |error| panic!("a FIFO the daemon holds open can be queried: {error}"),
-            |waiting| usize::try_from(waiting).expect("a FIFO holds few bytes"),
-        )
     }
 
     /// Takes back every token waiting in the FIFO.
@@ -217,14 +207,10 @@ impl Ledger {
 
     /// Takes back the tokens waiting in every FIFO and deals what is free.
     fn deal(&mut self) {
-        let mut took = BTreeMap::new();
-        for (id, account) in &mut self.accounts {
-            let held = account.deposited.saturating_sub(account.waiting());
-            took.insert(*id, held.saturating_sub(account.held));
-            account.held = held;
+        for account in self.accounts.values_mut() {
             account.withdraw_waiting();
         }
-        let mut free = self.free();
+        let free = self.free();
         // Compiling builds in this tick's order, starting at `turn`.
         let order = self
             .accounts
@@ -233,24 +219,8 @@ impl Ledger {
             .filter(|(_, account)| !account.testing)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        let mut round = 0;
-        while free > 0 {
-            let mut dealt = false;
-            for id in &order {
-                if free == 0 {
-                    break;
-                }
-                // Everyone gets one; more only to builds that took as many.
-                if round == 0 || took[id] > round {
-                    self.accounts.get_mut(id).expect("listed above").deposit();
-                    free -= 1;
-                    dealt = true;
-                }
-            }
-            if !dealt {
-                break;
-            }
-            round += 1;
+        for id in order.iter().cycle().take(free) {
+            self.accounts.get_mut(id).expect("listed above").deposit();
         }
         // Next tick starts after the build that went first in this one.
         self.turn = order.first().map_or(0, |id| id + 1);
@@ -339,7 +309,6 @@ fn fifo(path: &Path) -> Result<Account, String> {
             writer,
             child_reader,
             deposited: 0,
-            held: 0,
             testing: false,
         })
     })();
@@ -353,6 +322,16 @@ fn fifo(path: &Path) -> Result<Account, String> {
 mod tests {
     use super::*;
     use crate::snapshot::tests::TempDir;
+
+    impl Account {
+        /// Tokens waiting in the FIFO.
+        fn waiting(&self) -> usize {
+            rustix::io::ioctl_fionread(&self.reader).map_or_else(
+                |error| panic!("a FIFO the daemon holds open can be queried: {error}"),
+                |waiting| usize::try_from(waiting).expect("a FIFO holds few bytes"),
+            )
+        }
+    }
 
     /// A ledger without its dealer thread, dealt by hand.
     fn ledger(jobs: usize, test_jobs: usize, scratch: &Path) -> Ledger {
@@ -388,26 +367,30 @@ mod tests {
         (&ledger.accounts[&id].writer).write_all(b"|").unwrap();
     }
 
+    /// Tokens the processes of build `id` hold.
+    fn held(ledger: &Ledger, id: u64) -> usize {
+        let account = &ledger.accounts[&id];
+        account.deposited - account.waiting()
+    }
+
     #[test]
-    fn every_build_gets_a_token_and_builds_that_take_more_get_more() {
+    fn free_tokens_are_dealt_in_turn_to_every_compiling_build() {
         let scratch = TempDir::new();
         let mut ledger = ledger(6, 3, &scratch.0);
         let (a, b) = (open(&mut ledger), open(&mut ledger));
         ledger.deal();
-        // Each build is charged its implicit token and one waiting token.
-        assert_eq!(ledger.free(), 2);
-        assert_eq!(ledger.accounts[&a].waiting(), 1);
-        // A takes its token and gets another; B's waiting one is dealt again.
+        // Each build is charged its implicit token; the rest is dealt.
+        assert_eq!(ledger.free(), 0);
+        assert_eq!(ledger.accounts[&a].waiting(), 2);
+        assert_eq!(ledger.accounts[&b].waiting(), 2);
+        // A's process takes one and keeps it; the rest is dealt again, B
+        // first this time.
         take(&ledger, a);
         ledger.deal();
-        assert_eq!(ledger.accounts[&a].held, 1);
+        assert_eq!(held(&ledger, a), 1);
         assert_eq!(ledger.accounts[&a].waiting(), 1);
-        assert_eq!(ledger.accounts[&b].waiting(), 1);
-        assert_eq!(ledger.free(), 1);
-        assert_eq!(
-            ledger.accounts[&a].charge(3) + ledger.accounts[&b].charge(3),
-            5
-        );
+        assert_eq!(ledger.accounts[&b].waiting(), 2);
+        assert_eq!(ledger.free(), 0);
         // No scratch file stays behind.
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
@@ -417,38 +400,33 @@ mod tests {
         let scratch = TempDir::new();
         let mut ledger = ledger(4, 2, &scratch.0);
         let a = open(&mut ledger);
+        ledger.deal();
         for _ in 0..3 {
-            ledger.deal();
             take(&ledger, a);
         }
         ledger.deal();
-        assert_eq!(
-            ledger.free(),
-            0,
-            "a holds every job: {}",
-            ledger.accounts[&a].held
-        );
+        assert_eq!(held(&ledger, a), 3);
+        assert_eq!(ledger.free(), 0);
         // The build is killed without giving anything back.
         ledger.accounts.remove(&a);
+        assert_eq!(ledger.free(), 4);
         let b = open(&mut ledger);
         ledger.deal();
-        assert_eq!(ledger.free(), 2);
-        assert_eq!(ledger.accounts[&b].waiting(), 1);
+        assert_eq!(ledger.accounts[&b].waiting(), 3);
     }
 
     #[test]
-    fn tokens_given_back_go_to_whoever_needs_them_and_tests_take_their_share() {
+    fn tokens_given_back_are_dealt_again_and_tests_take_their_share() {
         let scratch = TempDir::new();
         let mut ledger = ledger(5, 3, &scratch.0);
         let (a, b) = (open(&mut ledger), open(&mut ledger));
         ledger.deal();
         take(&ledger, a);
-        ledger.deal();
         take(&ledger, a);
         give_back(&ledger, a);
         ledger.deal();
-        assert_eq!(ledger.accounts[&a].held, 1);
-        // B's tests run: it is charged three, A keeps only what it holds.
+        assert_eq!(held(&ledger, a), 1);
+        // B's tests run: it is charged three, and A keeps what it holds.
         ledger.accounts.get_mut(&b).unwrap().testing = true;
         ledger.deal();
         assert_eq!(ledger.accounts[&b].charge(3), 3);

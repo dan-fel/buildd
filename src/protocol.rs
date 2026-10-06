@@ -117,6 +117,13 @@ pub struct Status {
     pub capacity: usize,
     /// Disk a slot's target may keep between builds, in bytes.
     pub slot_limit: u64,
+    /// Disk free on the volume holding the slots, in bytes, when it could be
+    /// read, and the floor below which idle slots give up what builds used
+    /// longest ago.
+    #[serde(default)]
+    pub free_disk: Option<u64>,
+    #[serde(default)]
+    pub min_free: u64,
     pub slots: Vec<SlotStatus>,
     /// Waiting builds, next first.
     pub queue: Vec<QueuedBuild>,
@@ -295,6 +302,16 @@ pub enum EventKind {
         slot: String,
         operation: Operation,
         revision: Revision,
+    },
+    /// Free disk was `needed` bytes below the `floor`; idle slots gave up
+    /// `caches` incremental caches and `units` compiled units that builds
+    /// used longest ago, freeing `freed` bytes.
+    Reclaimed {
+        needed: u64,
+        freed: u64,
+        floor: u64,
+        caches: usize,
+        units: usize,
     },
     /// A slot was kept within its limit: `caches` incremental caches and
     /// `units` compiled units went, `in_use` of them used in the last ten

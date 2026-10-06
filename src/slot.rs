@@ -293,6 +293,108 @@ impl SlotDirectory {
     }
 }
 
+/// What a slot gave up to bring free disk back to the floor: how it was
+/// kept, and the compiled units it lost; or why it could not be.
+pub(crate) type Reclaimed = Result<(Pruning, Vec<String>), String>;
+
+/// Frees `needed` bytes of disk from `slots`, each with when builds last
+/// used its compiled units: what builds used longest ago goes first, across
+/// all of them, and nothing a build used in the last ten minutes. Returns
+/// what it did in each slot, in order. Only call this while no build runs
+/// in any of them.
+pub(crate) fn reclaim(
+    slots: &[(SlotDirectory, HashMap<String, u64>)],
+    needed: u64,
+) -> Vec<Reclaimed> {
+    let prepared = slots
+        .iter()
+        .map(|(slot, used)| {
+            let target = slot.target();
+            if !target.exists() {
+                let nothing = DiskUsage {
+                    total: 0,
+                    freeable: Vec::new(),
+                };
+                return Ok((Vec::new(), nothing));
+            }
+            let items = evictables(&target, used)?;
+            let usage = disk_usage(&target, &items)?;
+            Ok((items, usage))
+        })
+        .collect::<Vec<Result<_, String>>>();
+    let recent = SystemTime::now() - IN_USE;
+    let mut candidates = prepared
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, prepared)| prepared.as_ref().ok().map(|(items, _)| (slot, items)))
+        .flat_map(|(slot, items)| {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.used <= recent)
+                .map(move |(index, item)| (item.used, slot, index))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    let mut freed = 0;
+    let mut removed = vec![(0, Vec::new(), None); slots.len()];
+    for (_, slot, index) in candidates {
+        if freed >= needed {
+            break;
+        }
+        let Ok((items, usage)) = &prepared[slot] else {
+            unreachable!("only prepared slots have candidates");
+        };
+        let (caches, units, error) = &mut removed[slot];
+        if error.is_some() {
+            continue;
+        }
+        let item = &items[index];
+        if let Err(failed) = item.paths.iter().try_for_each(|path| remove_path(path)) {
+            *error = Some(failed);
+            continue;
+        }
+        freed += usage.freeable[index];
+        match &item.unit {
+            Some(unit) => units.push(unit.clone()),
+            None => *caches += 1,
+        }
+    }
+    prepared
+        .into_iter()
+        .zip(removed)
+        .zip(slots)
+        .map(|((prepared, (caches, units, error)), (slot, _))| {
+            let (_, usage) = prepared?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if caches == 0 && units.is_empty() {
+                return Ok((Pruning::Within { size: usage.total }, units));
+            }
+            let after = disk_usage(&slot.target(), &[])?.total;
+            let pruning = Pruning::Evicted {
+                before: usage.total,
+                after,
+                caches,
+                units: units.len(),
+                in_use: 0,
+            };
+            Ok((pruning, units))
+        })
+        .collect()
+}
+
+/// The disk space free for unprivileged use on the volume holding `path`.
+///
+/// # Errors
+/// When the volume cannot be queried.
+pub(crate) fn free_disk(path: &Path) -> Result<u64, String> {
+    let stat = rustix::fs::statvfs(path)
+        .map_err(|error| format!("could not query free disk at {}: {error}", path.display()))?;
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
 /// What keeping a slot within its limit did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Pruning {
@@ -697,6 +799,47 @@ mod tests {
             .unwrap()
             .set_modified(time)
             .unwrap();
+    }
+
+    #[test]
+    fn reclaiming_takes_what_builds_used_longest_ago_across_slots_but_nothing_in_use() {
+        let home = TempDir::new();
+        let slots = [0, 1].map(|index| SlotDirectory::new(&home.0, Path::new("/repo/.git"), index));
+        // Slot 0 holds an old and a recent cache, slot 1 a middle-aged one.
+        let cache = |slot: &SlotDirectory, name: &str, age: u64| {
+            let path = slot.target().join(format!("debug/incremental/{name}"));
+            file(&path.join("s-1/query.bin"), 200_000);
+            set_modified(&path, age);
+            path
+        };
+        let old = cache(&slots[0], "old", 3600);
+        let recent = cache(&slots[0], "recent", 10);
+        let middle = cache(&slots[1], "middle", 1800);
+        let with_use = slots.map(|slot| (slot, HashMap::new()));
+
+        // About one cache's worth: the oldest goes.
+        let results = reclaim(&with_use, 150_000);
+        assert!(!old.exists() && middle.exists() && recent.exists());
+        assert!(matches!(
+            results[0],
+            Ok((Pruning::Evicted { caches: 1, .. }, _))
+        ));
+        assert!(matches!(results[1], Ok((Pruning::Within { .. }, _))));
+        // Far more than there is: everything but what is in use goes.
+        let results = reclaim(&with_use, u64::MAX);
+        assert!(!middle.exists() && recent.exists());
+        assert!(matches!(
+            results[1],
+            Ok((
+                Pruning::Evicted {
+                    caches: 1,
+                    in_use: 0,
+                    ..
+                },
+                _
+            ))
+        ));
+        assert!(free_disk(&home.0).unwrap() > 0);
     }
 
     #[test]

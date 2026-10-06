@@ -19,6 +19,9 @@ pub struct Config {
     /// is at most this times `slots` per repository, plus what a running
     /// build adds before it is pruned.
     pub slot_limit: u64,
+    /// Disk the volume holding the home keeps free, in bytes: below it,
+    /// idle slots give up what builds used longest ago.
+    pub min_free: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -28,6 +31,7 @@ struct File {
     jobs: Option<usize>,
     test_jobs: Option<usize>,
     slot_limit_gib: Option<f64>,
+    min_free_gib: Option<f64>,
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -35,7 +39,7 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
     /// two slots, one job per available CPU, half of them for a build's
-    /// tests, and 20 GiB per slot.
+    /// tests, 20 GiB per slot, and 15 GiB of free disk.
     ///
     /// # Errors
     /// When the file cannot be read or parsed, or a limit is not positive.
@@ -54,6 +58,13 @@ impl Config {
                 path.display()
             ));
         }
+        let min_free_gib = file.min_free_gib.unwrap_or(15.0);
+        if !(min_free_gib.is_finite() && min_free_gib >= 0.0) {
+            return Err(format!(
+                "{}: min_free_gib must not be negative",
+                path.display()
+            ));
+        }
         let jobs = file.jobs.unwrap_or_else(|| {
             std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
         });
@@ -67,6 +78,12 @@ impl Config {
                 reason = "a positive, finite number of GiB rounds to bytes"
             )]
             slot_limit: (slot_limit_gib * GIB).round() as u64,
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a non-negative, finite number of GiB rounds to bytes"
+            )]
+            min_free: (min_free_gib * GIB).round() as u64,
         };
         if config.slots == 0 || config.jobs == 0 {
             return Err(format!(
@@ -121,12 +138,14 @@ mod tests {
         assert_eq!(defaults.slot_limit, 20 << 30);
         let write = |text: &str| std::fs::write(home.0.join("config.toml"), text).unwrap();
         assert_eq!(defaults.test_jobs, (defaults.jobs / 2).max(1));
-        write("slots = 3\njobs = 6\nslot_limit_gib = 0.5\n");
+        assert_eq!(defaults.min_free, 15 << 30);
+        write("slots = 3\njobs = 6\nslot_limit_gib = 0.5\nmin_free_gib = 0\n");
         let expected = Config {
             slots: 3,
             jobs: 6,
             test_jobs: 3,
             slot_limit: 1 << 29,
+            min_free: 0,
         };
         assert_eq!(Config::load(&home.0).unwrap(), expected);
         write("slot_limit_gib = 12\n");
@@ -139,6 +158,7 @@ mod tests {
             "slot = 1\n",
             "jobs = 4\ntest_jobs = 5\n",
             "test_jobs = 0\n",
+            "min_free_gib = -1\n",
         ] {
             write(invalid);
             assert!(Config::load(&home.0).is_err(), "{invalid}");

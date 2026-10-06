@@ -50,6 +50,12 @@ share one CPU budget instead of each assuming it owns the machine.
 - **Restarts keep slots warm.** Each slot records the compilations it ran
   and the worktree it last built for; a restarted daemon takes its slots
   back, with their checkouts and targets, and removes any beyond `slots`.
+- **Free disk floor.** After every build the daemon checks the volume
+  holding its home. Below `min_free_gib`, every idle slot gives up what
+  builds used longest ago, across all slots, never anything used in the
+  last ten minutes, until the shortfall is freed; `top` shows free disk
+  against the floor. Other programs filling the disk no longer make slot
+  records fail to write.
 - **Disk limit.** A slot's target is kept within `slot_limit_gib` once the
   slot has been idle for two seconds, so measuring it never delays the next
   build of a session running several in a row, and right after a build once
@@ -250,7 +256,7 @@ directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 
 ```text
 config.toml        slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
-                   slot_limit_gib = 20 by default
+                   slot_limit_gib = 20, min_free_gib = 15 by default
 sock               the daemon's socket
 daemon.log         output of a daemon a client started, each line timestamped
 events.jsonl       every event as a JSON line (moves to events.jsonl.1 at 10 MB)

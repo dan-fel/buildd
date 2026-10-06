@@ -89,13 +89,13 @@ pub(crate) enum Effect {
     Cancel {
         job: JobId,
     },
-    /// Keep slot `slot` of `repository` within its disk limit, knowing when
-    /// builds last `used` each compiled unit.
-    Maintain {
-        key: SlotKey,
-        repository: PathBuf,
-        slot: usize,
-        used: HashMap<String, u64>,
+    /// Keep the slot within its disk limit.
+    Maintain(IdleSlot),
+    /// Free `needed` bytes of disk from these slots, what builds used
+    /// longest ago first.
+    Reclaim {
+        slots: Vec<IdleSlot>,
+        needed: u64,
     },
     /// Something happened, for people watching.
     Report(EventKind),
@@ -105,6 +105,17 @@ pub(crate) enum Effect {
         slot: usize,
         record: SlotRecord,
     },
+}
+
+/// Slot `slot` of `repository`, idle and handed out to free disk, with when
+/// builds last `used` each of its compiled units. It is busy until the
+/// scheduler hears it was [`Scheduler::maintained`].
+#[derive(Debug, PartialEq)]
+pub(crate) struct IdleSlot {
+    pub(crate) key: SlotKey,
+    pub(crate) repository: PathBuf,
+    pub(crate) slot: usize,
+    pub(crate) used: HashMap<String, u64>,
 }
 
 /// A build to start in slot `slot` of `repository`.
@@ -682,15 +693,33 @@ impl<D: Distance> Scheduler<D> {
     }
 
     fn maintain(&mut self, index: usize) -> Effect {
+        Effect::Maintain(self.hand_out(index))
+    }
+
+    /// Marks idle slot `index` busy while it frees disk.
+    fn hand_out(&mut self, index: usize) -> IdleSlot {
         let slot = &mut self.slots[index];
-        assert!(!slot.busy(), "only an idle slot is maintained");
+        assert!(!slot.busy(), "only an idle slot is handed out");
         slot.maintaining = true;
-        Effect::Maintain {
+        IdleSlot {
             key: SlotKey(index),
             repository: slot.repository.clone(),
             slot: slot.index,
             used: slot.units.clone(),
         }
+    }
+
+    /// Hands out every idle slot to free `needed` bytes of disk; None when
+    /// every slot is busy. Each is [`Self::maintained`] afterwards.
+    pub(crate) fn reclaim(&mut self, needed: u64) -> Option<Effect> {
+        let idle = (0..self.slots.len())
+            .filter(|index| !self.slots[*index].busy())
+            .collect::<Vec<_>>();
+        if idle.is_empty() {
+            return None;
+        }
+        let slots = idle.into_iter().map(|index| self.hand_out(index)).collect();
+        Some(Effect::Reclaim { slots, needed })
     }
 
     /// When the next idle slot is due for maintenance, if one will be.
@@ -1122,7 +1151,7 @@ mod tests {
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Maintain { slot, .. } => Some(*slot),
+                Effect::Maintain(IdleSlot { slot, .. }) => Some(*slot),
                 _ => None,
             })
             .collect()
@@ -1737,6 +1766,24 @@ mod tests {
     }
 
     #[test]
+    fn reclaiming_disk_hands_out_every_idle_slot_and_starts_waiting_builds_after() {
+        let mut scheduler = checked_and_tested();
+        let busy = submit(&mut scheduler, 3, "/c", "c1");
+        assert_eq!(starts(&busy).len(), 1);
+        let Some(Effect::Reclaim { slots, needed: 7 }) = scheduler.reclaim(7) else {
+            panic!("one slot is idle");
+        };
+        let [IdleSlot { key, .. }] = &slots[..] else {
+            panic!("{slots:?}");
+        };
+        assert_eq!(scheduler.reclaim(7), None, "no slot is idle any more");
+        let waiting = submit(&mut scheduler, 4, "/d", "d1");
+        assert!(starts(&waiting).is_empty());
+        let done = scheduler.maintained(*key, Some(Pruning::Within { size: 1 }), &[]);
+        assert_eq!(starts(&done).len(), 1, "{done:?}");
+    }
+
+    #[test]
     fn units_builds_use_are_recorded_handed_to_maintenance_and_forgotten_when_evicted() {
         let mut scheduler = scheduler(1);
         let first = submit(&mut scheduler, 1, "/work/a", "a1");
@@ -1754,7 +1801,7 @@ mod tests {
             ["debug/aaaaaaaaaaaaaaaa", "debug/bbbbbbbbbbbbbbbb"]
         );
         let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
-        let [Effect::Maintain { used, .. }] = &maintain[..] else {
+        let [Effect::Maintain(IdleSlot { used, .. })] = &maintain[..] else {
             panic!("{maintain:?}");
         };
         assert_eq!(used.len(), 2);

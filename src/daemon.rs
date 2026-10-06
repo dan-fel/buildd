@@ -23,8 +23,10 @@ use crate::config::{self, Config};
 use crate::distance::{GitDistance, Workspace};
 use crate::log::log;
 use crate::products::{self, Product};
-use crate::protocol::{Activity, BuildRequest, Message, Outcome, Request, Status, Usage};
-use crate::scheduler::{Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
+use crate::protocol::{
+    Activity, BuildRequest, EventKind, Message, Outcome, Request, Status, Usage,
+};
+use crate::scheduler::{Effect, IdleSlot, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
 use crate::slot::{self, Pruning, SlotDirectory, slot_name};
 use crate::snapshot;
 
@@ -80,6 +82,12 @@ enum Event {
         job: JobId,
         outcome: Outcome,
         usage: Option<Usage>,
+    },
+    /// Idle slots gave up what builds used longest ago to free the `needed`
+    /// bytes free disk lacked below the floor; each did what its result says.
+    Reclaimed {
+        needed: u64,
+        results: Vec<(SlotKey, String, slot::Reclaimed)>,
     },
     /// Slot `key` of `repository` was kept within its disk limit by
     /// `pruning`, removing compiled units `evicted` (None when that failed),
@@ -145,6 +153,8 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         waiters: HashMap::new(),
         runs: HashMap::new(),
         log: ActivityLog::new(SystemTime::now(), EventFile::new(home)),
+        reclaiming: false,
+        below_floor: false,
     }
     .drive(&received)
 }
@@ -362,6 +372,11 @@ struct Daemon {
     waiters: HashMap<WaiterId, Sender<Message>>,
     runs: HashMap<JobId, Arc<Run>>,
     log: ActivityLog,
+    /// Idle slots are freeing disk below the floor.
+    reclaiming: bool,
+    /// Free disk was below the floor when last looked at, and nothing more
+    /// could be done then.
+    below_floor: bool,
 }
 
 impl Daemon {
@@ -431,8 +446,14 @@ impl Daemon {
                     usage,
                 } => {
                     self.runs.remove(&job);
-                    self.scheduler.exited(job, &outcome, usage)
+                    let effects = self.scheduler.exited(job, &outcome, usage);
+                    for effect in effects {
+                        self.apply(effect);
+                    }
+                    self.keep_disk_free();
+                    Vec::new()
                 }
+                Event::Reclaimed { needed, results } => self.reclaimed(needed, results),
                 Event::Maintained {
                     key,
                     repository,
@@ -452,6 +473,57 @@ impl Daemon {
         }
     }
 
+    /// Hands each reclaimed slot back to the scheduler and reports what
+    /// freeing disk did.
+    fn reclaimed(
+        &mut self,
+        needed: u64,
+        results: Vec<(SlotKey, String, slot::Reclaimed)>,
+    ) -> Vec<Effect> {
+        self.reclaiming = false;
+        let floor = self.config.min_free;
+        let (mut caches, mut units, mut freed) = (0, 0, 0);
+        let mut effects = Vec::new();
+        for (key, name, result) in results {
+            let (pruning, evicted) = match result {
+                Ok((pruning, evicted)) => (Some(pruning), evicted),
+                Err(error) => {
+                    log!("slot {name} could not free disk: {error}");
+                    (None, Vec::new())
+                }
+            };
+            if let Some(slot::Pruning::Evicted {
+                before,
+                after,
+                caches: gone_caches,
+                units: gone_units,
+                ..
+            }) = pruning
+            {
+                caches += gone_caches;
+                units += gone_units;
+                freed += before.saturating_sub(after);
+            }
+            effects.extend(self.scheduler.maintained(key, pruning, &evicted));
+        }
+        log!(
+            "disk: {} short of the floor of {}: idle slots gave up {caches} caches and \
+             {units} compiled units, {}",
+            gib(needed),
+            gib(floor),
+            gib(freed)
+        );
+        self.below_floor = freed < needed;
+        effects.push(Effect::Report(EventKind::Reclaimed {
+            needed,
+            freed,
+            floor,
+            caches,
+            units,
+        }));
+        effects
+    }
+
     fn status(&self) -> Status {
         let (slots, queue) = self
             .scheduler
@@ -462,6 +534,8 @@ impl Daemon {
             idle_jobs,
             capacity: self.config.slots,
             slot_limit: self.config.slot_limit,
+            free_disk: slot::free_disk(&self.home).ok(),
+            min_free: self.config.min_free,
             slots,
             queue,
         }
@@ -478,6 +552,8 @@ impl Daemon {
                 let directory = SlotDirectory::new(&self.home, &repository, slot);
                 if let Err(error) = directory.write_record(&record) {
                     log!("{error}");
+                    // A full disk is the likely reason.
+                    self.keep_disk_free();
                 }
             }
             Effect::Send { waiter, message } => {
@@ -516,12 +592,12 @@ impl Daemon {
                     });
                 }
             }
-            Effect::Maintain {
+            Effect::Maintain(IdleSlot {
                 key,
                 repository,
                 slot,
                 used,
-            } => {
+            }) => {
                 let directory = SlotDirectory::new(&self.home, &repository, slot);
                 let name = slot_name(&repository, slot);
                 let limit = self.config.slot_limit;
@@ -556,11 +632,88 @@ impl Daemon {
                     });
                 }
             }
+            Effect::Reclaim { slots, needed } => {
+                let home = self.home.clone();
+                let events = self.events.clone();
+                let keys = slots.iter().map(|slot| slot.key).collect::<Vec<_>>();
+                let spawned = std::thread::Builder::new()
+                    .name("buildd-reclaim".into())
+                    .spawn(move || {
+                        let directories = slots
+                            .iter()
+                            .map(|idle| {
+                                let directory =
+                                    SlotDirectory::new(&home, &idle.repository, idle.slot);
+                                (directory, idle.used.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        let results = slot::reclaim(&directories, needed);
+                        let _ = events.send(Event::Reclaimed {
+                            needed,
+                            results: slots
+                                .into_iter()
+                                .map(|idle| (idle.key, slot_name(&idle.repository, idle.slot)))
+                                .zip(results)
+                                .map(|((key, name), result)| (key, name, result))
+                                .collect(),
+                        });
+                    });
+                if let Err(error) = spawned {
+                    log!("could not start freeing disk: {error}");
+                    let results = keys
+                        .into_iter()
+                        .map(|key| (key, String::new(), Err(error.to_string())))
+                        .collect();
+                    let _ = self.events.send(Event::Reclaimed { needed, results });
+                }
+            }
             Effect::Cancel { job } => {
                 if let Some(run) = self.runs.get(&job) {
                     run.cancel();
                 }
             }
+        }
+    }
+
+    /// Below the floor of free disk, hands the idle slots out to give up
+    /// what builds used longest ago; one reclaim at a time.
+    fn keep_disk_free(&mut self) {
+        let floor = self.config.min_free;
+        if self.reclaiming || floor == 0 {
+            return;
+        }
+        let free = match slot::free_disk(&self.home) {
+            Ok(free) => free,
+            Err(error) => {
+                log!("{error}");
+                return;
+            }
+        };
+        if free >= floor {
+            if self.below_floor {
+                log!(
+                    "disk: {} free again, above the floor of {}",
+                    gib(free),
+                    gib(floor)
+                );
+                self.below_floor = false;
+            }
+            return;
+        }
+        match self.scheduler.reclaim(floor - free) {
+            Some(effect) => {
+                self.reclaiming = true;
+                self.apply(effect);
+            }
+            None if !self.below_floor => {
+                log!(
+                    "disk: {} free, below the floor of {}, and every slot is busy",
+                    gib(free),
+                    gib(floor)
+                );
+                self.below_floor = true;
+            }
+            None => {}
         }
     }
 }

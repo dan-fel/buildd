@@ -77,6 +77,9 @@ fn daemon(home: &Path) -> Result<ExitCode, String> {
     match buildd::daemon::run(home, config)? {}
 }
 
+/// The names of buildd's own options of a build.
+const OPTIONS: [&str; 3] = ["--json", "--copy-to", "--rustflags"];
+
 /// buildd's own options of a build, which come before Cargo's arguments.
 #[derive(Debug, Default, PartialEq)]
 struct Options {
@@ -122,6 +125,20 @@ impl Options {
             taken += 1;
         }
         args.drain(..taken);
+        let misplaced = args
+            .iter()
+            .take_while(|argument| *argument != "--")
+            .find(|argument| {
+                let name = argument
+                    .split_once('=')
+                    .map_or(argument.as_str(), |(name, _)| name);
+                OPTIONS.contains(&name)
+            });
+        if let Some(argument) = misplaced {
+            return Err(format!(
+                "`{argument}` is buildd's option: put it before Cargo's arguments"
+            ));
+        }
         Ok(options)
     }
 }
@@ -244,12 +261,22 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         idle_jobs,
         capacity,
         slot_limit,
+        free_disk,
+        min_free,
         slots,
         queue,
     } = client::status(connect(home)?)?;
+    let disk = free_disk.map_or_else(
+        || "unknown".to_owned(),
+        |free| {
+            let below = if free < min_free { ", below" } else { "" };
+            format!("{} free{below}", gib(free))
+        },
+    );
     println!(
-        "{capacity} slots of {}, jobs: {idle_jobs} of {jobs} idle",
-        gib(slot_limit)
+        "{capacity} slots of {}, jobs: {idle_jobs} of {jobs} idle, disk: {disk} (floor {})",
+        gib(slot_limit),
+        gib(min_free)
     );
     for slot in slots {
         let worktree = slot.worktree.map_or_else(String::new, |worktree| {
@@ -375,6 +402,7 @@ mod tests {
             "out",
             "--rustflags=-C force-frame-pointers=yes",
             "--release",
+            "--",
             "--json",
         ]);
         assert_eq!(
@@ -385,10 +413,12 @@ mod tests {
                 rustflags: vec!["-C".into(), "force-frame-pointers=yes".into()],
             }
         );
-        assert_eq!(rest, ["--release", "--json"]);
-        let (options, rest) = take(&["-p", "x", "--copy-to", "/abs"]);
+        assert_eq!(rest, ["--release", "--", "--json"]);
+        let (options, rest) = take(&["-p", "x", "--", "--json"]);
         assert_eq!(options.unwrap(), Options::default());
-        assert_eq!(rest, ["-p", "x", "--copy-to", "/abs"]);
+        assert_eq!(rest, ["-p", "x", "--", "--json"]);
+        let (misplaced, _) = take(&["-p", "x", "--copy-to=/abs"]);
+        assert!(misplaced.unwrap_err().contains("before Cargo's arguments"));
         assert!(
             take(&["--copy-to"])
                 .0

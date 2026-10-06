@@ -101,7 +101,7 @@ impl ActivityLog {
             }
             EventKind::Dropped { .. } => totals.dropped += 1,
             EventKind::Cancelled { .. } => totals.cancelled += 1,
-            EventKind::Pruned { .. } => {}
+            EventKind::Pruned { .. } | EventKind::Reclaimed { .. } => {}
         }
         let event = Event {
             at_ms: epoch_millis(at),
@@ -253,6 +253,8 @@ mod tests {
             idle_jobs: 1,
             capacity: 1,
             slot_limit: 1,
+            free_disk: None,
+            min_free: 0,
             slots: Vec::new(),
             queue: Vec::new(),
         }

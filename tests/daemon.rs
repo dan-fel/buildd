@@ -437,6 +437,33 @@ fn a_build_nobody_waits_for_is_stopped_with_everything_it_started() {
 }
 
 #[test]
+fn below_the_disk_floor_idle_slots_give_up_what_is_not_in_use() {
+    // No volume has this much free: every build ends below the floor.
+    let daemon = Daemon::configured("slots = 1\njobs = 4\nmin_free_gib = 1000000\n");
+    let repository = crate_repository(None);
+    let built = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&built).success(), "{built:#?}");
+    wait_until("the idle slot gave up what it could", || {
+        daemon.activity().events.iter().any(|event| {
+            matches!(
+                event.kind,
+                // Everything was used minutes ago: nothing goes.
+                EventKind::Reclaimed {
+                    freed: 0,
+                    units: 0,
+                    ..
+                }
+            )
+        })
+    });
+    let status = daemon.status();
+    assert!(status.free_disk.is_some_and(|free| free < status.min_free));
+    // The slot is handed back and builds again.
+    let again = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&again).success(), "{again:#?}");
+}
+
+#[test]
 fn requests_outside_a_worktree_or_taking_over_the_slot_are_rejected() {
     let daemon = Daemon::start(1);
     let plain = TempDir::new();
