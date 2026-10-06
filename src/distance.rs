@@ -15,6 +15,7 @@ use std::process::Stdio;
 use serde::Deserialize;
 
 use crate::git;
+use crate::log::log;
 use crate::scheduler::Distance;
 use crate::snapshot::Revision;
 
@@ -60,7 +61,7 @@ impl Distance for GitDistance {
             Ok(paths) => paths,
             // An unknown distance ranks behind every known one.
             Err(error) => {
-                eprintln!("buildd: could not compare trees: {error}");
+                log!("could not compare trees: {error}");
                 return u64::MAX;
             }
         };

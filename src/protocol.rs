@@ -54,12 +54,15 @@ pub enum Message {
     Stdout { line: String },
     /// A line of Cargo's standard error.
     Stderr { line: String },
-    /// The build of `revision` ended.
+    /// The build of `revision` ended. For `test`, `test_ms` is the part of
+    /// `build_ms` after compilation finished: running the tests.
     Finished {
         revision: Revision,
         outcome: Outcome,
         queued_ms: u64,
         build_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        test_ms: Option<u64>,
     },
     /// The request was not accepted.
     Rejected { reason: String },
@@ -123,6 +126,20 @@ pub struct SlotStatus {
     /// limit is below what they need, and they compile from scratch.
     pub undersized: bool,
     pub build: Option<RunningBuild>,
+    /// How its latest build ended, since the daemon started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<LastBuild>,
+}
+
+/// A slot's latest finished build.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LastBuild {
+    pub operation: Operation,
+    pub outcome: Outcome,
+    pub build_ms: u64,
+    /// For `test`, the part of `build_ms` spent running the tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_ms: Option<u64>,
 }
 
 /// A build in a slot.
@@ -138,6 +155,9 @@ pub struct RunningBuild {
     pub fresh: u64,
     /// Nobody waits for it any more; it is being stopped.
     pub cancelled: bool,
+    /// A `test` build whose compilation finished: its tests run.
+    #[serde(default)]
+    pub testing: bool,
 }
 
 /// A build waiting for a slot.
@@ -235,6 +255,9 @@ pub enum EventKind {
         revision: Revision,
         outcome: Outcome,
         build_ms: u64,
+        /// For `test`, the part of `build_ms` spent running the tests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        test_ms: Option<u64>,
         compiled: u64,
         fresh: u64,
         /// What Cargo and its compilers used, when it ran.

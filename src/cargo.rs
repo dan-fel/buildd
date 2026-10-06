@@ -230,8 +230,10 @@ pub(crate) enum Line {
     /// A build script's report, with the directory it wrote; also inside the
     /// slot.
     BuildScript { out_dir: PathBuf },
-    /// Diagnostics, the final build message and every other line (test
-    /// output): for the client.
+    /// Cargo's message that compilation ended; for `test`, the tests run
+    /// next. The client gets it too.
+    BuildFinished,
+    /// Diagnostics and every other line (test output): for the client.
     Forward,
 }
 
@@ -261,6 +263,10 @@ impl Line {
                 out_dir: Some(out_dir),
                 ..
             }) => Self::BuildScript { out_dir },
+            Ok(Message {
+                reason: "build-finished",
+                ..
+            }) => Self::BuildFinished,
             _ => Self::Forward,
         }
     }
@@ -324,9 +330,12 @@ mod tests {
                 out_dir: "/slot/x".into()
             }
         );
+        assert_eq!(
+            Line::of(r#"{"reason":"build-finished","success":true}"#),
+            Line::BuildFinished
+        );
         for forwarded in [
             r#"{"reason":"compiler-message","message":{"rendered":"x"}}"#,
-            r#"{"reason":"build-finished","success":true}"#,
             "test tests::it_works ... ok",
             "{ not json",
         ] {

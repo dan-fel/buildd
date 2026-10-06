@@ -1,29 +1,73 @@
 //! What the daemon did, for people watching: its recent events and the
-//! totals derived from them.
+//! totals derived from them, and every event in a file for hindsight.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::log::log;
 use crate::protocol::{Activity, Event, EventKind, Status, Totals};
 
-/// How many recent events the log keeps.
+/// How many recent events the log keeps in memory.
 const KEPT_EVENTS: usize = 200;
+/// How large the event file grows before it moves aside.
+const EVENT_FILE_LIMIT: u64 = 10 << 20;
 
 pub(crate) struct ActivityLog {
     started: SystemTime,
     totals: Totals,
     events: VecDeque<Event>,
     worktrees: HashSet<PathBuf>,
+    file: EventFile,
+}
+
+/// `events.jsonl` in the daemon's home: every event as a JSON line, so
+/// hindsight reaches past the events kept in memory and past restarts. At
+/// [`EVENT_FILE_LIMIT`] it moves to `events.jsonl.1`, replacing the older
+/// one there.
+pub(crate) struct EventFile {
+    path: PathBuf,
+}
+
+impl EventFile {
+    pub(crate) fn new(home: &Path) -> Self {
+        Self {
+            path: home.join("events.jsonl"),
+        }
+    }
+
+    fn append(&self, event: &Event) {
+        let mut line = serde_json::to_string(event).expect("events serialize");
+        line.push('\n');
+        let full =
+            std::fs::metadata(&self.path).is_ok_and(|metadata| metadata.len() >= EVENT_FILE_LIMIT);
+        let written = if full {
+            std::fs::rename(&self.path, self.path.with_extension("jsonl.1"))
+        } else {
+            Ok(())
+        }
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+        })
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(error) = written {
+            log!("could not write {}: {error}", self.path.display());
+        }
+    }
 }
 
 impl ActivityLog {
-    pub(crate) fn new(started: SystemTime) -> Self {
+    pub(crate) fn new(started: SystemTime, file: EventFile) -> Self {
         Self {
             started,
             totals: Totals::default(),
             events: VecDeque::new(),
             worktrees: HashSet::new(),
+            file,
         }
     }
 
@@ -59,13 +103,15 @@ impl ActivityLog {
             EventKind::Cancelled { .. } => totals.cancelled += 1,
             EventKind::Pruned { .. } => {}
         }
+        let event = Event {
+            at_ms: epoch_millis(at),
+            kind,
+        };
+        self.file.append(&event);
         if self.events.len() == KEPT_EVENTS {
             self.events.pop_front();
         }
-        self.events.push_back(Event {
-            at_ms: epoch_millis(at),
-            kind,
-        });
+        self.events.push_back(event);
     }
 
     /// What `buildd top` shows, with the daemon's current `status`.
@@ -92,6 +138,7 @@ mod tests {
     use crate::cargo::{Command, Operation};
     use crate::protocol::{Outcome, Usage};
     use crate::snapshot::Revision;
+    use crate::snapshot::tests::TempDir;
 
     fn check() -> Operation {
         Operation {
@@ -116,7 +163,8 @@ mod tests {
 
     #[test]
     fn totals_follow_the_events_and_the_log_keeps_the_latest() {
-        let mut log = ActivityLog::new(SystemTime::now());
+        let home = TempDir::new();
+        let mut log = ActivityLog::new(SystemTime::now(), EventFile::new(&home.0));
         log.record(SystemTime::now(), requested("/a", false));
         log.record(SystemTime::now(), requested("/b", true));
         log.record(SystemTime::now(), requested("/a", false));
@@ -140,6 +188,7 @@ mod tests {
                 revision: tree("t"),
                 outcome: Outcome::Exited { code: 0 },
                 build_ms: 10,
+                test_ms: None,
                 compiled: 3,
                 fresh: 97,
                 usage: Some(Usage {
@@ -170,6 +219,31 @@ mod tests {
         let activity = log.activity(empty_status());
         assert_eq!(activity.events.len(), KEPT_EVENTS);
         assert_eq!(activity.totals.requests, 3 + KEPT_EVENTS as u64);
+        // The file keeps every event, not only the latest.
+        let file = std::fs::read_to_string(home.0.join("events.jsonl")).unwrap();
+        assert_eq!(file.lines().count(), 5 + KEPT_EVENTS);
+        let first: Event = serde_json::from_str(file.lines().next().unwrap()).unwrap();
+        assert_eq!(first.kind, requested("/a", false));
+    }
+
+    #[test]
+    fn a_full_event_file_moves_aside_and_a_new_one_starts() {
+        let home = TempDir::new();
+        let path = home.0.join("events.jsonl");
+        std::fs::write(
+            &path,
+            vec![b'x'; usize::try_from(EVENT_FILE_LIMIT).unwrap()],
+        )
+        .unwrap();
+        let mut log = ActivityLog::new(SystemTime::now(), EventFile::new(&home.0));
+        log.record(SystemTime::now(), requested("/a", false));
+        assert_eq!(
+            std::fs::metadata(home.0.join("events.jsonl.1"))
+                .unwrap()
+                .len(),
+            EVENT_FILE_LIMIT
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
     }
 
     fn empty_status() -> Status {

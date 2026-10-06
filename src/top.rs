@@ -180,7 +180,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         .filter_map(|event| {
             let (text, style) = describe(&event.kind)?;
             Some(Line::from(vec![
-                Span::from(format!("{:>4}  ", ago(event.at_ms, now))).dark_gray(),
+                Span::from(format!("{}  ", clock(event.at_ms))).dark_gray(),
                 Span::styled(text, style),
             ]))
         })
@@ -236,6 +236,11 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
             };
             let state = if build.cancelled {
                 Span::from("  stopping").red()
+            } else if build.testing {
+                Span::from(format!(
+                    "  testing · compiled {} · reused {}",
+                    build.compiled, build.fresh
+                ))
             } else {
                 Span::from(format!(
                     "  compiled {} · reused {}",
@@ -264,6 +269,11 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
                 }))
                 .dark_gray(),
             ];
+            if let Some(build) = &slot.last {
+                line.push(
+                    Span::from(format!("  {}", took(build.build_ms, build.test_ms))).dark_gray(),
+                );
+            }
             if slot.undersized {
                 line.push(Span::from("  limit below what its builds use").red());
             }
@@ -334,6 +344,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             operation,
             outcome,
             build_ms,
+            test_ms,
             compiled,
             fresh,
             usage,
@@ -351,7 +362,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             (
                 format!(
                     "{slot} {ended} {operation} in {}: compiled {compiled}, reused {fresh}{cpu}",
-                    seconds(*build_ms)
+                    took(*build_ms, *test_ms)
                 ),
                 style,
             )
@@ -418,6 +429,25 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
     })
 }
 
+/// A build's wall time, split into compiling and testing for a test build.
+fn took(build_ms: u64, test_ms: Option<u64>) -> String {
+    match test_ms {
+        Some(test_ms) => format!(
+            "{} (compile {} · tests {})",
+            seconds(build_ms),
+            seconds(build_ms.saturating_sub(test_ms)),
+            seconds(test_ms)
+        ),
+        None => seconds(build_ms),
+    }
+}
+
+/// The local clock time of `at_ms`.
+fn clock(at_ms: u64) -> String {
+    let at = SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms);
+    buildd::log::local_time(at)[11..].to_owned()
+}
+
 /// How long ago `at_ms` was at `now`, briefly.
 fn ago(at_ms: u64, now: SystemTime) -> String {
     let now_ms = u64::try_from(
@@ -457,7 +487,7 @@ mod tests {
     use std::time::Duration;
 
     use buildd::cargo::{Command, Operation};
-    use buildd::protocol::{Event, QueuedBuild, RunningBuild, Status, Totals, Usage};
+    use buildd::protocol::{Event, LastBuild, QueuedBuild, RunningBuild, Status, Totals, Usage};
     use buildd::snapshot::Revision;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -506,7 +536,9 @@ mod tests {
                             compiled: 3,
                             fresh: 412,
                             cancelled: false,
+                            testing: false,
                         }),
+                        last: None,
                     },
                     SlotStatus {
                         name: "app-c716/1".into(),
@@ -515,6 +547,15 @@ mod tests {
                         maintaining: false,
                         undersized: true,
                         build: None,
+                        last: Some(LastBuild {
+                            operation: Operation {
+                                command: Command::Test,
+                                args: Vec::new(),
+                            },
+                            outcome: Outcome::Exited { code: 0 },
+                            build_ms: 300_000,
+                            test_ms: Some(200_000),
+                        }),
                     },
                 ],
                 queue: vec![QueuedBuild {
@@ -559,6 +600,7 @@ mod tests {
                         revision: tree("91c0"),
                         outcome: Outcome::Exited { code: 0 },
                         build_ms: 2100,
+                        test_ms: None,
                         compiled: 2,
                         fresh: 233,
                         usage: Some(Usage {
@@ -603,7 +645,7 @@ mod tests {
             "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 in use · disk 24.0 GiB",
             "check -p app-ui @ 7f3a9c0d1e",
             "for agent-1, agent-7  shared by 2  compiled 3 · reused 412",
-            "last for agent-2  limit below what its builds use",
+            "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use",
             "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",

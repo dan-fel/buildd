@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cargo::Compilation;
 use crate::git;
+use crate::log::log;
 use crate::snapshot::Revision;
 
 /// An incremental cache compiled this recently belongs to builds in use:
@@ -78,8 +79,8 @@ pub(crate) fn existing_slots(home: &Path) -> Result<Vec<ExistingSlot>, String> {
     let mut existing = Vec::new();
     for project in read_directory(&slots)? {
         let Ok(repository) = std::fs::read(project.join("repository")) else {
-            eprintln!(
-                "buildd: {} names no repository; leaving it alone",
+            log!(
+                "{} names no repository; leaving it alone",
                 project.display()
             );
             continue;

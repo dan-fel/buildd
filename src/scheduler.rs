@@ -35,8 +35,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::cargo::{Compilation, Operation};
-use crate::protocol::{EventKind, Message, Outcome, QueuedBuild, RunningBuild, SlotStatus, Usage};
+use crate::cargo::{Command, Compilation, Operation};
+use crate::protocol::{
+    EventKind, LastBuild, Message, Outcome, QueuedBuild, RunningBuild, SlotStatus, Usage,
+};
 use crate::slot::{CompilationRun, Pruning, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
 
@@ -154,6 +156,8 @@ enum State {
         /// Index into the scheduler's slots.
         slot: usize,
         started: Instant,
+        /// When Cargo reported that compilation finished.
+        compiled_at: Option<Instant>,
         cancelled: bool,
     },
 }
@@ -179,6 +183,8 @@ struct Slot {
     size: Option<u64>,
     /// Its last maintenance took caches in use: its limit is too small.
     undersized: bool,
+    /// How its latest build since the daemon started ended.
+    last: Option<LastBuild>,
     /// What its latest build of each compilation used.
     compilations: Vec<CompilationRun>,
     /// When a build last used each compiled unit, in seconds since the Unix
@@ -344,6 +350,7 @@ impl<D: Distance> Scheduler<D> {
             idle_since: Instant::now(),
             size: None,
             undersized: false,
+            last: None,
             compilations: record.compilations,
             units: record.units.into_iter().collect(),
         });
@@ -547,6 +554,18 @@ impl<D: Distance> Scheduler<D> {
         }
     }
 
+    /// Cargo reported that running job `id` finished compiling.
+    pub(crate) fn compiled(&mut self, id: JobId) {
+        // Like output, a report can arrive after the build ended.
+        if let Some(Job {
+            state: State::Running { compiled_at, .. },
+            ..
+        }) = self.jobs.get_mut(&id)
+        {
+            compiled_at.get_or_insert_with(Instant::now);
+        }
+    }
+
     /// Running job `id` used compiled `unit`, such as a build script's output.
     pub(crate) fn unit_used(&mut self, id: JobId, unit: String) {
         // Like output, a report can arrive after the build ended.
@@ -569,9 +588,18 @@ impl<D: Distance> Scheduler<D> {
         usage: Option<Usage>,
     ) -> Vec<Effect> {
         let mut job = self.jobs.remove(&id).expect("only tracked jobs run");
-        let State::Running { slot, started, .. } = job.state else {
+        let State::Running {
+            slot,
+            started,
+            compiled_at,
+            ..
+        } = job.state
+        else {
             panic!("only running jobs exit");
         };
+        let test_ms = compiled_at
+            .filter(|_| job.operation.command == Command::Test)
+            .map(|compiled_at| millis(compiled_at.elapsed()));
         let compilation = Compilation::of(&job);
         let entry = &mut self.slots[slot];
         // Cargo ran to its end, also when the job's own crates did not
@@ -584,6 +612,12 @@ impl<D: Distance> Scheduler<D> {
         entry.unmeasured += 1;
         entry.idle_since = Instant::now();
         let build_ms = millis(started.elapsed());
+        entry.last = Some(LastBuild {
+            operation: job.operation.clone(),
+            outcome: outcome.clone(),
+            build_ms,
+            test_ms,
+        });
         let mut effects = vec![Effect::Report(EventKind::Finished {
             slot: slot_name(&entry.repository, entry.index),
             who: job.who(),
@@ -591,6 +625,7 @@ impl<D: Distance> Scheduler<D> {
             revision: job.revision.clone(),
             outcome: outcome.clone(),
             build_ms,
+            test_ms,
             compiled: job.compiled,
             fresh: job.fresh,
             usage,
@@ -608,6 +643,7 @@ impl<D: Distance> Scheduler<D> {
                     outcome: outcome.clone(),
                     queued_ms: millis(started.saturating_duration_since(waiter.since)),
                     build_ms,
+                    test_ms,
                 },
             });
         }
@@ -743,6 +779,7 @@ impl<D: Distance> Scheduler<D> {
             job.state = State::Running {
                 slot,
                 started: Instant::now(),
+                compiled_at: None,
                 cancelled: false,
             };
             let name = slot_name(&self.slots[slot].repository, self.slots[slot].index);
@@ -830,6 +867,7 @@ impl<D: Distance> Scheduler<D> {
             idle_since: Instant::now(),
             size: None,
             undersized: false,
+            last: None,
             compilations: Vec::new(),
             units: HashMap::new(),
         });
@@ -850,7 +888,10 @@ impl<D: Distance> Scheduler<D> {
                 build: slot.job.map(|id| {
                     let job = &self.jobs[&id];
                     let State::Running {
-                        started, cancelled, ..
+                        started,
+                        compiled_at,
+                        cancelled,
+                        ..
                     } = job.state
                     else {
                         panic!("a slot's job runs");
@@ -863,8 +904,10 @@ impl<D: Distance> Scheduler<D> {
                         compiled: job.compiled,
                         fresh: job.fresh,
                         cancelled,
+                        testing: job.operation.command == Command::Test && compiled_at.is_some(),
                     }
                 }),
+                last: slot.last.clone(),
             })
             .collect();
         let mut queued = self
@@ -938,7 +981,6 @@ fn millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cargo::Command;
 
     /// Distances from a table; trees not in it are equal or 10 apart.
     #[derive(Default)]
@@ -1472,6 +1514,51 @@ mod tests {
                 // The next build starts in the slot that just did `check`.
                 EventKind::Started { warm: true, first: true, .. },
             ] if who.len() == 2
+        ));
+    }
+
+    #[test]
+    fn a_test_build_reports_the_time_its_tests_ran_and_its_slot_remembers_it() {
+        let mut scheduler = scheduler(1);
+        let effects = submit_operation(&mut scheduler, 1, "/a", "a1", Command::Test, &[]);
+        let [(job, ..)] = starts(&effects)[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(!scheduler.status().0[0].build.as_ref().unwrap().testing);
+        scheduler.compiled(job);
+        assert!(scheduler.status().0[0].build.as_ref().unwrap().testing);
+        std::thread::sleep(Duration::from_millis(20));
+        let finished = scheduler.exited(job, &ok(), None);
+        let [
+            Message::Finished {
+                test_ms: Some(test_ms),
+                build_ms,
+                ..
+            },
+        ] = sent(&finished, 1)[..]
+        else {
+            panic!("{finished:?}");
+        };
+        assert!(
+            *test_ms >= 20 && test_ms <= build_ms,
+            "{test_ms} of {build_ms}"
+        );
+        let last = scheduler.status().0[0]
+            .last
+            .clone()
+            .expect("the slot built");
+        assert_eq!(last.test_ms, Some(*test_ms));
+
+        // Other commands finish compiling at their end: no test time.
+        let effects = submit(&mut scheduler, 2, "/a", "a2");
+        let [(job, ..)] = starts(&effects)[..] else {
+            panic!("{effects:?}");
+        };
+        scheduler.compiled(job);
+        let finished = scheduler.exited(job, &ok(), None);
+        assert!(matches!(
+            sent(&finished, 2)[..],
+            [Message::Finished { test_ms: None, .. }]
         ));
     }
 

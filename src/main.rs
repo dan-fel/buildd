@@ -141,6 +141,7 @@ fn render(message: &Message) {
             outcome,
             queued_ms,
             build_ms,
+            test_ms,
         } => {
             let ended = match outcome {
                 Outcome::Exited { code: 0 } => "succeeded".to_owned(),
@@ -148,8 +149,15 @@ fn render(message: &Message) {
                 Outcome::Signaled { signal } => format!("was killed by signal {signal}"),
                 Outcome::Failed { reason } => format!("could not run: {reason}"),
             };
+            let phases = test_ms.map_or_else(String::new, |test_ms| {
+                format!(
+                    " ({} compiling, {} testing)",
+                    seconds(build_ms.saturating_sub(test_ms)),
+                    seconds(test_ms)
+                )
+            });
             eprintln!(
-                "buildd: tree {} {ended} after {} in the build and {} in the queue",
+                "buildd: tree {} {ended} after {} in the build{phases} and {} in the queue",
                 revision.short(),
                 seconds(*build_ms),
                 seconds(*queued_ms),

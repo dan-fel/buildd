@@ -212,6 +212,16 @@ fn a_build_compiles_the_worktrees_uncommitted_content_outside_the_worktree() {
         "{fixed:#?}"
     );
     assert!(
+        matches!(
+            fixed.last(),
+            Some(Message::Finished {
+                test_ms: Some(_),
+                ..
+            })
+        ),
+        "a test build reports how long its tests ran: {fixed:#?}"
+    );
+    assert!(
         !repository.0.join("target").exists(),
         "nothing builds in the worktree"
     );
@@ -220,6 +230,13 @@ fn a_build_compiles_the_worktrees_uncommitted_content_outside_the_worktree() {
     assert_eq!(
         status.slots[0].worktree.as_deref(),
         Some(repository.0.as_path())
+    );
+    // Every event also went to the event file, for hindsight.
+    let events = std::fs::read_to_string(daemon.home.0.join("events.jsonl")).unwrap();
+    assert_eq!(
+        events.lines().count(),
+        daemon.activity().events.len(),
+        "{events}"
     );
 }
 

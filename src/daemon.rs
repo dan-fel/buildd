@@ -15,11 +15,12 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
-use crate::activity::ActivityLog;
+use crate::activity::{ActivityLog, EventFile};
 use crate::cargo;
 use crate::cargo::Line;
 use crate::config::{self, Config};
 use crate::distance::{GitDistance, Workspace};
+use crate::log::log;
 use crate::protocol::{Activity, BuildRequest, Message, Outcome, Request, Status, Usage};
 use crate::scheduler::{Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
 use crate::slot::{self, Pruning, SlotDirectory, slot_name};
@@ -64,6 +65,10 @@ enum Event {
         job: JobId,
         unit: String,
     },
+    /// Cargo finished compiling for `job`; a test build runs its tests now.
+    Compiled {
+        job: JobId,
+    },
     /// Cargo ended, having used `usage` when it ran.
     Exited {
         job: JobId,
@@ -106,8 +111,8 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .map_err(|error| format!("could not listen on {}: {error}", socket.display()))?;
     let jobserver = jobserver::Client::new(config.jobs)
         .map_err(|error| format!("could not create the jobserver: {error}"))?;
-    eprintln!(
-        "buildd: listening on {} with {} slots of {} and {} jobs",
+    log!(
+        "listening on {} with {} slots of {} and {} jobs",
         socket.display(),
         config.slots,
         gib(config.slot_limit),
@@ -134,7 +139,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         scheduler,
         waiters: HashMap::new(),
         runs: HashMap::new(),
-        log: ActivityLog::new(SystemTime::now()),
+        log: ActivityLog::new(SystemTime::now(), EventFile::new(home)),
     }
     .drive(&received)
 }
@@ -152,14 +157,14 @@ fn restore_slots(
         let name = slot_name(&existing.repository, existing.index);
         if existing.index >= config.slots {
             match existing.directory.remove() {
-                Ok(()) => eprintln!("buildd: removed slot {name}: beyond {} slots", config.slots),
-                Err(error) => eprintln!("buildd: could not remove slot {name}: {error}"),
+                Ok(()) => log!("removed slot {name}: beyond {} slots", config.slots),
+                Err(error) => log!("could not remove slot {name}: {error}"),
             }
             continue;
         }
         if !existing.repository.exists() {
-            eprintln!(
-                "buildd: slot {name}: its repository {} is gone; leaving the slot alone",
+            log!(
+                "slot {name}: its repository {} is gone; leaving the slot alone",
                 existing.repository.display()
             );
             continue;
@@ -172,14 +177,14 @@ fn restore_slots(
         });
         match restored {
             Ok((revision, record)) => {
-                eprintln!(
-                    "buildd: restored slot {name} with {} compilations",
+                log!(
+                    "restored slot {name} with {} compilations",
                     record.compilations.len()
                 );
                 scheduler.restore(existing.repository, existing.index, revision, record);
             }
             // A slot whose checkout never completed is rebuilt when needed.
-            Err(error) => eprintln!("buildd: slot {name} not restored: {error}"),
+            Err(error) => log!("slot {name} not restored: {error}"),
         }
     }
     Ok(())
@@ -197,7 +202,7 @@ impl Accepting {
             let stream = match stream {
                 Ok(stream) => stream,
                 Err(error) => {
-                    eprintln!("buildd: could not accept a client: {error}");
+                    log!("could not accept a client: {error}");
                     continue;
                 }
             };
@@ -210,7 +215,7 @@ impl Accepting {
                 .name("buildd-client".into())
                 .spawn(move || connection.serve(stream));
             if let Err(error) = spawned {
-                eprintln!("buildd: could not serve a client: {error}");
+                log!("could not serve a client: {error}");
             }
         }
     }
@@ -228,7 +233,7 @@ impl Connection {
         let mut reader = match stream.try_clone() {
             Ok(reader) => BufReader::new(reader),
             Err(error) => {
-                eprintln!("buildd: could not read from a client: {error}");
+                log!("could not read from a client: {error}");
                 return;
             }
         };
@@ -392,6 +397,10 @@ impl Daemon {
                     self.scheduler.unit_used(job, unit);
                     Vec::new()
                 }
+                Event::Compiled { job } => {
+                    self.scheduler.compiled(job);
+                    Vec::new()
+                }
                 Event::Exited {
                     job,
                     outcome,
@@ -444,7 +453,7 @@ impl Daemon {
             } => {
                 let directory = SlotDirectory::new(&self.home, &repository, slot);
                 if let Err(error) = directory.write_record(&record) {
-                    eprintln!("buildd: {error}");
+                    log!("{error}");
                 }
             }
             Effect::Send { waiter, message } => {
@@ -500,7 +509,7 @@ impl Daemon {
                         // by what Cargo compiles again.
                         let workspace =
                             Workspace::read(&directory.source()).unwrap_or_else(|error| {
-                                eprintln!("buildd: slot {name}: {error}");
+                                log!("slot {name}: {error}");
                                 None
                             });
                         let _ = events.send(Event::Maintained {
@@ -512,7 +521,7 @@ impl Daemon {
                         });
                     });
                 if let Err(error) = spawned {
-                    eprintln!("buildd: could not start maintaining a slot: {error}");
+                    log!("could not start maintaining a slot: {error}");
                     let _ = self.events.send(Event::Maintained {
                         key,
                         repository: PathBuf::new(),
@@ -578,7 +587,7 @@ fn signal_group(group: Pid, signal: Signal) {
     match rustix::process::kill_process_group(group, signal) {
         // The group has no members left.
         Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-        Err(error) => eprintln!("buildd: could not signal process group {group:?}: {error}"),
+        Err(error) => log!("could not signal process group {group:?}: {error}"),
     }
 }
 
@@ -589,7 +598,7 @@ fn kill_leftovers(group: Pid) {
         // No members left, or (macOS) only the unreaped Cargo itself, which
         // a signal cannot reach.
         Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => {}
-        Err(error) => eprintln!("buildd: could not kill process group {group:?}: {error}"),
+        Err(error) => log!("could not kill process group {group:?}: {error}"),
     }
 }
 
@@ -611,20 +620,20 @@ fn maintain(
                     caches,
                     units,
                     in_use,
-                } => eprintln!(
-                    "buildd: slot {name} used {}: removed {caches} incremental caches and \
+                } => log!(
+                    "slot {name} used {}: removed {caches} incremental caches and \
                      {units} compiled units ({in_use} in use), {} left",
                     gib(before),
                     gib(after)
                 ),
-                Pruning::Cleared { before } => eprintln!(
-                    "buildd: slot {name} used {} with nothing left to remove: cleared its target",
+                Pruning::Cleared { before } => log!(
+                    "slot {name} used {} with nothing left to remove: cleared its target",
                     gib(before)
                 ),
             }
             if pruning.undersized() {
-                eprintln!(
-                    "buildd: slot {name}'s limit of {} is below what its builds use, so \
+                log!(
+                    "slot {name}'s limit of {} is below what its builds use, so \
                      they compile from scratch; raise slot_limit_gib or lower slots",
                     gib(limit)
                 );
@@ -632,7 +641,7 @@ fn maintain(
             (Some(pruning), evicted)
         }
         Err(error) => {
-            eprintln!("buildd: slot {name} could not be kept within its limit: {error}");
+            log!("slot {name} could not be kept within its limit: {error}");
             (None, Vec::new())
         }
     }
@@ -746,36 +755,40 @@ impl Building {
                         .trim_end_matches(['\n', '\r'])
                         .to_owned();
                     bytes.clear();
-                    let event = match &target {
-                        None => Event::Output {
+                    let stdout = |line| Event::Output {
+                        job,
+                        message: Message::Stdout { line },
+                    };
+                    let reported = match &target {
+                        None => vec![Event::Output {
                             job,
                             message: Message::Stderr { line },
-                        },
+                        }],
                         Some(target) => match Line::of(&line) {
-                            Line::Crate { fresh, outputs } => Event::Crate {
+                            Line::Crate { fresh, outputs } => vec![Event::Crate {
                                 job,
                                 fresh,
                                 unit: outputs.iter().find_map(|path| slot::unit_key(target, path)),
-                            },
-                            Line::BuildScript { out_dir } => match slot::unit_key(target, &out_dir)
-                            {
-                                Some(unit) => Event::BuildScript { job, unit },
-                                None => continue,
-                            },
-                            Line::Forward => Event::Output {
-                                job,
-                                message: Message::Stdout { line },
-                            },
+                            }],
+                            Line::BuildScript { out_dir } => slot::unit_key(target, &out_dir)
+                                .map(|unit| Event::BuildScript { job, unit })
+                                .into_iter()
+                                .collect(),
+                            Line::BuildFinished => vec![Event::Compiled { job }, stdout(line)],
+                            Line::Forward => vec![stdout(line)],
                         },
                     };
-                    if events.send(event).is_err() {
+                    if reported
+                        .into_iter()
+                        .any(|event| events.send(event).is_err())
+                    {
                         break;
                     }
                 }
                 let _ = done.send(());
             });
         if let Err(error) = spawned {
-            eprintln!("buildd: could not read a build's output: {error}");
+            log!("could not read a build's output: {error}");
         }
     }
 }

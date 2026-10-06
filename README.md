@@ -208,6 +208,8 @@ What the numbers mean, all measured by the daemon since it started:
   to date; the share up to date is what incremental state in the slots saved.
 - **CPU.** User and system time of each Cargo run and every compiler it
   started.
+- **compile · tests.** A `test` build's wall time, split at Cargo's
+  `build-finished` message: compiling before it, running tests after.
 - **new worktrees starting on a warm slot.** The first build of a worktree
   that ran in a slot which had already done its compilation, instead of a
   cold build in a fresh target.
@@ -225,7 +227,8 @@ directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 ```text
 config.toml        slots = 2, jobs = <CPUs>, slot_limit_gib = 20 by default
 sock               the daemon's socket
-daemon.log         output of a daemon a client started
+daemon.log         output of a daemon a client started, each line timestamped
+events.jsonl       every event as a JSON line (moves to events.jsonl.1 at 10 MB)
 slots/<repo>-<hash>/repository     the repository these slots build
 slots/<repo>-<hash>/<n>/{src,target,record.json}
 ```
