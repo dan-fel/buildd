@@ -37,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cargo::{Command, Compilation, Operation};
 use crate::protocol::{
-    EventKind, LastBuild, Message, Outcome, QueuedBuild, RunningBuild, SlotStatus, Usage,
+    EventKind, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild, SlotStatus, Usage,
 };
 use crate::slot::{CompilationRun, Pruning, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
@@ -74,6 +74,8 @@ pub(crate) struct Submission {
     pub(crate) operation: Operation,
     /// Who asks; the worktree's folder name when None.
     pub(crate) label: Option<String>,
+    /// Where to copy the executables Cargo produces, when asked.
+    pub(crate) copy_to: Option<PathBuf>,
 }
 
 /// What the daemon must do.
@@ -116,6 +118,7 @@ pub(crate) struct Start {
     pub(crate) prefix: PathBuf,
     pub(crate) revision: Revision,
     pub(crate) operation: Operation,
+    pub(crate) copy_to: Option<PathBuf>,
 }
 
 impl Compilation {
@@ -137,6 +140,7 @@ struct Job {
     prefix: PathBuf,
     revision: Revision,
     operation: Operation,
+    copy_to: Option<PathBuf>,
     waiters: Vec<Waiter>,
     /// The job's place in the queue: the earliest submission it carries.
     order: u64,
@@ -158,6 +162,8 @@ enum State {
         started: Instant,
         /// When Cargo reported that compilation finished.
         compiled_at: Option<Instant>,
+        /// Cargo succeeded and its executables are being copied out.
+        copying: bool,
         cancelled: bool,
     },
 }
@@ -230,7 +236,12 @@ impl Slot {
         let mut compilations = self.compilations.clone();
         compilations.sort_by(|a, b| {
             let (a, b) = (&a.compilation, &b.compilation);
-            (&a.prefix, a.command, &a.args).cmp(&(&b.prefix, b.command, &b.args))
+            (&a.prefix, a.command, &a.args, &a.rustflags).cmp(&(
+                &b.prefix,
+                b.command,
+                &b.args,
+                &b.rustflags,
+            ))
         });
         Effect::Persist {
             repository: self.repository.clone(),
@@ -261,11 +272,16 @@ pub(crate) struct Scheduler<D> {
 }
 
 impl Job {
-    fn same_build(&self, source: &Source, revision: &Revision, operation: &Operation) -> bool {
-        self.repository == source.repository
-            && self.prefix == source.prefix
-            && self.operation == *operation
-            && self.revision == *revision
+    fn same_build(&self, submission: &Submission) -> bool {
+        self.same_request(submission) && self.revision == submission.revision
+    }
+
+    /// Whether the job does what `submission` asks, maybe of another tree.
+    fn same_request(&self, submission: &Submission) -> bool {
+        self.repository == submission.source.repository
+            && self.prefix == submission.source.prefix
+            && self.operation == submission.operation
+            && self.copy_to == submission.copy_to
     }
 
     fn queued(&self) -> bool {
@@ -357,12 +373,26 @@ impl<D: Distance> Scheduler<D> {
     }
 
     pub(crate) fn submit(&mut self, submission: Submission) -> Vec<Effect> {
+        let superseded = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.queued() && job.same_request(&submission) && job.revision != submission.revision
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let existing = self
+            .jobs
+            .iter()
+            .find(|(_, job)| job.same_build(&submission) && !job.cancelled())
+            .map(|(id, _)| *id);
         let Submission {
             waiter,
             source,
             revision,
             operation,
             label,
+            copy_to,
         } = submission;
         assert!(!self.waiting.contains_key(&waiter), "a waiter submits once");
         self.clock += 1;
@@ -380,19 +410,6 @@ impl<D: Distance> Scheduler<D> {
             since: Instant::now(),
         }];
         let mut reports = Vec::new();
-
-        let superseded = self
-            .jobs
-            .iter()
-            .filter(|(_, job)| {
-                job.queued()
-                    && job.repository == source.repository
-                    && job.prefix == source.prefix
-                    && job.operation == operation
-                    && job.revision != revision
-            })
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
         for id in superseded {
             let job = self.jobs.get_mut(&id).expect("listed above");
             let (mine, others) = std::mem::take(&mut job.waiters)
@@ -414,11 +431,6 @@ impl<D: Distance> Scheduler<D> {
             }
         }
 
-        let existing = self
-            .jobs
-            .iter()
-            .find(|(_, job)| job.same_build(&source, &revision, &operation) && !job.cancelled())
-            .map(|(id, _)| *id);
         let requested = EventKind::Requested {
             who,
             worktree: source.worktree.clone(),
@@ -436,6 +448,7 @@ impl<D: Distance> Scheduler<D> {
                     prefix: source.prefix.clone(),
                     revision,
                     operation,
+                    copy_to,
                     waiters: Vec::new(),
                     order,
                     state: State::Queued,
@@ -564,6 +577,19 @@ impl<D: Distance> Scheduler<D> {
         {
             compiled_at.get_or_insert_with(Instant::now);
         }
+    }
+
+    /// Cargo succeeded for running job `id`, whose executables are being
+    /// copied out of its slot now.
+    pub(crate) fn copying(&mut self, id: JobId) {
+        let Some(Job {
+            state: State::Running { copying, .. },
+            ..
+        }) = self.jobs.get_mut(&id)
+        else {
+            panic!("only a running job copies");
+        };
+        *copying = true;
     }
 
     /// Running job `id` used compiled `unit`, such as a build script's output.
@@ -780,6 +806,7 @@ impl<D: Distance> Scheduler<D> {
                 slot,
                 started: Instant::now(),
                 compiled_at: None,
+                copying: false,
                 cancelled: false,
             };
             let name = slot_name(&self.slots[slot].repository, self.slots[slot].index);
@@ -804,6 +831,7 @@ impl<D: Distance> Scheduler<D> {
                 prefix: job.prefix.clone(),
                 revision: job.revision.clone(),
                 operation: job.operation.clone(),
+                copy_to: job.copy_to.clone(),
             }));
         }
         effects
@@ -890,6 +918,7 @@ impl<D: Distance> Scheduler<D> {
                     let State::Running {
                         started,
                         compiled_at,
+                        copying,
                         cancelled,
                         ..
                     } = job.state
@@ -904,7 +933,13 @@ impl<D: Distance> Scheduler<D> {
                         compiled: job.compiled,
                         fresh: job.fresh,
                         cancelled,
-                        testing: job.operation.command == Command::Test && compiled_at.is_some(),
+                        phase: if copying {
+                            Phase::Copying
+                        } else if job.operation.command == Command::Test && compiled_at.is_some() {
+                            Phase::Testing
+                        } else {
+                            Phase::Compiling
+                        },
                     }
                 }),
                 last: slot.last.clone(),
@@ -1017,6 +1052,7 @@ mod tests {
         Operation {
             command: Command::Check,
             args: Vec::new(),
+            rustflags: Vec::new(),
         }
     }
 
@@ -1036,6 +1072,7 @@ mod tests {
             revision: revision(tree),
             operation: check(),
             label: None,
+            copy_to: None,
         })
     }
 
@@ -1054,8 +1091,10 @@ mod tests {
             operation: Operation {
                 command,
                 args: args.iter().map(|argument| (*argument).to_owned()).collect(),
+                rustflags: Vec::new(),
             },
             label: None,
+            copy_to: None,
         })
     }
 
@@ -1171,6 +1210,44 @@ mod tests {
     }
 
     #[test]
+    fn requests_copying_elsewhere_or_with_other_rustflags_are_other_builds() {
+        let mut scheduler = scheduler(1);
+        let request = |waiter: u64, copy_to: Option<&str>, rustflags: &[&str]| Submission {
+            waiter: WaiterId(waiter),
+            source: source("/a"),
+            revision: revision("t1"),
+            operation: Operation {
+                rustflags: rustflags.iter().map(|flag| (*flag).to_owned()).collect(),
+                ..check()
+            },
+            label: None,
+            copy_to: copy_to.map(PathBuf::from),
+        };
+        let first = scheduler.submit(request(1, Some("/out"), &[]));
+        assert_eq!(starts(&first).len(), 1);
+        let joined = scheduler.submit(request(2, Some("/out"), &[]));
+        assert!(matches!(
+            reports(&joined)[..],
+            [EventKind::Requested { shared: true, .. }]
+        ));
+        for (waiter, copy_to, rustflags) in [
+            (3, None, &[][..]),
+            (4, Some("/elsewhere"), &[]),
+            (5, Some("/out"), &["--cfg", "x"]),
+        ] {
+            let other = scheduler.submit(request(waiter, copy_to, rustflags));
+            assert!(
+                matches!(
+                    reports(&other)[..],
+                    [EventKind::Requested { shared: false, .. }]
+                ),
+                "{other:?}"
+            );
+        }
+        assert_eq!(scheduler.status().1.len(), 3);
+    }
+
+    #[test]
     fn a_build_nobody_waits_for_is_dropped_or_cancelled_and_not_joined() {
         let mut scheduler = scheduler(1);
         let first = submit(&mut scheduler, 1, "/a", "t1");
@@ -1267,6 +1344,7 @@ mod tests {
             revision: revision("o1"),
             operation: check(),
             label: None,
+            copy_to: None,
         });
         assert_eq!(starts(&other).len(), 1);
         let (slots, queue) = scheduler.status();
@@ -1467,6 +1545,7 @@ mod tests {
             revision: revision("t1"),
             operation: check(),
             label: Some("agent-1".into()),
+            copy_to: None,
         });
         let [(job, ..)] = starts(&first)[..] else {
             panic!("{first:?}");
@@ -1524,9 +1603,15 @@ mod tests {
         let [(job, ..)] = starts(&effects)[..] else {
             panic!("{effects:?}");
         };
-        assert!(!scheduler.status().0[0].build.as_ref().unwrap().testing);
+        assert_eq!(
+            scheduler.status().0[0].build.as_ref().unwrap().phase,
+            Phase::Compiling
+        );
         scheduler.compiled(job);
-        assert!(scheduler.status().0[0].build.as_ref().unwrap().testing);
+        assert_eq!(
+            scheduler.status().0[0].build.as_ref().unwrap().phase,
+            Phase::Testing
+        );
         std::thread::sleep(Duration::from_millis(20));
         let finished = scheduler.exited(job, &ok(), None);
         let [

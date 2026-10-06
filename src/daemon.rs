@@ -21,6 +21,7 @@ use crate::cargo::Line;
 use crate::config::{self, Config};
 use crate::distance::{GitDistance, Workspace};
 use crate::log::log;
+use crate::products::{self, Product};
 use crate::protocol::{Activity, BuildRequest, Message, Outcome, Request, Status, Usage};
 use crate::scheduler::{Effect, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
 use crate::slot::{self, Pruning, SlotDirectory, slot_name};
@@ -67,6 +68,10 @@ enum Event {
     },
     /// Cargo finished compiling for `job`; a test build runs its tests now.
     Compiled {
+        job: JobId,
+    },
+    /// Cargo succeeded for `job`; its executables are copied out now.
+    Copying {
         job: JobId,
     },
     /// Cargo ended, having used `usage` when it ran.
@@ -272,7 +277,17 @@ impl Connection {
         mut reader: BufReader<UnixStream>,
         request: BuildRequest,
     ) {
+        let copy_to = request.copy_to;
         let prepared = request.operation.validate().and_then(|()| {
+            if let Some(directory) = copy_to
+                .as_ref()
+                .filter(|directory| !directory.is_absolute())
+            {
+                return Err(format!(
+                    "the directory to copy to must be absolute: {}",
+                    directory.display()
+                ));
+            }
             let source = snapshot::resolve(&request.directory)?;
             let revision = source.snapshot(&self.home.join("tmp"))?;
             Ok((source, revision))
@@ -291,6 +306,7 @@ impl Connection {
             revision,
             operation: request.operation,
             label: request.label,
+            copy_to,
         };
         if self
             .events
@@ -399,6 +415,10 @@ impl Daemon {
                 }
                 Event::Compiled { job } => {
                     self.scheduler.compiled(job);
+                    Vec::new()
+                }
+                Event::Copying { job } => {
+                    self.scheduler.copying(job);
                     Vec::new()
                 }
                 Event::Exited {
@@ -703,7 +723,8 @@ impl Building {
         let stdout = child.stdout.take().expect("cargo's output is piped");
         let stderr = child.stderr.take().expect("cargo's errors are piped");
         let target = self.slot.target();
-        self.forward(stdout, Some(target), done.clone());
+        let products = Arc::new(Mutex::new(Vec::new()));
+        self.forward(stdout, Some((target, Arc::clone(&products))), done.clone());
         self.forward(stderr, None, done);
 
         let pid = Pid::from_child(&child);
@@ -731,16 +752,44 @@ impl Building {
                 break;
             }
         }
-        (outcome(status), Some(usage))
+        let outcome = match (outcome(status), &self.start.copy_to) {
+            (outcome, Some(directory)) if outcome.success() => {
+                let products = std::mem::take(
+                    &mut *products
+                        .lock()
+                        .expect("no thread panics holding a build's products"),
+                );
+                self.copy(&products, directory).unwrap_or(outcome)
+            }
+            (outcome, _) => outcome,
+        };
+        (outcome, Some(usage))
+    }
+
+    /// Copies `products` into `directory` and tells the build's waiters
+    /// where they went; how the build failed when copying did.
+    fn copy(&self, products: &[Product], directory: &Path) -> Result<Outcome, Outcome> {
+        let job = self.start.job;
+        let _ = self.events.send(Event::Copying { job });
+        let messages =
+            products::copy(products, directory).map_err(|reason| Outcome::Failed { reason })?;
+        for artifact in messages {
+            let _ = self.events.send(Event::Output {
+                job,
+                message: Message::Copied { artifact },
+            });
+        }
+        Ok(Outcome::Exited { code: 0 })
     }
 
     /// Sends each line of `output` to the scheduler on a thread of its own:
-    /// Cargo's standard output, whose messages name files in `target`, or
-    /// its standard error when `target` is None.
+    /// Cargo's standard output, whose messages name files in `target` and
+    /// whose executables go to `products`, or its standard error when
+    /// `target` is None.
     fn forward(
         &self,
         output: impl std::io::Read + Send + 'static,
-        target: Option<PathBuf>,
+        target: Option<(PathBuf, Arc<Mutex<Vec<Product>>>)>,
         done: Sender<()>,
     ) {
         let events = self.events.clone();
@@ -764,12 +813,25 @@ impl Building {
                             job,
                             message: Message::Stderr { line },
                         }],
-                        Some(target) => match Line::of(&line) {
-                            Line::Crate { fresh, outputs } => vec![Event::Crate {
-                                job,
+                        Some((target, products)) => match Line::of(&line) {
+                            Line::Crate {
                                 fresh,
-                                unit: outputs.iter().find_map(|path| slot::unit_key(target, path)),
-                            }],
+                                outputs,
+                                executable,
+                            } => {
+                                let unit =
+                                    outputs.iter().find_map(|path| slot::unit_key(target, path));
+                                if executable.is_some() {
+                                    products
+                                        .lock()
+                                        .expect("no thread panics holding a build's products")
+                                        .push(Product {
+                                            message: line,
+                                            files: outputs,
+                                        });
+                                }
+                                vec![Event::Crate { job, fresh, unit }]
+                            }
                             Line::BuildScript { out_dir } => slot::unit_key(target, &out_dir)
                                 .map(|unit| Event::BuildScript { job, unit })
                                 .into_iter()

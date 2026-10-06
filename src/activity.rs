@@ -144,6 +144,7 @@ mod tests {
         Operation {
             command: Command::Check,
             args: Vec::new(),
+            rustflags: Vec::new(),
         }
     }
 

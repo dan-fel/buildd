@@ -952,6 +952,7 @@ mod tests {
                     &crate::cargo::Operation {
                         command: crate::cargo::Command::Test,
                         args: vec!["--lib".into()],
+                        rustflags: Vec::new(),
                     },
                 ),
                 at: 7,

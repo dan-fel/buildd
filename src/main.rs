@@ -3,7 +3,7 @@
 use std::io::ErrorKind;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
@@ -16,9 +16,16 @@ mod top;
 
 const USAGE: &str = "\
 usage:
-  buildd check|clippy|build|test [CARGO ARGS...]
+  buildd check|clippy|build|test [OPTIONS] [CARGO ARGS...]
       Build the current content of this worktree, committed or not, in a
       build slot, and print Cargo's diagnostics and test output.
+      Options, before Cargo's arguments:
+        --json             print every message from the daemon as a line of
+                           JSON on standard output instead
+        --copy-to DIR      after a successful build, copy the executables
+                           Cargo produced, with their debug information,
+                           into DIR
+        --rustflags FLAGS  pass FLAGS to every rustc, as RUSTFLAGS would
     buildd status
       Show the build slots and the queue.
   buildd top
@@ -52,13 +59,7 @@ fn main() -> ExitCode {
         },
     };
     let result = config::home().and_then(|home| match command {
-        Some(command) => build(
-            &home,
-            Operation {
-                command,
-                args: args.collect(),
-            },
-        ),
+        Some(command) => build(&home, command, args.collect()),
         None if name == "daemon" => daemon(&home),
         None if name == "top" => {
             top::run(|| client::activity(connect(&home)?)).map(|()| ExitCode::SUCCESS)
@@ -76,17 +77,81 @@ fn daemon(home: &Path) -> Result<ExitCode, String> {
     match buildd::daemon::run(home, config)? {}
 }
 
-fn build(home: &Path, operation: Operation) -> Result<ExitCode, String> {
+/// buildd's own options of a build, which come before Cargo's arguments.
+#[derive(Debug, Default, PartialEq)]
+struct Options {
+    json: bool,
+    copy_to: Option<PathBuf>,
+    rustflags: Vec<String>,
+}
+
+impl Options {
+    /// Takes the options off the front of `args`, leaving Cargo's
+    /// arguments; a relative directory is taken relative to `directory`.
+    fn take(args: &mut Vec<String>, directory: &Path) -> Result<Self, String> {
+        let mut options = Self::default();
+        let mut taken = 0;
+        while let Some(argument) = args.get(taken) {
+            let (name, inline) = match argument.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_owned())),
+                None => (argument.as_str(), None),
+            };
+            let value = |taken: &mut usize| {
+                let value = match inline.clone() {
+                    Some(value) => value,
+                    None => {
+                        *taken += 1;
+                        args.get(*taken)
+                            .cloned()
+                            .ok_or_else(|| format!("{name} needs a value"))?
+                    }
+                };
+                Ok::<_, String>(value)
+            };
+            match name {
+                "--json" if inline.is_none() => options.json = true,
+                "--copy-to" => options.copy_to = Some(directory.join(value(&mut taken)?)),
+                "--rustflags" => {
+                    options.rustflags = value(&mut taken)?
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect();
+                }
+                _ => break,
+            }
+            taken += 1;
+        }
+        args.drain(..taken);
+        Ok(options)
+    }
+}
+
+fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCode, String> {
     let directory = std::env::current_dir()
         .map_err(|error| format!("could not read the current directory: {error}"))?;
+    let options = Options::take(&mut args, &directory)?;
     let request = BuildRequest {
         directory,
-        operation,
+        operation: Operation {
+            command,
+            args,
+            rustflags: options.rustflags,
+        },
         label: std::env::var("BUILDD_LABEL")
             .ok()
             .filter(|label| !label.is_empty()),
+        copy_to: options.copy_to,
     };
-    let last = client::build(connect(home)?, request, render)?;
+    let last = if options.json {
+        client::build(connect(home)?, request, |message| {
+            println!(
+                "{}",
+                serde_json::to_string(message).expect("messages serialize")
+            );
+        })?
+    } else {
+        client::build(connect(home)?, request, render)?
+    };
     Ok(match last {
         Message::Finished {
             outcome: Outcome::Exited { code },
@@ -136,6 +201,12 @@ fn render(message: &Message) {
             Err(_) => println!("{line}"),
         },
         Message::Stderr { line } => eprintln!("{line}"),
+        Message::Copied { artifact } => {
+            let copy = serde_json::from_str::<serde_json::Value>(artifact)
+                .ok()
+                .and_then(|artifact| artifact["executable"].as_str().map(str::to_owned));
+            eprintln!("buildd: copied {}", copy.as_deref().unwrap_or(artifact));
+        }
         Message::Finished {
             revision,
             outcome,
@@ -284,4 +355,45 @@ fn start_daemon(home: &Path) -> Result<(), String> {
         })
         .map(drop)
         .map_err(|error| format!("could not start the daemon: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take(args: &[&str]) -> (Result<Options, String>, Vec<String>) {
+        let mut args = args.iter().map(|argument| (*argument).to_owned()).collect();
+        let options = Options::take(&mut args, Path::new("/work"));
+        (options, args)
+    }
+
+    #[test]
+    fn options_come_off_the_front_and_cargos_arguments_stay() {
+        let (options, rest) = take(&[
+            "--json",
+            "--copy-to",
+            "out",
+            "--rustflags=-C force-frame-pointers=yes",
+            "--release",
+            "--json",
+        ]);
+        assert_eq!(
+            options.unwrap(),
+            Options {
+                json: true,
+                copy_to: Some("/work/out".into()),
+                rustflags: vec!["-C".into(), "force-frame-pointers=yes".into()],
+            }
+        );
+        assert_eq!(rest, ["--release", "--json"]);
+        let (options, rest) = take(&["-p", "x", "--copy-to", "/abs"]);
+        assert_eq!(options.unwrap(), Options::default());
+        assert_eq!(rest, ["-p", "x", "--copy-to", "/abs"]);
+        assert!(
+            take(&["--copy-to"])
+                .0
+                .unwrap_err()
+                .contains("needs a value")
+        );
+    }
 }

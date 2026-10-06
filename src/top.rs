@@ -5,7 +5,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use buildd::protocol::{Activity, EventKind, Outcome, SlotStatus};
+use buildd::protocol::{Activity, EventKind, Outcome, Phase, SlotStatus};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -234,16 +234,16 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
             } else {
                 Span::from("")
             };
+            let phase = match build.phase {
+                Phase::Compiling => "",
+                Phase::Testing => "testing · ",
+                Phase::Copying => "copying · ",
+            };
             let state = if build.cancelled {
                 Span::from("  stopping").red()
-            } else if build.testing {
-                Span::from(format!(
-                    "  testing · compiled {} · reused {}",
-                    build.compiled, build.fresh
-                ))
             } else {
                 Span::from(format!(
-                    "  compiled {} · reused {}",
+                    "  {phase}compiled {} · reused {}",
                     build.compiled, build.fresh
                 ))
             };
@@ -502,6 +502,7 @@ mod tests {
         Operation {
             command: Command::Check,
             args: vec!["-p".into(), package.into()],
+            rustflags: Vec::new(),
         }
     }
 
@@ -536,7 +537,7 @@ mod tests {
                             compiled: 3,
                             fresh: 412,
                             cancelled: false,
-                            testing: false,
+                            phase: Phase::Compiling,
                         }),
                         last: None,
                     },
@@ -551,6 +552,7 @@ mod tests {
                             operation: Operation {
                                 command: Command::Test,
                                 args: Vec::new(),
+                                rustflags: Vec::new(),
                             },
                             outcome: Outcome::Exited { code: 0 },
                             build_ms: 300_000,

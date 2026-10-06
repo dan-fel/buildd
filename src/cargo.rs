@@ -59,8 +59,8 @@ const RESERVED_OPTIONS: [&str; 8] = [
     "--jobs",
 ];
 
-/// What Cargo compiles for a build: its directory, command and arguments,
-/// less those that only change what runs afterwards: for `test`, the
+/// What Cargo compiles for a build: its directory, command, rustc flags and
+/// arguments, less those that only change what runs afterwards: for `test`, the
 /// positional test name, arguments after `--` (they go to the test harness),
 /// `--no-run` and `--no-fail-fast`. For
 /// Clippy the arguments after `--` stay: they are lint settings that change
@@ -71,6 +71,8 @@ pub(crate) struct Compilation {
     pub(crate) prefix: PathBuf,
     pub(crate) command: Command,
     pub(crate) args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) rustflags: Vec<String>,
 }
 
 impl Compilation {
@@ -83,6 +85,7 @@ impl Compilation {
             prefix: prefix.to_owned(),
             command: operation.command,
             args,
+            rustflags: operation.rustflags.clone(),
         }
     }
 }
@@ -152,6 +155,10 @@ fn test_compilation_args(args: &[String]) -> Vec<String> {
 pub struct Operation {
     pub command: Command,
     pub args: Vec<String>,
+    /// Flags for every rustc Cargo runs, as `RUSTFLAGS` would give them:
+    /// they change what is compiled, so they are part of the compilation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rustflags: Vec<String>,
 }
 
 impl Operation {
@@ -184,6 +191,9 @@ impl Operation {
 
 impl fmt::Display for Operation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.rustflags.is_empty() {
+            write!(formatter, "RUSTFLAGS='{}' ", self.rustflags.join(" "))?;
+        }
         formatter.write_str(self.command.as_str())?;
         for argument in &self.args {
             write!(formatter, " {argument}")?;
@@ -217,6 +227,12 @@ pub(crate) fn command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if !operation.rustflags.is_empty() {
+        command.env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            operation.rustflags.join("\u{1f}"),
+        );
+    }
     command
 }
 
@@ -226,7 +242,12 @@ pub(crate) enum Line {
     /// A crate Cargo compiled, or found up to date when `fresh`, with the
     /// files it produced. Its message names paths inside the slot, which
     /// mean nothing to a client.
-    Crate { fresh: bool, outputs: Vec<PathBuf> },
+    Crate {
+        fresh: bool,
+        outputs: Vec<PathBuf>,
+        /// The executable among them, for a binary or test target.
+        executable: Option<PathBuf>,
+    },
     /// A build script's report, with the directory it wrote; also inside the
     /// slot.
     BuildScript { out_dir: PathBuf },
@@ -246,6 +267,7 @@ impl Line {
             fresh: bool,
             #[serde(default)]
             filenames: Vec<PathBuf>,
+            executable: Option<PathBuf>,
             out_dir: Option<PathBuf>,
         }
         match serde_json::from_str::<Message<'_>>(line) {
@@ -253,10 +275,12 @@ impl Line {
                 reason: "compiler-artifact",
                 fresh,
                 filenames,
+                executable,
                 ..
             }) => Self::Crate {
                 fresh,
                 outputs: filenames,
+                executable,
             },
             Ok(Message {
                 reason: "build-script-executed",
@@ -280,6 +304,7 @@ mod tests {
         Operation {
             command: Command::Test,
             args: args.iter().map(|argument| (*argument).to_owned()).collect(),
+            rustflags: Vec::new(),
         }
     }
 
@@ -314,14 +339,18 @@ mod tests {
             Line::of(r#"{"reason":"compiler-artifact","filenames":["/slot/x"],"fresh":true}"#),
             Line::Crate {
                 fresh: true,
-                outputs: vec!["/slot/x".into()]
+                outputs: vec!["/slot/x".into()],
+                executable: None,
             }
         );
         assert_eq!(
-            Line::of(r#"{"reason":"compiler-artifact","fresh":false}"#),
+            Line::of(
+                r#"{"reason":"compiler-artifact","fresh":false,"filenames":["/slot/app"],"executable":"/slot/app"}"#
+            ),
             Line::Crate {
                 fresh: false,
-                outputs: Vec::new()
+                outputs: vec!["/slot/app".into()],
+                executable: Some("/slot/app".into()),
             }
         );
         assert_eq!(
@@ -351,6 +380,7 @@ mod tests {
                 &Operation {
                     command,
                     args: args.iter().map(|argument| (*argument).to_owned()).collect(),
+                    rustflags: Vec::new(),
                 },
             )
         };

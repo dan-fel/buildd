@@ -221,6 +221,21 @@ slot's target directory, checkout, output format or parallelism away from
 the daemon (`--target-dir`, `--manifest-path`, `--message-format`,
 `--config`, `-j`, `-Z`, ...), which are rejected.
 
+buildd's own options come before Cargo's arguments:
+
+- `--copy-to DIR`: after a successful build, copy the executables Cargo
+  produced, with their debug information (`.dSYM` bundles), into `DIR`,
+  each replacing an older copy as a whole. Programs that need what was
+  built, such as an install script, get it without building outside the
+  slots. A request copying elsewhere is a different build.
+- `--rustflags FLAGS`: flags for every rustc, as `RUSTFLAGS` would give
+  them. They are part of what a build compiles, so builds with other flags
+  never share or supersede each other.
+- `--json`: print every message from the daemon as a line of JSON on
+  standard output, for programs that drive buildd: Cargo's messages,
+  `copied` messages (Cargo's `compiler-artifact` message for each copy,
+  naming the copied paths) and the final `finished` with the tree built.
+
 State lives in `$BUILDD_HOME`, by default `buildd` in the user cache
 directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
 
@@ -277,7 +292,8 @@ library's `client` module is what other programs integrate with.
   served, at most `slots` at once.
 - A `cargo` shim that routes agents' own Cargo calls to the daemon.
 - Client environment: Cargo runs with the daemon's environment, so a
-  client's `RUSTFLAGS` or `RUST_LOG` do not reach the build.
+  client's `RUSTFLAGS` or `RUST_LOG` do not reach the build; flags for
+  rustc go through `--rustflags`.
 - Ignored files are not part of a snapshot; a build that needs a generated,
   ignored file fails in a slot.
 - A timeline of recent builds per slot in `buildd top`.

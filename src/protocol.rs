@@ -38,6 +38,11 @@ pub struct BuildRequest {
     /// worktree's folder name when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// An absolute directory to copy the executables Cargo produced into,
+    /// with their debug information, once the build succeeds. Requests that
+    /// copy elsewhere are different builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_to: Option<PathBuf>,
 }
 
 /// What the daemon tells a client about its build.
@@ -54,6 +59,10 @@ pub enum Message {
     Stdout { line: String },
     /// A line of Cargo's standard error.
     Stderr { line: String },
+    /// An executable was copied out of the slot as the request asked:
+    /// Cargo's `compiler-artifact` message for it, with every path naming the
+    /// copy.
+    Copied { artifact: String },
     /// The build of `revision` ended. For `test`, `test_ms` is the part of
     /// `build_ms` after compilation finished: running the tests.
     Finished {
@@ -84,7 +93,8 @@ pub enum Outcome {
     Exited { code: i32 },
     /// Cargo was killed by `signal`.
     Signaled { signal: i32 },
-    /// Cargo could not run: preparing the slot or starting it failed.
+    /// Cargo could not run (preparing the slot or starting it failed), or
+    /// it succeeded and copying its executables out failed.
     Failed { reason: String },
 }
 
@@ -155,9 +165,18 @@ pub struct RunningBuild {
     pub fresh: u64,
     /// Nobody waits for it any more; it is being stopped.
     pub cancelled: bool,
-    /// A `test` build whose compilation finished: its tests run.
-    #[serde(default)]
-    pub testing: bool,
+    pub phase: Phase,
+}
+
+/// What a running build does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Compiling,
+    /// A `test` build whose compilation finished runs its tests.
+    Testing,
+    /// Cargo succeeded; its executables are copied out of the slot.
+    Copying,
 }
 
 /// A build waiting for a slot.
@@ -308,8 +327,10 @@ mod tests {
             operation: Operation {
                 command: Command::Check,
                 args: vec!["-p".into(), "a".into()],
+                rustflags: Vec::new(),
             },
             label: None,
+            copy_to: None,
         });
         let text = serde_json::to_string(&request).unwrap();
         assert_eq!(

@@ -101,8 +101,10 @@ fn request(directory: &Path, command: Command, args: &[&str]) -> BuildRequest {
         operation: Operation {
             command,
             args: args.iter().map(|argument| (*argument).to_owned()).collect(),
+            rustflags: Vec::new(),
         },
         label: None,
+        copy_to: None,
     }
 }
 
@@ -237,6 +239,60 @@ fn a_build_compiles_the_worktrees_uncommitted_content_outside_the_worktree() {
         events.lines().count(),
         daemon.activity().events.len(),
         "{events}"
+    );
+}
+
+#[test]
+fn executables_are_copied_out_and_rustflags_reach_the_compiler() {
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    std::fs::create_dir(repository.0.join("src/bin")).unwrap();
+    // The binary compiles only with the flag the request passes.
+    std::fs::write(
+        repository.0.join("src/bin/tool.rs"),
+        "#[cfg(not(buildd_flag))]\ncompile_error!(\"no flag\");\nfn main() {}\n",
+    )
+    .unwrap();
+    let out = TempDir::new();
+    let mut request = request(&repository.0, Command::Build, &["--bins"]);
+    request.copy_to = Some(out.0.join("bin"));
+    let build = |request: BuildRequest| {
+        let mut messages = Vec::new();
+        client::build(daemon.connect(), request, |message| {
+            messages.push(message.clone());
+        })
+        .unwrap();
+        messages
+    };
+
+    let refused = build(request.clone());
+    assert_eq!(outcome(&refused), &Outcome::Exited { code: 101 });
+    assert!(!out.0.join("bin").exists(), "a failed build copies nothing");
+
+    request.operation.rustflags = vec!["--cfg".into(), "buildd_flag".into()];
+    let built = build(request);
+    assert!(outcome(&built).success(), "{built:#?}");
+    let copy = out.0.join("bin/tool");
+    let artifacts = built
+        .iter()
+        .filter_map(|message| match message {
+            Message::Copied { artifact } => {
+                Some(serde_json::from_str::<serde_json::Value>(artifact).unwrap())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [artifact] = &artifacts[..] else {
+        panic!("one executable: {built:#?}");
+    };
+    assert_eq!(artifact["executable"], copy.to_str().unwrap());
+    assert_eq!(artifact["target"]["name"], "tool");
+    assert!(
+        std::process::Command::new(&copy)
+            .status()
+            .unwrap()
+            .success(),
+        "the copy runs"
     );
 }
 
