@@ -1,392 +1,270 @@
 # buildd
 
-Coordinates the Cargo builds of many concurrent sessions (coding agents,
-editors, people) on one machine, so that build disk stays fixed and builds
-share one budget of CPU and memory instead of each assuming it owns the
-machine. On request it builds on another machine's daemon instead, for an
-OS this one is not, with the same command and output.
-
-## How it works
-
-- **Sessions never build in their worktree.** `buildd check` (or `clippy`,
-  `build`, `test`, `nextest`) snapshots the worktree's current content, committed or
-  not, as a git tree. Tracked files and untracked files git does not ignore
-  are included. The tree id is the revision every result reports.
-- **Build slots.** The daemon checks that tree out into a slot: a checkout at
-  a fixed path with the only target directory that path ever uses. Checking
-  out writes only the files that differ from the slot's previous build, so
-  Cargo sees ordinary edits and incremental compilation stays warm. Each
-  repository gets at most `slots` slot directories, created only when its
-  builds run concurrently, so build disk depends on the slot count rather
-  than the number of sessions or worktrees.
-- **Best slot.** A build takes the idle slot where Cargo has the least to
-  do: the fewest compiled units it needs and the slot lacks, plus how far
-  the slot's checkout is from the build's tree. What a build needs is what
-  the latest build of the same compilation (directory, command and Cargo
-  arguments) used, in any slot, learned from Cargo's reports; unit hashes
-  are the same in every slot. A compilation that never ran is assumed to
-  need what builds of the same command used, so a single crate's tests go
-  to the slot that ran the whole suite. Distance is the packages Cargo
-  compiles again: the paths that differ (`git diff-tree`), each changed
-  package counted with every workspace package that depends on it, learned
-  from `cargo metadata`, and a lockfile or build-configuration change
-  counting all of them. It waits for a busy slot while another is idle
-  only when that is expected to be faster: the busy build's expected end
-  plus its share there beats the idle slot compiling its share cold, at
-  what a compiled unit cost lately. `top` shows such a build as waiting
-  for that slot, with both estimates.
-- **Memory admission.** The daemon samples each build's process group
-  every second and records the summed peak with its compilation. A queued
-  build starts only when the running builds' recorded peaks plus its own
-  fit `memory_gib` (default: physical memory less 6 GiB); a compilation
-  never seen is estimated at the largest peak of its command. A build
-  that does not fit holds the queue behind it, so smaller builds cannot
-  starve it, and with nothing running it starts whatever it needs.
-- **Shortest expected build first.** The queue is ordered by each build's
-  expected wall time (the last successful build of its compilation, or of
-  its command in its directory) less the time it has waited, so a short
-  Clippy no longer waits behind two full test suites, and a long build
-  still runs once it has waited its own length.
-- **One CPU budget.** `jobs` tokens for every build together. Each build
-  gets a jobserver of its own (a FIFO its Cargo and compilers take tokens
-  from, as GNU make's protocol says), and the daemon deals tokens between
-  them every few milliseconds: it takes back the tokens waiting unclaimed
-  and deals every free one again, a token at a time to each compiling
-  build in turn. It knows what each build holds, so a build that
-  is killed returns everything when it ends; with one shared jobserver, a
-  compiler killed while holding tokens took them with it for good. A
-  build's tests run on `test_jobs` threads (`RUST_TEST_THREADS`), and
-  while they run the build is charged at least `test_jobs` tokens, since
-  test threads and the processes they start use the machine without
-  tokens; compilation in other slots shrinks to what is left.
-- **Deduplication and supersession.** A request equal to a queued or running
-  build (same repository, tree, directory, command and arguments) waits for
-  that build. A newer request from a worktree replaces its own queued older
-  ones at their place in the queue. `test` requests that differ only in
-  `--no-fail-fast` are one request: the build runs with it, and its exit
-  status answers both.
-- **Tests that cannot have changed are skipped.** A `buildd nextest` run
-  of every test skips the test binaries that passed in the slot and whose
-  executable and inputs are unchanged since (see Use). Repeated full suites
-  run only what an edit could affect.
-- **Cancellation.** Closing the client (Ctrl-C) withdraws the request. A
-  build nobody waits for any more is stopped with its whole process group.
-- **Restarts keep slots warm.** Each slot records the compilations it ran
-  and the worktree it last built for; a restarted daemon takes its slots
-  back, with their checkouts and targets, and removes any beyond `slots`.
-- **Free disk floor.** After every build the daemon checks the volume
-  holding its home. Below `min_free_gib`, every idle slot gives up what
-  builds used longest ago, across all slots, never anything used in the
-  last ten minutes, until the shortfall is freed; `top` shows free disk
-  against the floor. Other programs filling the disk no longer make slot
-  records fail to write.
-- **Disk limit.** A slot's target is kept within `slot_limit_gib` once the
-  slot has been idle for two seconds, so measuring it never delays the next
-  build of a session running several in a row, and right after a build once
-  eight builds went unmeasured. It removes what builds used longest ago
-  first: incremental caches, and compiled units (a crate's outputs,
-  fingerprint and build-script directory, all named by its hash). The daemon
-  records when builds use each unit from Cargo's own reports, so units of
-  old feature sets, profiles and dependency versions go before ones in use;
-  Cargo just recompiles a removed unit if a build needs it again. The whole
-  target goes only when nothing else is left. Build disk per repository is
-  therefore at most `slots` times the limit, plus what builds add between
-  measurements.
-- **Sizing.** A slot's limit must hold the working set of the builds it
-  serves; below that, keeping to it removes caches in use and those builds
-  compile from scratch, many times slower. `buildd status` and the daemon
-  log flag such a slot. Fewer, larger slots beat more, smaller ones: on
-  the 60-crate workspace buildd was built for, check and test builds of a
-  few crates need 12–15 GiB per slot, and 4 slots of 8 GiB were several
-  times slower than 2 of 15. Full-workspace `test` and
-  `clippy --all-targets` from several worktrees, as agents run them before
-  each commit, need about 30 GiB per slot: at 20 GiB a slot's compiled
-  artifacts alone outgrew the limit and its target was cleared.
-
-## Snapshots, trees and slots
-
-Every build is named by a git tree: a snapshot of a directory whose id is a
-hash of its content. buildd uses it as an exact, cheap name for "this
-worktree's files, right now".
-
-### What a tree is
-
-Git stores each file's content as a blob named by the hash of its bytes. A
-tree lists names and the blob or subtree each points to, and is itself
-named by the hash of that list.
+One build daemon for all the Cargo sessions on a machine: coding agents,
+editors, people. Each asks buildd to build its worktree; buildd builds in a
+few shared slots, under one budget for CPU, memory and disk.
 
 ```text
-tree 7f3a…                         ← one id names the whole snapshot
-├── Cargo.toml   → blob 1c2d…
-├── Cargo.lock   → blob 88e0…
-└── crates/      → tree 4b91…
-    ├── domain/  → tree a0f3…
-    │   └── src/lib.rs → blob 5e77…
-    └── gui/     → tree c2d8…
-        └── src/lib.rs → blob 9b14…
+ worktree A ─┐                        ┌─▶ slot 0   src/ + target/  (warm)
+ worktree B ─┼─ buildd test ─▶ daemon ┼─▶ slot 1   src/ + target/
+ worktree C ─┘                        └─▶ ssh ─▶ remote daemon     (--os linux)
+
+ each request is sent as a git tree snapshot; queue, job tokens, memory
+ and disk are shared by all of them
 ```
 
-Identical content gives an identical id in any worktree. Editing one file
-changes its blob id, its folder's tree id, and so on up to the top.
-
-### Snapshotting a worktree
-
-For each request the daemon writes the worktree's current content as a tree
-(about 0.1 s on a 600k-line workspace):
-
-```text
-worktree on disk          private copy of           git objects
-(committed + uncommitted  the worktree's index      (shared by all worktrees
- + new files)             ($BUILDD_HOME/tmp)         of the repository)
-
-  crates/gui/src/lib.rs ─┐
-  (edited, not staged)   │  git add --all  ┌──────────┐  a new blob only for
-                         ├────────────────▶│ temp     │──▶ each changed file
-  new_file.rs ───────────┘                 │ index    │
-  target/, ignored files ✗ skipped         └────┬─────┘
-                                                │ git write-tree
-                                                ▼
-                                        tree 7f3a…  = the revision
-```
-
-- The copy starts from the worktree's own index, whose cached file sizes and
-  times let git rehash only the files that changed.
-- Unchanged files keep their blob ids, so a snapshot stores only the new
-  versions of edited files.
-- The worktree's own index, and anything staged in it, are never touched,
-  so the agents sharing a worktree see no change.
-
-### What the tree id gives
-
-- **Deduplication.** Two requests for the same repository, tree, directory,
-  command and arguments are one build.
-- **Honest results.** Every result names the tree that was compiled, never
-  "whatever was on disk".
-- **Cheap distances.** `git diff-tree` compares two trees by id and skips
-  every folder whose id matches, so finding the few paths that differ
-  between two snapshots of a large workspace takes milliseconds. The
-  scheduler uses that count to choose the slot with the least to recompile.
-
-```text
-tree 7f3a (slot holds)        tree 3d2e (request)
-crates/ → 4b91           vs   crates/ → 6e02        differ: descend
-  domain/ → a0f3                domain/ → a0f3      same id: skip
-  gui/    → c2d8                gui/    → f417      differ: descend
-     src/lib.rs → 9b14             src/lib.rs → 0c55   changed file
-```
-
-### Checking a tree out into a slot
-
-A slot's checkout is a small git repository of its own whose objects come
-from the source repository, so checking out copies nothing up front and
-writes only what differs:
-
-```text
-slots/<repo>-<hash>/<n>/src
-  .git/objects/info/alternates ──▶ the source repository's objects
-                                   (every blob readable, nothing copied)
-
-  1. git commit-tree <tree>   wrap the tree in a commit (fixed author and
-                              date, so one tree is always one commit)
-  2. git reset --hard <commit>
-                              compare with what the checkout holds:
-                                same blob id    → file untouched
-                                different id    → file rewritten
-                                not in the tree → file deleted
-  3. git clean -ffdx          remove anything a build left behind
-```
-
-Only rewritten files get new modification times, which is what Cargo's
-fingerprints look at, so Cargo sees an ordinary small edit and recompiles
-only what depends on those files. The checkout's path never changes, and
-neither does the target directory next to it
-(`slots/<repo>-<hash>/<n>/target`), so its incremental state stays valid.
-A target directory never sees a second path: sharing one between paths
-lets Cargo judge stale artifacts fresh.
-
-### One caveat
-
-Snapshot trees are not referenced by any branch, so git's garbage
-collection may delete them, by default once they are two weeks old. A
-build needs its tree for seconds, so this is harmless; it does mean a
-revision id is a short-lived build handle, not a name to keep.
+Without it, every worktree has its own `target/` (disk × N), and every Cargo
+assumes it owns all the cores.
 
 ## Use
 
 ```sh
 cargo install --path . --root ~/.local
-cd some/worktree
-buildd check -p my-crate        # starts the daemon on first use
-buildd test -p my-crate -- some_test
-buildd status
-buildd top                      # watch it work; q quits
+cd my/worktree
+buildd check -p my-crate              # starts the daemon on first use
+buildd test -p my-crate -- some_test  # same arguments as cargo
+buildd nextest --workspace            # every test in its own process
+buildd test --os linux --workspace    # on a remote Linux host
+buildd status                         # one-shot summary
+buildd top                            # live view; q quits
 ```
 
-Set `BUILDD_LABEL` (an agent's or task's name) so `buildd top` and
-`buildd status` show who asked; otherwise a request is named by its
-worktree's folder.
+Set `BUILDD_LABEL` (an agent's or task's name) so `status` and `top` show
+who asked. Otherwise a request is named after its worktree's folder.
 
-## Watching it: `buildd top`
+## A build, step by step
 
-![buildd top in real use: three 40 GiB slots running full-workspace tests and Clippy for agent worktrees, two builds queued, and recent events](assets/top.svg)
+```text
+buildd test -p app
+   │
+1  snapshot   git add --all into a private index, git write-tree → tree 7f3a…
+   │          (the worktree and its index are untouched; ~0.1 s on 600k lines)
+2  join       same repo + tree + dir + command + args already queued or running?
+   │            → wait for that build instead
+   │          newer request from the same worktree?
+   │            → replaces its older queued one, keeping its place
+3  queue      shortest expected build first, less the time it has waited
+   │          starts only when its memory peak fits (see Memory)
+4  slot       the idle slot with the least to recompile
+   │            = compiled units it needs that the slot lacks
+   │            + packages the diff between the trees touches
+5  checkout   git reset --hard <tree> in the slot: only changed files are written
+   │            → Cargo sees a small edit; incremental state stays warm
+6  cargo      job tokens dealt from the shared budget (see CPU)
+   │
+7  result     output streamed back, naming tree 7f3a…
+```
 
-From real use, with names changed: eleven agent worktrees of one
-workspace shared three 40 GiB slots for 1 h 38 min. All three slots run
-full-workspace tests or Clippy while two builds wait, a pruning pass removed
-stale compiled units instead of clearing a target, and the daemon estimates
-that one target per worktree would have taken 430 GiB against the slots'
-117 GiB.
+Ctrl-C withdraws the request. A build nobody waits for any more is killed
+with its whole process group.
 
-The image predates some of the lines described here. Under the header,
-a line shows how fast builds went in the last hour: the queue wait, then
-the wall time of each kind of build (checks, scoped tests, workspace tests,
-builds), each as median / 90th percentile with its count. That line answers
-"are builds fast right now"; a rising p90 wait means the machine is
-oversubscribed. The header also shows jobs in use, the memory the running
-builds are expected to use against `memory_gib`, and free disk against the
-floor. A running build shows its phase (testing, copying) and the jobs it
-holds; a queued one shows its expected duration and why it waits (memory,
-or a busy warm slot with both estimates). Remote hosts appear in a block of
-their own, or as unreachable with the reason.
+## Snapshots
 
-What the totals mean, all measured by the daemon since it started:
+```text
+tree 7f3a…                      one id names the whole snapshot
+├── Cargo.toml → blob 1c2d…
+└── crates/    → tree 4b91…
+    ├── domain/ → tree a0f3…    same content → same id, in any worktree
+    └── gui/    → tree c2d8…    editing a file changes every id above it
+```
 
-- **requests → Cargo runs.** The difference is work that never ran: requests
-  that joined an equal build (shared), queued requests that moved to a newer
-  tree of their worktree (replaced), and builds nobody waited for any more
-  (dropped before starting, cancelled while running).
-- **crates reused.** Cargo reports every crate of a build as compiled or up
-  to date; the share up to date is what incremental state in the slots saved.
-- **CPU.** User and system time of each Cargo run and every compiler it
-  started.
-- **compile · tests.** A `test` build's wall time, split at Cargo's
-  `build-finished` message: compiling before it, running tests after.
-- **test binaries skipped.** Binaries a `nextest` run of every test did
-  not run because they had passed unchanged.
-- **new worktrees starting on a warm slot.** The first build of a worktree
-  that ran in a slot which had already done its compilation, instead of a
-  cold build in a fresh target.
-- **separate targets.** Worktrees served times the average measured slot
-  size: an estimate of the disk one target per worktree would take.
+What tree ids buy:
 
-Arguments are passed to Cargo unchanged, except those that would take the
-slot's target directory, checkout, output format or parallelism away from
-the daemon (`--target-dir`, `--manifest-path`, `--message-format`,
-`--config`, `-j`, `-Z`, ...), which are rejected.
+- **Deduplication.** Equal requests are one build.
+- **Honest results.** A result names exactly what was compiled.
+- **Cheap diffs.** `git diff-tree` skips every subtree whose id matches:
 
-`buildd nextest [ARGS]` runs `cargo nextest run` in a slot (nextest is
-installed separately): it compiles what `buildd test` compiles, so both
-share a slot's compilation, and runs each test in a process of its own,
-`test_jobs` at a time, while the build is charged `test_jobs` jobs.
-nextest does not run doctests (run `buildd test --doc` for those) and
-reads arguments after `--` as filters and libtest flags, so test binaries
-with their own harness that take data arguments stay with `buildd test`.
+```text
+slot holds 7f3a           request 3d2e
+crates/  4b91       vs    crates/  6e02    differ → descend
+  domain/ a0f3              domain/ a0f3   same   → skip
+  gui/    c2d8              gui/    f417   differ → src/lib.rs changed
+```
 
-A `buildd nextest` run of every test (no test name filters, filtersets or
-arguments after `--`) skips the test binaries that already passed in the
-slot and cannot have changed: buildd compiles the tests first, and a
-binary is skipped when its executable is the same file that passed and no
-path changed since then in its package, in a workspace package it depends
-on, or outside every package (fixtures, the lockfile, the toolchain).
-Cargo rewrites an executable whenever any Rust input of it changes; the
-path rule covers data its tests read at run time. The output says how
-many were skipped; `--rerun-all` runs them too. A test that reads files of
-a package it does not depend on is outside this rule: keep such data in
-its own package or outside every package.
+Snapshot trees belong to no branch, so git's garbage collection may delete
+them after about two weeks. A tree id is a handle for one build, not a name
+to keep.
+
+## Slots
+
+```text
+slots/<repo>-<hash>/<n>/
+  src/          checkout; reads the source repo's objects (git alternates),
+                so nothing is copied up front
+  target/       the only target directory this path ever uses
+  record.json   compilations run, units used, last worktree served
+```
+
+- The path never changes, so incremental state stays valid. (A target shared
+  between paths can make Cargo take stale artifacts for fresh ones.)
+- A slot is created only when builds run concurrently, up to `slots` per
+  repository.
+- A restarted daemon takes its slots back, still warm.
+
+## CPU: one job budget
+
+```text
+            jobs = 12 tokens
+ ┌───────────────┬─────────────┬─────────┐
+ │ build A   5   │ build B  4  │ free 3  │  every 5 ms: take back unused tokens,
+ └───────────────┴─────────────┴─────────┘  deal the free ones round-robin
+```
+
+- Each build gets its own jobserver; Cargo and rustc take tokens from it
+  (GNU make's protocol).
+- The daemon knows what each build holds, so a killed build returns all of
+  its tokens.
+- Tests run on `test_jobs` threads. While tests run, the build is charged at
+  least `test_jobs` tokens, since tests use cores without taking tokens.
+
+## Memory and disk
+
+```text
+memory   a queued build starts when
+           Σ peaks of running builds + its own peak ≤ memory_gib
+         peak = summed RSS of the build's process group, recorded per compilation
+         a build that doesn't fit holds the queue, so big builds aren't starved
+
+disk     per slot     target ≤ slot_limit_gib, trimmed while idle,
+                      least recently used first:
+                      incremental caches → compiled units → whole target (last resort)
+         per volume   free < min_free_gib → idle slots give up their oldest units,
+                      never anything used in the last 10 minutes
+```
+
+**Sizing.** A slot must hold the working set of the builds it serves.
+Below that, trimming deletes caches still in use and builds start cold;
+`status` flags slots that are too small. Fewer, larger slots win. Builds of
+a few crates need 12–15 GiB per slot. Full-workspace `test` plus
+`clippy --all-targets` need about 30 GiB.
+
+## Tests
+
+```text
+buildd nextest --workspace
+   │
+   compile the tests (shared with buildd test)
+   │
+   for each test binary:  same executable file as when it last passed?
+   │                      and no change in its package, the workspace
+   │                      packages it uses, or outside every package
+   │                      (fixtures, Cargo.lock)?
+   ├── yes → skip
+   └── no  → run, each test in its own process
+```
+
+- Skipping applies only to unfiltered runs. `--rerun-all` runs everything.
+- nextest doesn't run doctests: use `buildd test --doc` for those.
+- Test binaries with their own harness that take arguments after `--` stay
+  with `buildd test`.
+- If a test reads files from a package it doesn't depend on, skipping can't
+  see changes to them. Keep such data in the test's own package or outside
+  every package.
+
+## Remote hosts
+
+```text
+ this machine                                  remote (os = linux)
+ buildd test --os linux
+   │ snapshot → commit
+   ├── git push over ssh ───────────────────▶ mirrors/<project>  (last 20 trees)
+   ├── ssh 'buildd serve' ──────────────────▶ daemon: own slots, budget, config
+   ◀── messages streamed back ─────────────── slot shows as  pc:<slot>
+
+ status questions use a second SSH connection, so top never waits behind a push
+```
+
+```toml
+# config.toml
+[[remote]]
+name = "pc"
+ssh = "me@pc.example"
+os = "linux"
+command = "bash -lc 'buildd serve'"   # login shell: same tools as a terminal
+```
+
+- The caller names the OS. buildd never picks one itself, since results
+  differ by OS. A request for an OS no host builds for is rejected.
+- The remote daemon is an ordinary daemon and knows nothing about who uses
+  it.
+- `buildd drain` stops a daemon taking new builds (for example during a
+  benchmark); `buildd undrain` resumes.
+
+## `buildd top`
+
+![buildd top: three slots running workspace tests and Clippy, two builds queued, recent events (older screenshot)](assets/top.svg)
+
+```text
+header    slots · jobs in use · expected memory / memory_gib · free disk / floor
+speed     last hour (median / p90): wait 4.3 s / 29 s · checks 18 s / 23 s ×8 · ...
+slots     each running build: phase (compiling, testing, copying), jobs held
+queue     expected duration, and why it waits (memory, or a busy warm slot)
+remotes   the same per host, or why it can't be reached
+totals    since the daemon started (below)
+events    the latest ones
+```
+
+If the p90 wait keeps rising, the machine is oversubscribed.
+
+| total | meaning |
+|---|---|
+| requests → Cargo runs | the gap is work saved: shared, replaced, dropped or cancelled builds |
+| crates reused | share of crates Cargo found up to date |
+| CPU | user + system time of Cargo and every compiler it started |
+| compile · tests | a test build's wall time, split where Cargo finished building |
+| test binaries skipped | passed earlier and unchanged since |
+| warm starts | a worktree's first build landing on a slot that already had its work |
+| separate targets | estimated disk if every worktree had its own target |
+
+## Options
 
 buildd's own options come before Cargo's arguments:
 
-- `--copy-to DIR`: after a successful build, copy the executables Cargo
-  produced, with their debug information (`.dSYM` bundles), into `DIR`,
-  each replacing an older copy as a whole. Programs that need what was
-  built, such as an install script, get it without building outside the
-  slots. A request copying elsewhere is a different build.
-- `--rustflags FLAGS`: flags for every rustc, as `RUSTFLAGS` would give
-  them. They are part of what a build compiles, so builds with other flags
-  never share or supersede each other.
-- `--json`: print every message from the daemon as a line of JSON on
-  standard output, for programs that drive buildd: Cargo's messages,
-  `copied` messages (Cargo's `compiler-artifact` message for each copy,
-  naming the copied paths) and the final `finished` with the tree built.
+| option | effect |
+|---|---|
+| `--os OS` | build on a remote host for that OS |
+| `--copy-to DIR` | after success, copy the built executables (and `.dSYM`) into `DIR` |
+| `--rustflags FLAGS` | flags for every rustc (like `RUSTFLAGS`); part of the build's identity |
+| `--json` | print every daemon message as a JSON line, for programs |
+| `--rerun-all` | `nextest`: also run binaries that would be skipped |
 
-State lives in `$BUILDD_HOME`, by default `buildd` in the user cache
-directory (`~/Library/Caches/buildd` on macOS, `~/.cache/buildd` on Linux):
+Cargo options that would take the target, checkout, output format or
+parallelism away from the daemon (`--target-dir`, `--manifest-path`,
+`--message-format`, `--config`, `-j`, `-Z`, ...) are rejected.
+
+## State
+
+`$BUILDD_HOME`, by default `~/Library/Caches/buildd` (macOS) or
+`~/.cache/buildd` (Linux):
 
 ```text
-config.toml        slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
-                   slot_limit_gib = 20, min_free_gib = 15,
-                   memory_gib = <physical> - 6 by default; [[remote]] hosts
-sock               the daemon's socket
-daemon.log         output of a daemon a client started, each line timestamped
-events.jsonl       every event as a JSON line (moves to events.jsonl.1 at 10 MB)
-mirrors/<project>  bare repositories other machines' daemons push trees into
-ssh-<hash>         SSH control sockets to remote hosts, kept open 10 minutes:
-ssh-status-<hash>  one for builds, one for status, so top never waits behind
-                   a build's push or output
-slots/<repo>-<hash>/repository     the repository these slots build
-slots/<repo>-<hash>/<n>/{src,target,record.json}
+config.toml          slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
+                     slot_limit_gib = 20, min_free_gib = 15,
+                     memory_gib = <physical> - 6, [[remote]] hosts
+sock                 the daemon's socket
+daemon.log           output of a daemon a client started
+events.jsonl         every event as JSON (rotates to .1 at 10 MB)
+slots/               see Slots
+mirrors/<project>    repositories remote machines push into
+ssh-<hash>           SSH connection for builds  ┐ kept open
+ssh-status-<hash>    SSH connection for status  ┘ 10 minutes
 ```
 
-## Remote hosts: building for another OS
+The daemon reads `config.toml` when it starts: restart it after a change.
 
-A build can run on another machine's buildd daemon, for an OS this one is
-not. Name the host in `config.toml`:
+## macOS: skip first-run scans
 
-```toml
-[[remote]]
-name = "pc"
-ssh = "me@192.168.0.10"
-os = "linux"
-command = "bash -lc 'buildd serve'"
-```
-
-`command` runs in the remote user's login shell here, so the daemon it
-starts, on first use, sees the same tools (Cargo, linkers, build tools
-such as Zig) as a terminal there.
-
-and ask for the OS: `buildd test --os linux --workspace`. Everything else
-is the same command and the same output. The local daemon snapshots the
-worktree as usual, makes the tree's commit and pushes it (`git push` over
-SSH) into the remote daemon's mirror of the repository, which keeps the
-latest 20 pushed trees so the next push sends only what changed. It then
-runs `command` over the same SSH connection (one per host, kept open
-between builds) to ask that daemon to build the tree, and passes its
-messages on; the slot shows as `pc:<slot>`. Closing the client closes the
-SSH session, which withdraws the build there. buildd never picks another
-OS by itself: results differ by OS, so the caller names it, and a request
-for an OS no host builds for is rejected. `buildd top` shows each remote
-host's slots, queue and budget, or why it could not be reached.
-
-The remote daemon is an ordinary daemon with its own slots, budget, limits
-and config; it knows nothing about the machines that use it. `buildd
-serve` passes one request from standard input to it. `buildd drain` makes
-a daemon take no new builds while running and queued ones end (to keep a
-machine quiet for a benchmark); `buildd undrain` reverses it.
-
-## macOS: exempt the daemon from first-run scans
-
-macOS scans every new executable the first time it runs unless the app
-responsible for the process is a developer tool. Test binaries are new
-after every link, so each test build pays the scan per binary: measured
-inside a slot, about 0.1 s for a 1 MB test binary and 2.4 s for a 175 MB
-one, in series because Cargo runs test binaries one after another.
-
-The daemon is attributed to the app whose `buildd` client first started
-it: usually your terminal. Add that app (and any other app that starts
-buildd clients, such as an editor or agent host) under System Settings →
-Privacy & Security → Developer Tools, then restart the daemon so a client
-from that app starts it again. `spctl developer-mode enable-terminal`
-makes Terminal appear in that list. Linux has no such scan.
-
-To check, run a test that copies its own executable and times the copy's
-first and second runs; with the exemption both take milliseconds.
+macOS scans each new executable on its first run, and every link makes new
+test binaries. That costs about 0.1 s for a 1 MB binary and 2.4 s for a
+175 MB one. Add the app that starts buildd (your terminal, editor or agent
+host) under System Settings → Privacy & Security → Developer Tools, then
+restart the daemon from that app. Linux has no such scan.
 
 ## Load test
 
-`bench/load.py` runs many sessions against one Cargo workspace, each in its
-own worktree editing one crate and asking for `check` and `test --no-run`,
-either through a buildd daemon it starts or with plain Cargo and one target
-per worktree. It reports time to finish, latency, queue time and peak disk.
+`bench/load.py` runs many simulated sessions against one workspace, through
+buildd or with plain Cargo and one target per worktree. It reports time to
+finish, latency, queue time and peak disk.
 
 ```sh
 bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
@@ -396,21 +274,18 @@ bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
 
 ## Protocol
 
-One JSON object per line over the Unix socket; see `src/protocol.rs`.
-`build` streams a build's messages, `status` describes the slots and queue,
-and `activity` adds the totals and recent events `buildd top` shows. The
-library's `client` module is what other programs integrate with.
+One JSON object per line over the Unix socket (`src/protocol.rs`): `build`
+streams a build, `status` describes slots and queue, `activity` adds what
+`top` shows. Programs integrate through the library's `client` module.
 
 ## Not yet
 
-- A `cargo` shim that routes agents' own Cargo calls to the daemon.
-- Client environment: Cargo runs with the daemon's environment, so a
-  client's `RUSTFLAGS` or `RUST_LOG` do not reach the build; flags for
-  rustc go through `--rustflags`.
-- Ignored files are not part of a snapshot; a build that needs a generated,
-  ignored file fails in a slot.
-- A timeline of recent builds per slot in `buildd top`.
-- Building for every OS in one request (`--os all`), or letting the daemon
-  pick the free machine when either OS's answer will do (`--os any`).
+- A `cargo` shim that routes direct Cargo calls to the daemon.
+- The client's environment doesn't reach the build (`RUSTFLAGS`, `RUST_LOG`);
+  use `--rustflags`.
+- Ignored files aren't snapshotted, so a build that needs a generated,
+  ignored file fails.
+- A per-slot timeline in `top`.
+- `--os all` (every OS, one verdict) and `--os any` (whichever is free).
 
-Unix only (Unix sockets, process groups).
+Unix only.
