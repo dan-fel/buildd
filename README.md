@@ -28,8 +28,16 @@ share one CPU budget instead of each assuming it owns the machine.
   compiles again: the paths that differ (`git diff-tree`), each changed
   package counted with every workspace package that depends on it, learned
   from `cargo metadata`, and a lockfile or build-configuration change
-  counting all of them. It never waits for a busy slot while another is
-  idle.
+  counting all of them. It waits for a busy slot while another is idle
+  only when that is expected to be faster: the busy build's expected end
+  plus its share there beats the idle slot compiling its share cold, at
+  what a compiled unit cost lately. `top` shows such a build as waiting
+  for that slot, with both estimates.
+- **Shortest expected build first.** The queue is ordered by each build's
+  expected wall time (the last successful build of its compilation, or of
+  its command in its directory) less the time it has waited, so a short
+  Clippy no longer waits behind two full test suites, and a long build
+  still runs once it has waited its own length.
 - **One CPU budget.** `jobs` tokens for every build together. Each build
   gets a jobserver of its own (a FIFO its Cargo and compilers take tokens
   from, as GNU make's protocol says), and the daemon deals tokens between
@@ -306,8 +314,8 @@ library's `client` module is what other programs integrate with.
 
 ## Not yet
 
-- Memory-aware admission and priorities: builds start first come, first
-  served, at most `slots` at once.
+- Memory-aware admission: at most `slots` builds run at once, whatever
+  they need.
 - A `cargo` shim that routes agents' own Cargo calls to the daemon.
 - Client environment: Cargo runs with the daemon's environment, so a
   client's `RUSTFLAGS` or `RUST_LOG` do not reach the build; flags for

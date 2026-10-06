@@ -23,8 +23,14 @@
 //!   slot's tree and the build's. A build needs what the latest build of its
 //!   [`Compilation`] used, in any slot; a compilation no build ran yet needs,
 //!   as far as anyone knows, what the latest builds of the same command in
-//!   the same directory used. It never waits for a busy slot while one is
-//!   idle: measured, waiting for a warm slot cost more than warming another.
+//!   the same directory used. It waits for a busy slot while one is idle
+//!   only when that is expected to be faster: the busy slot's build ends
+//!   (its compilation's last wall time) and the build compiles its share
+//!   there sooner than the idle slot compiles its share cold, units costing
+//!   what they cost lately. Without estimates it never waits.
+//! - **Queue order.** The shortest expected build first, less the time it
+//!   has waited, so short builds go ahead of long ones and a long one goes
+//!   once it has waited its own length.
 //!   It gets a new slot only when every slot of its repository runs a build,
 //!   so slot directories are created only when builds of a repository run
 //!   concurrently.
@@ -40,7 +46,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cargo::{Command, Compilation, Operation};
 use crate::protocol::{
-    EventKind, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild, SlotStatus, Usage,
+    EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild, SlotStatus,
+    Usage,
 };
 use crate::slot::{CompilationRun, Pruning, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
@@ -50,6 +57,8 @@ pub(crate) const MAINTENANCE_QUIET: Duration = Duration::from_secs(2);
 /// After this many unmeasured builds a slot is kept within its limit right
 /// after its build, idle or not.
 pub(crate) const MAINTENANCE_DUE: u32 = 8;
+/// A build that compiled at least this many units tells what one costs.
+const UNIT_COST_SAMPLE: u64 = 5;
 
 /// How far apart two trees of a repository are, as the work Cargo redoes
 /// when a slot holding one is checked out to the other.
@@ -166,6 +175,8 @@ struct Job {
     fresh: u64,
     /// The compiled units it used so far.
     units: HashSet<String>,
+    /// It waits for a busy slot although another is idle, and why.
+    hold: Option<Hold>,
 }
 
 enum State {
@@ -220,7 +231,13 @@ impl Slot {
     /// Its build of `compilation` used `units`: everything the compilation
     /// needs when the build `succeeded`. A failed build may have stopped
     /// early, so what earlier builds used stays.
-    fn ran(&mut self, compilation: Compilation, units: HashSet<String>, succeeded: bool) {
+    fn ran(
+        &mut self,
+        compilation: Compilation,
+        units: HashSet<String>,
+        succeeded: bool,
+        build_ms: u64,
+    ) {
         // A build that used no units says nothing about what it needs.
         if units.is_empty() {
             return;
@@ -234,6 +251,7 @@ impl Slot {
             Some(run) => {
                 if succeeded {
                     run.units.clear();
+                    run.build_ms = Some(build_ms);
                 }
                 run.units.extend(units);
                 run.at = at;
@@ -242,6 +260,7 @@ impl Slot {
                 compilation,
                 at,
                 units: units.into_iter().collect(),
+                build_ms: succeeded.then_some(build_ms),
             }),
         }
     }
@@ -283,6 +302,9 @@ pub(crate) struct Scheduler<D> {
     jobs: BTreeMap<JobId, Job>,
     waiting: HashMap<WaiterId, JobId>,
     slots: Vec<Slot>,
+    /// Per repository, the wall time compiling one unit took lately, in
+    /// milliseconds: a moving average over builds that compiled enough.
+    unit_ms: HashMap<PathBuf, u64>,
 }
 
 impl Job {
@@ -318,6 +340,15 @@ impl Job {
         )
     }
 
+    /// How long its longest-waiting waiter has waited.
+    fn waited_ms(&self) -> u64 {
+        self.waiters
+            .iter()
+            .map(|waiter| millis(waiter.since.elapsed()))
+            .max()
+            .expect("a job has waiters")
+    }
+
     fn who(&self) -> Vec<String> {
         self.waiters
             .iter()
@@ -350,6 +381,7 @@ impl<D: Distance> Scheduler<D> {
             jobs: BTreeMap::new(),
             waiting: HashMap::new(),
             slots: Vec::new(),
+            unit_ms: HashMap::new(),
         }
     }
 
@@ -479,6 +511,7 @@ impl<D: Distance> Scheduler<D> {
                     compiled: 0,
                     fresh: 0,
                     units: HashSet::new(),
+                    hold: None,
                 },
             );
             id
@@ -663,14 +696,27 @@ impl<D: Distance> Scheduler<D> {
         let entry = &mut self.slots[slot];
         // Cargo ran to its end, also when the job's own crates did not
         // compile; a cancelled or killed build tells less.
+        let build_ms = millis(started.elapsed());
         if let Outcome::Exited { code } = outcome {
-            entry.ran(compilation, std::mem::take(&mut job.units), *code == 0);
+            entry.ran(
+                compilation,
+                std::mem::take(&mut job.units),
+                *code == 0,
+                build_ms,
+            );
         }
         let persist = entry.persist();
         entry.job = None;
         entry.unmeasured += 1;
         entry.idle_since = Instant::now();
-        let build_ms = millis(started.elapsed());
+        // What compiling one unit costs here, for weighing cold builds.
+        let compile_ms = build_ms - test_ms.unwrap_or(0).min(build_ms);
+        if job.compiled >= UNIT_COST_SAMPLE {
+            let sample = compile_ms / job.compiled;
+            let cost = self.unit_ms.entry(job.repository.clone()).or_insert(sample);
+            *cost = (*cost * 3 + sample) / 4;
+        }
+        let entry = &mut self.slots[slot];
         entry.last = Some(LastBuild {
             operation: job.operation.clone(),
             outcome: outcome.clone(),
@@ -830,19 +876,28 @@ impl<D: Distance> Scheduler<D> {
     /// repositories go first.
     fn start_ready(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let mut queued = self
-            .jobs
-            .iter()
-            .filter(|(_, job)| job.queued())
-            .map(|(id, job)| (job.order, *id))
-            .collect::<Vec<_>>();
-        queued.sort_unstable();
-        for (_, id) in queued {
+        for id in self.queue_order() {
             if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
                 break;
             }
-            let Some((slot, warm)) = self.choose_slot(id) else {
-                continue;
+            let (slot, warm) = match self.choose_slot(id) {
+                Placement::Start { slot, warm } => (slot, warm),
+                Placement::Wait => {
+                    self.jobs.get_mut(&id).expect("queued above").hold = None;
+                    continue;
+                }
+                Placement::Hold(hold) => {
+                    let job = self.jobs.get_mut(&id).expect("queued above");
+                    if job.hold.is_none() {
+                        effects.push(Effect::Report(EventKind::Held {
+                            who: job.who(),
+                            operation: job.operation.clone(),
+                            hold: hold.clone(),
+                        }));
+                    }
+                    job.hold = Some(hold);
+                    continue;
+                }
             };
             self.clock += 1;
             let job = &self.jobs[&id];
@@ -888,10 +943,53 @@ impl<D: Distance> Scheduler<D> {
         effects
     }
 
+    /// The queued jobs, the one to start first first: shortest expected
+    /// build minus time waited, so short builds go ahead and a long one goes
+    /// once it has waited its own length; then submission order.
+    fn queue_order(&self) -> Vec<JobId> {
+        let mut queued = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.queued())
+            .map(|(id, job)| {
+                let waited = job.waited_ms();
+                let expected = self
+                    .estimate(job)
+                    .or_else(|| typical(&self.slots, &job.repository))
+                    .unwrap_or(0);
+                (expected.saturating_sub(waited), job.order, *id)
+            })
+            .collect::<Vec<_>>();
+        queued.sort_unstable();
+        queued.into_iter().map(|(_, _, id)| id).collect()
+    }
+
+    /// How long a build of `job` is expected to take: the latest successful
+    /// build of its compilation, or the average of builds of the same
+    /// command in the same directory.
+    fn estimate(&self, job: &Job) -> Option<u64> {
+        let compilation = Compilation::of(job);
+        let runs = || {
+            self.slots
+                .iter()
+                .filter(|slot| slot.repository == job.repository)
+                .flat_map(|slot| &slot.compilations)
+        };
+        if let Some(run) = runs()
+            .filter(|run| run.compilation == compilation && run.build_ms.is_some())
+            .max_by_key(|run| run.at)
+        {
+            return run.build_ms;
+        }
+        average(runs().filter(|run| {
+            run.compilation.prefix == compilation.prefix
+                && run.compilation.command == compilation.command
+        }))
+    }
+
     /// The slot queued job `id` runs in now, as the module explains, and
-    /// whether that slot holds everything the build needs; None while it
-    /// waits.
-    fn choose_slot(&mut self, id: JobId) -> Option<(usize, bool)> {
+    /// whether that slot holds everything the build needs; or why it waits.
+    fn choose_slot(&mut self, id: JobId) -> Placement {
         let job = &self.jobs[&id];
         let repository = job.repository.clone();
         let revision = job.revision.clone();
@@ -918,8 +1016,14 @@ impl<D: Distance> Scheduler<D> {
                 best = Some((rank, known && missing == 0));
             }
         }
-        if let Some(((_, _, index), warm)) = best {
-            return Some((index, warm));
+        if let Some(((work, _, index), warm)) = best {
+            // Owned: weighing busy slots measures distances, which need the
+            // scheduler mutably.
+            let needed = needed.into_iter().map(str::to_owned).collect();
+            return match self.hold(id, &needed, work) {
+                Some(hold) => Placement::Hold(hold),
+                None => Placement::Start { slot: index, warm },
+            };
         }
         let own = || {
             self.slots
@@ -928,7 +1032,7 @@ impl<D: Distance> Scheduler<D> {
         };
         // A slot being maintained is free again soon, and warm.
         if own().any(|slot| slot.maintaining) || own().count() >= self.capacity {
-            return None;
+            return Placement::Wait;
         }
         // Restored slots can leave gaps: take the lowest free index.
         let index = (0..self.capacity)
@@ -950,7 +1054,57 @@ impl<D: Distance> Scheduler<D> {
             compilations: Vec::new(),
             units: HashMap::new(),
         });
-        Some((self.slots.len() - 1, false))
+        Placement::Start {
+            slot: self.slots.len() - 1,
+            warm: false,
+        }
+    }
+
+    /// Whether queued job `id`, whose best idle slot leaves `work` units to
+    /// compile, should wait for a busy slot of its repository instead: the
+    /// busy slot's build is expected to end, and the job to build there,
+    /// sooner than the idle slot would compile its share cold. Without
+    /// estimates it never waits.
+    fn hold(&mut self, id: JobId, needed: &HashSet<String>, work: u64) -> Option<Hold> {
+        let job = &self.jobs[&id];
+        let unit_ms = *self.unit_ms.get(&job.repository)?;
+        let cold_ms = work.saturating_mul(unit_ms);
+        let mut best: Option<Hold> = None;
+        for slot in &self.slots {
+            let Some(running) = slot.job.filter(|_| slot.repository == job.repository) else {
+                continue;
+            };
+            let running = &self.jobs[&running];
+            let State::Running { started, .. } = running.state else {
+                panic!("a slot's job runs");
+            };
+            let elapsed = millis(started.elapsed());
+            // A build far past its estimate says nothing about its end.
+            let Some(expected) = self
+                .estimate(running)
+                .filter(|expected| elapsed <= expected.saturating_mul(2))
+            else {
+                continue;
+            };
+            let missing = needed
+                .iter()
+                .filter(|unit| !slot.units.contains_key(unit.as_str()))
+                .count() as u64;
+            let distance =
+                self.distance
+                    .distance(&job.repository, &running.revision, &job.revision);
+            let wait_ms = expected
+                .saturating_sub(elapsed)
+                .saturating_add(missing.saturating_add(distance).saturating_mul(unit_ms));
+            if wait_ms < cold_ms && best.as_ref().is_none_or(|best| wait_ms < best.wait_ms) {
+                best = Some(Hold {
+                    slot: slot_name(&slot.repository, slot.index),
+                    wait_ms,
+                    cold_ms,
+                });
+            }
+        }
+        best
     }
 
     /// The slots and the queue, next build first, with the jobs each running
@@ -1002,28 +1156,54 @@ impl<D: Distance> Scheduler<D> {
                 last: slot.last.clone(),
             })
             .collect();
-        let mut queued = self
-            .jobs
-            .iter()
-            .filter(|(_, job)| job.queued())
-            .collect::<Vec<_>>();
-        queued.sort_by_key(|(id, job)| (job.order, **id));
-        let queue = queued
+        let queue = self
+            .queue_order()
             .into_iter()
-            .map(|(_, job)| QueuedBuild {
-                revision: job.revision.clone(),
-                operation: job.operation.clone(),
-                who: job.who(),
-                waited_ms: job
-                    .waiters
-                    .iter()
-                    .map(|waiter| millis(waiter.since.elapsed()))
-                    .max()
-                    .expect("a queued job has waiters"),
+            .map(|id| {
+                let job = &self.jobs[&id];
+                QueuedBuild {
+                    revision: job.revision.clone(),
+                    operation: job.operation.clone(),
+                    who: job.who(),
+                    waited_ms: job.waited_ms(),
+                    estimate_ms: self.estimate(job),
+                    held: job.hold.clone(),
+                }
             })
             .collect();
         (slots, queue)
     }
+}
+
+/// Where a queued job goes now.
+enum Placement {
+    Start {
+        slot: usize,
+        warm: bool,
+    },
+    /// No slot is free for it.
+    Wait,
+    /// It waits for a busy slot although one is idle.
+    Hold(Hold),
+}
+
+/// The average wall time of `runs` that succeeded, if any did.
+fn average<'a>(runs: impl Iterator<Item = &'a CompilationRun>) -> Option<u64> {
+    let (total, count) = runs
+        .filter_map(|run| run.build_ms)
+        .fold((0, 0), |(total, count), ms| (total + ms, count + 1));
+    (count > 0).then(|| total / count)
+}
+
+/// How long a build of `repository` takes on average, for a build nothing
+/// is known about.
+fn typical(slots: &[Slot], repository: &Path) -> Option<u64> {
+    average(
+        slots
+            .iter()
+            .filter(|slot| slot.repository == repository)
+            .flat_map(|slot| &slot.compilations),
+    )
 }
 
 /// The compiled units a build of `compilation` in `repository` needs, as the
@@ -1578,6 +1758,76 @@ mod tests {
     }
 
     #[test]
+    fn a_build_waits_for_a_busy_warm_slot_when_that_beats_building_cold() {
+        let mut scheduler = checked_and_tested();
+        scheduler.slots[1].compilations[0].build_ms = Some(5000);
+        let running = submit_operation(&mut scheduler, 3, "/b", "b2", Command::Test, &[]);
+        let [(job, 1, _)] = starts(&running)[..] else {
+            panic!("{running:?}");
+        };
+        // Compiling a unit takes a second: slot 0 lacks 12 units and is 10
+        // packages away, 22 s cold; slot 1 ends in about 5 s and is 10
+        // packages away, 15 s.
+        scheduler.unit_ms.insert("/repo/.git".into(), 1000);
+        let held = submit_operation(&mut scheduler, 4, "/c", "c1", Command::Test, &[]);
+        assert!(starts(&held).is_empty(), "{held:?}");
+        assert!(matches!(
+            reports(&held)[..],
+            [
+                _,
+                EventKind::Held {
+                    hold: Hold {
+                        wait_ms: 14_000..=15_000,
+                        cold_ms: 22_000,
+                        ..
+                    },
+                    ..
+                }
+            ]
+        ));
+        let (_, queue) = scheduler.status(|_| 0);
+        assert!(queue[0].held.is_some());
+        let next = scheduler.exited(job, &ok(), None);
+        assert!(matches!(starts(&next)[..], [(_, 1, _)]), "{next:?}");
+    }
+
+    #[test]
+    fn the_queue_runs_the_build_expected_to_be_shortest_first() {
+        let mut scheduler = checked_and_tested();
+        scheduler.slots[0].compilations[0].build_ms = Some(2_000);
+        scheduler.slots[1].compilations[0].build_ms = Some(600_000);
+        let busy = [
+            submit(&mut scheduler, 3, "/x", "x1"),
+            submit(&mut scheduler, 4, "/y", "y1"),
+        ];
+        let running = busy
+            .iter()
+            .flat_map(|effects| starts(effects))
+            .map(|(job, ..)| job)
+            .collect::<Vec<_>>();
+        assert_eq!(running.len(), 2);
+        submit_operation(&mut scheduler, 5, "/t", "t1", Command::Test, &[]);
+        submit(&mut scheduler, 6, "/c", "c1");
+        let (_, queue) = scheduler.status(|_| 0);
+        let order = queue
+            .iter()
+            .map(|build| (build.operation.command, build.estimate_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                (Command::Check, Some(2_000)),
+                (Command::Test, Some(600_000))
+            ]
+        );
+        let next = scheduler.exited(running[0], &ok(), None);
+        assert!(
+            matches!(&starts(&next)[..], [(_, _, tree)] if tree == "c1"),
+            "{next:?}"
+        );
+    }
+
+    #[test]
     fn evicted_units_count_as_missing() {
         let mut scheduler = checked_and_tested();
         scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
@@ -1826,6 +2076,7 @@ mod tests {
                 compilation: Compilation::new(Path::new(""), &check()),
                 at: 1,
                 units: units("c", 12).into_iter().collect(),
+                build_ms: None,
             }],
             units: units("c", 12).into_iter().map(|unit| (unit, 1)).collect(),
         };

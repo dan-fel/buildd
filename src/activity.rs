@@ -101,7 +101,7 @@ impl ActivityLog {
             }
             EventKind::Dropped { .. } => totals.dropped += 1,
             EventKind::Cancelled { .. } => totals.cancelled += 1,
-            EventKind::Pruned { .. } | EventKind::Reclaimed { .. } => {}
+            EventKind::Pruned { .. } | EventKind::Reclaimed { .. } | EventKind::Held { .. } => {}
         }
         let event = Event {
             at_ms: epoch_millis(at),

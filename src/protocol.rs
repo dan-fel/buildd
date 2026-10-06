@@ -197,6 +197,23 @@ pub struct QueuedBuild {
     /// Who waits for it, one entry per request it serves.
     pub who: Vec<String>,
     pub waited_ms: u64,
+    /// How long it is expected to take, from earlier builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_ms: Option<u64>,
+    /// It waits for a busy slot that has what it needs, although another
+    /// slot is idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Hold>,
+}
+
+/// Why a build waits for a busy slot: building cold in an idle one was
+/// expected to take `cold_ms`, waiting for `slot` and building there
+/// `wait_ms`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Hold {
+    pub slot: String,
+    pub wait_ms: u64,
+    pub cold_ms: u64,
 }
 
 /// What `buildd top` shows.
@@ -265,6 +282,13 @@ pub enum EventKind {
         operation: Operation,
         from: Revision,
         to: Revision,
+    },
+    /// A build waits for busy `slot` although another slot is idle, as
+    /// `hold` explains.
+    Held {
+        who: Vec<String>,
+        operation: Operation,
+        hold: Hold,
     },
     /// Cargo started. `warm` when the slot had done this compilation before;
     /// `first` when this is the first build of its worktree.

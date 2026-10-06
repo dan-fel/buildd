@@ -59,6 +59,9 @@ pub(crate) struct CompilationRun {
     pub(crate) compilation: Compilation,
     pub(crate) at: u64,
     pub(crate) units: BTreeSet<String>,
+    /// The wall time of the latest successful build, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) build_ms: Option<u64>,
 }
 
 /// A slot directory a daemon left behind.
@@ -1100,6 +1103,7 @@ mod tests {
                 ),
                 at: 7,
                 units: ["debug/0123456789abcdef".to_owned()].into(),
+                build_ms: Some(4200),
             }],
             units: [("debug/0123456789abcdef".to_owned(), 7)].into(),
         };

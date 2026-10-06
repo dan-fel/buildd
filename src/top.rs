@@ -118,8 +118,19 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
             .iter()
             .enumerate()
             .map(|(position, build)| {
+                let estimate = build
+                    .estimate_ms
+                    .map_or_else(String::new, |estimate| format!(" · ~{}", seconds(estimate)));
+                let held = build.held.as_ref().map_or_else(String::new, |hold| {
+                    format!(
+                        " · for {} (~{}, cold ~{})",
+                        hold.slot,
+                        seconds(hold.wait_ms),
+                        seconds(hold.cold_ms)
+                    )
+                });
                 Line::from(format!(
-                    "{}. {}  {} @ {}  waiting {}",
+                    "{}. {}  {} @ {}  waiting {}{estimate}{held}",
                     position + 1,
                     build.who.join(", "),
                     build.operation,
@@ -399,6 +410,20 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             ),
             Style::new().fg(Color::Yellow),
         ),
+        EventKind::Held {
+            who,
+            operation,
+            hold,
+        } => (
+            format!(
+                "{} waits for {} to {operation}: ~{} there, ~{} cold in an idle slot",
+                who.join(", "),
+                hold.slot,
+                seconds(hold.wait_ms),
+                seconds(hold.cold_ms)
+            ),
+            Style::new().fg(Color::Yellow),
+        ),
         EventKind::Reclaimed {
             needed,
             freed,
@@ -518,7 +543,9 @@ mod tests {
     use std::time::Duration;
 
     use buildd::cargo::{Command, Operation};
-    use buildd::protocol::{Event, LastBuild, QueuedBuild, RunningBuild, Status, Totals, Usage};
+    use buildd::protocol::{
+        Event, Hold, LastBuild, QueuedBuild, RunningBuild, Status, Totals, Usage,
+    };
     use buildd::snapshot::Revision;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -599,6 +626,12 @@ mod tests {
                     operation: check("app-protocol"),
                     who: vec!["agent-5".into()],
                     waited_ms: 2100,
+                    estimate_ms: Some(40_000),
+                    held: Some(Hold {
+                        slot: "app-c716/0".into(),
+                        wait_ms: 30_000,
+                        cold_ms: 300_000,
+                    }),
                 }],
             },
             started_at_ms: at(3600),
@@ -682,7 +715,7 @@ mod tests {
             "check -p app-ui @ 7f3a9c0d1e",
             "for agent-1, agent-7  shared by 2  testing · 4 jobs · compiled 3 · reused 412",
             "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use",
-            "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s",
+            "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s · ~40.0 s · for app-c716/0 (~30.0 s, cold ~300.0 s)",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",
             "new worktrees starting on a warm slot: 6 of 6",
