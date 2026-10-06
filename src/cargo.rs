@@ -14,11 +14,20 @@ pub enum Command {
     Clippy,
     Build,
     Test,
+    /// `cargo nextest run`: the tests `test` compiles, each in a process of
+    /// its own, `test_jobs` at a time.
+    Nextest,
 }
 
 impl Command {
     /// Every command, in the order usage lists them.
-    pub const ALL: [Self; 4] = [Self::Check, Self::Clippy, Self::Build, Self::Test];
+    pub const ALL: [Self; 5] = [
+        Self::Check,
+        Self::Clippy,
+        Self::Build,
+        Self::Test,
+        Self::Nextest,
+    ];
 
     /// The subcommand's name.
     #[must_use]
@@ -28,7 +37,14 @@ impl Command {
             Self::Clippy => "clippy",
             Self::Build => "build",
             Self::Test => "test",
+            Self::Nextest => "nextest",
         }
+    }
+
+    /// Whether it runs tests once compilation finishes.
+    #[must_use]
+    pub fn runs_tests(self) -> bool {
+        matches!(self, Self::Test | Self::Nextest)
     }
 
     /// The command named `name`.
@@ -46,9 +62,12 @@ impl fmt::Display for Command {
     }
 }
 
-/// Cargo options that would take the slot's target, checkout, output format
-/// or parallelism out of buildd's hands.
-const RESERVED_OPTIONS: [&str; 8] = [
+/// Cargo and nextest options that would take the slot's target, checkout,
+/// output format or parallelism out of buildd's hands.
+const RESERVED_OPTIONS: [&str; 11] = [
+    "--test-threads",
+    "--cargo-message-format",
+    "--target-dir-remap",
     "--target-dir",
     "--manifest-path",
     "--message-format",
@@ -62,7 +81,8 @@ const RESERVED_OPTIONS: [&str; 8] = [
 /// What Cargo compiles for a build: its directory, command, rustc flags and
 /// arguments, less those that only change what runs afterwards: for `test`, the
 /// positional test name, arguments after `--` (they go to the test harness),
-/// `--no-run` and `--no-fail-fast`. For
+/// `--no-run` and `--no-fail-fast`. `nextest` compiles what `test` does, so
+/// it is that compilation, less its own filters and run options. For
 /// Clippy the arguments after `--` stay: they are lint settings that change
 /// what Clippy checks. Builds of a compilation use the same compiled units,
 /// so the scheduler learns from each build what the next one needs.
@@ -77,13 +97,16 @@ pub(crate) struct Compilation {
 
 impl Compilation {
     pub(crate) fn new(prefix: &Path, operation: &Operation) -> Self {
-        let args = match operation.command {
-            Command::Test => test_compilation_args(&operation.args),
-            Command::Check | Command::Clippy | Command::Build => operation.args.clone(),
+        let (command, args) = match operation.command {
+            Command::Test => (Command::Test, test_compilation_args(&operation.args, false)),
+            Command::Nextest => (Command::Test, test_compilation_args(&operation.args, true)),
+            Command::Check | Command::Clippy | Command::Build => {
+                (operation.command, operation.args.clone())
+            }
         };
         Self {
             prefix: prefix.to_owned(),
-            command: operation.command,
+            command,
             args,
             rustflags: operation.rustflags.clone(),
         }
@@ -93,19 +116,41 @@ impl Compilation {
 /// Strip execution-only test arguments without mistaking an option's value
 /// for a test name. Unknown options keep the original selection: Cargo owns
 /// its argument language, and an uncertain reuse estimate must stay distinct.
-fn test_compilation_args(args: &[String]) -> Vec<String> {
+/// For `nextest`, its filters and run options go too, and its
+/// `--cargo-profile` is Cargo's `--profile`.
+fn test_compilation_args(args: &[String], nextest: bool) -> Vec<String> {
     let original: Vec<_> = args
         .iter()
         .take_while(|argument| *argument != "--")
         .filter(|argument| !matches!(argument.as_str(), "--no-run" | "--no-fail-fast"))
+        .filter(|argument| {
+            !(nextest && matches!(argument.as_str(), "--no-capture" | "--nocapture"))
+        })
         .cloned()
         .collect();
     let mut compiled = Vec::new();
     let mut arguments = original.iter();
     while let Some(argument) = arguments.next() {
         if !argument.starts_with('-') {
-            // Cargo's only free argument before `--` is TESTNAME.
+            // The only free arguments before `--` are test name filters.
             continue;
+        }
+        if nextest {
+            match argument.as_str() {
+                "-E" | "--filterset" | "-P" | "--profile" | "--retries" | "--max-fail"
+                | "--run-ignored" | "--partition" => {
+                    arguments.next();
+                    continue;
+                }
+                "--cargo-profile" => {
+                    compiled.push("--profile".to_owned());
+                    if let Some(value) = arguments.next() {
+                        compiled.push(value.clone());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
         }
         compiled.push(argument.clone());
         match argument.as_str() {
@@ -200,7 +245,7 @@ impl Operation {
         if self == other {
             return Some(self.clone());
         }
-        if self.command != Command::Test || other.command != Command::Test {
+        if self.command != other.command || !self.command.runs_tests() {
             return None;
         }
         let (mine, my_flag) = self.without_no_fail_fast();
@@ -254,20 +299,31 @@ impl fmt::Display for Operation {
 }
 
 /// The `cargo` process for `operation` in `directory` of a slot's checkout,
+/// its tests running on `test_jobs` threads or processes,
 /// building into the slot's `target`. It runs in its own process group so a
 /// cancellation reaches everything it started.
 pub(crate) fn command(
     directory: &Path,
     target: &Path,
     operation: &Operation,
+    test_jobs: usize,
 ) -> std::process::Command {
     use std::os::unix::process::CommandExt as _;
 
     let mut command = std::process::Command::new("cargo");
+    command.current_dir(directory);
+    match operation.command {
+        Command::Nextest => command
+            .args(["nextest", "run", "--cargo-message-format", "json"])
+            .arg(format!("--test-threads={test_jobs}")),
+        Command::Check | Command::Clippy | Command::Build | Command::Test => command
+            .arg(operation.command.as_str())
+            .arg("--message-format=json"),
+    };
+    if operation.command == Command::Test {
+        command.env("RUST_TEST_THREADS", test_jobs.to_string());
+    }
     command
-        .current_dir(directory)
-        .arg(operation.command.as_str())
-        .arg("--message-format=json")
         .args(&operation.args)
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_TERM_COLOR", "never")
@@ -450,6 +506,37 @@ mod tests {
         ] {
             assert_eq!(Line::of(forwarded), Line::Forward, "{forwarded}");
         }
+    }
+
+    #[test]
+    fn nextest_runs_are_the_compilation_of_test() {
+        let of = |command: Command, args: &[&str]| {
+            Compilation::new(
+                Path::new(""),
+                &Operation {
+                    command,
+                    ..operation(args)
+                },
+            )
+        };
+        assert_eq!(
+            of(
+                Command::Nextest,
+                &["--workspace", "-E", "test(x)", "name", "--no-capture"]
+            ),
+            of(Command::Test, &["--workspace"])
+        );
+        assert_eq!(
+            of(
+                Command::Nextest,
+                &["-p", "x", "--cargo-profile", "ci", "-P", "slow"]
+            ),
+            of(Command::Test, &["-p", "x", "--profile", "ci"])
+        );
+        assert_eq!(
+            of(Command::Nextest, &["-p", "x", "--", "--exact", "a"]),
+            of(Command::Test, &["-p", "x"])
+        );
     }
 
     #[test]

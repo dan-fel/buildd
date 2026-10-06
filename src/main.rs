@@ -16,9 +16,11 @@ mod top;
 
 const USAGE: &str = "\
 usage:
-  buildd check|clippy|build|test [OPTIONS] [CARGO ARGS...]
+  buildd check|clippy|build|test|nextest [OPTIONS] [CARGO ARGS...]
       Build the current content of this worktree, committed or not, in a
-      build slot, and print Cargo's diagnostics and test output.
+      build slot, and print Cargo's diagnostics and test output. nextest
+      runs `cargo nextest run` (installed separately): the tests `test`
+      compiles, each in its own process, test_jobs at a time.
       Options, before Cargo's arguments:
         --json             print every message from the daemon as a line of
                            JSON on standard output instead

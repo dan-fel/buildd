@@ -253,6 +253,14 @@ slot's target directory, checkout, output format or parallelism away from
 the daemon (`--target-dir`, `--manifest-path`, `--message-format`,
 `--config`, `-j`, `-Z`, ...), which are rejected.
 
+`buildd nextest [ARGS]` runs `cargo nextest run` in a slot (nextest is
+installed separately): it compiles what `buildd test` compiles, so both
+share a slot's compilation, and runs each test in a process of its own,
+`test_jobs` at a time, while the build is charged `test_jobs` jobs.
+nextest does not run doctests (run `buildd test --doc` for those) and
+reads arguments after `--` as filters and libtest flags, so test binaries
+with their own harness that take data arguments stay with `buildd test`.
+
 buildd's own options come before Cargo's arguments:
 
 - `--copy-to DIR`: after a successful build, copy the executables Cargo

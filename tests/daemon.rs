@@ -40,8 +40,10 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// A daemon with no floor of free disk: the machine's own free disk must
+    /// not decide what these tests see.
     fn start(slots: usize) -> Self {
-        Self::configured(&format!("slots = {slots}\njobs = 4\n"))
+        Self::configured(&format!("slots = {slots}\njobs = 4\nmin_free_gib = 0\n"))
     }
 
     fn configured(config: &str) -> Self {
@@ -297,6 +299,52 @@ fn executables_are_copied_out_and_rustflags_reach_the_compiler() {
 }
 
 #[test]
+fn nextest_runs_the_tests_test_compiles_and_reports_the_phase() {
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    std::fs::write(
+        repository.0.join("src/lib.rs"),
+        "pub fn answer() -> u32 {\n    42\n}\n\n#[test]\nfn answers() {\n    assert_eq!(answer(), 42);\n}\n",
+    )
+    .unwrap();
+    let compiled = daemon.build(&repository.0, Command::Test, &["--no-run"]);
+    assert!(outcome(&compiled).success(), "{compiled:#?}");
+    let run = daemon.build(&repository.0, Command::Nextest, &[]);
+    assert!(outcome(&run).success(), "{run:#?}");
+    assert!(
+        run.iter().any(|message| matches!(
+            message,
+            Message::Stderr { line } | Message::Stdout { line } if line.contains("answers")
+        )),
+        "{run:#?}"
+    );
+    assert!(
+        matches!(
+            run.last(),
+            Some(Message::Finished {
+                test_ms: Some(_),
+                ..
+            })
+        ),
+        "{run:#?}"
+    );
+    let activity = daemon.activity();
+    let started = activity
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Started { warm, .. } => Some(*warm),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        started,
+        [false, true],
+        "nextest reuses what test --no-run compiled"
+    );
+}
+
+#[test]
 fn equal_requests_share_one_cargo_run() {
     let daemon = Daemon::start(2);
     let marks = TempDir::new();
@@ -484,7 +532,8 @@ fn requests_outside_a_worktree_or_taking_over_the_slot_are_rejected() {
 #[test]
 fn a_slot_over_its_disk_limit_is_pruned_once_it_is_quiet() {
     // About 10 kB, less than any build leaves behind.
-    let daemon = Daemon::configured("slots = 1\njobs = 4\nslot_limit_gib = 0.00001\n");
+    let daemon =
+        Daemon::configured("slots = 1\njobs = 4\nslot_limit_gib = 0.00001\nmin_free_gib = 0\n");
     let repository = crate_repository(None);
     let messages = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&messages).success(), "{messages:#?}");

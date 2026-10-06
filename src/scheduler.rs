@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::cargo::{Command, Compilation, Operation};
+use crate::cargo::{Compilation, Operation};
 use crate::protocol::{
     EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild, SlotStatus,
     Usage,
@@ -658,7 +658,7 @@ impl<D: Distance> Scheduler<D> {
             return false;
         };
         compiled_at.get_or_insert_with(Instant::now);
-        operation.command == Command::Test
+        operation.command.runs_tests()
     }
 
     /// Cargo succeeded for running job `id`, whose executables are being
@@ -706,7 +706,7 @@ impl<D: Distance> Scheduler<D> {
             panic!("only running jobs exit");
         };
         let test_ms = compiled_at
-            .filter(|_| job.operation.command == Command::Test)
+            .filter(|_| job.operation.command.runs_tests())
             .map(|compiled_at| millis(compiled_at.elapsed()));
         let compilation = Compilation::of(&job);
         let entry = &mut self.slots[slot];
@@ -1255,7 +1255,7 @@ impl<D: Distance> Scheduler<D> {
                         tokens,
                         phase: if copying {
                             Phase::Copying
-                        } else if job.operation.command == Command::Test && compiled_at.is_some() {
+                        } else if job.operation.command.runs_tests() && compiled_at.is_some() {
                             Phase::Testing
                         } else {
                             Phase::Compiling
@@ -1364,6 +1364,7 @@ fn millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cargo::Command;
 
     /// Distances from a table; trees not in it are equal or 10 apart.
     #[derive(Default)]

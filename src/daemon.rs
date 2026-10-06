@@ -897,11 +897,9 @@ impl Building {
             &self.slot.source().join(&self.start.prefix),
             &self.slot.target(),
             &self.start.operation,
+            self.test_jobs,
         );
         lease.configure(&mut command);
-        if self.start.operation.command == cargo::Command::Test {
-            command.env("RUST_TEST_THREADS", self.test_jobs.to_string());
-        }
         let mut child = {
             let mut state = self.run.lock();
             state.lease = Some(lease);
