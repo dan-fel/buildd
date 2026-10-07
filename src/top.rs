@@ -682,7 +682,7 @@ mod tests {
 
     use buildd::cargo::{Command, Operation};
     use buildd::protocol::{
-        Event, Hold, LastBuild, QueuedBuild, RunningBuild, Status, Totals, Usage,
+        BuildReport, Event, Hold, LastBuild, QueuedBuild, RunningBuild, Status, Totals, Usage,
     };
     use buildd::snapshot::Revision;
     use ratatui::Terminal;
@@ -844,6 +844,7 @@ mod tests {
                             cpu_ms: 3400,
                             peak_memory: 1 << 30,
                         }),
+                        report: BuildReport::default(),
                     },
                 },
                 Event {

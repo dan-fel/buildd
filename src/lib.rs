@@ -16,6 +16,7 @@
 
 mod activity;
 mod budget;
+mod build_log;
 pub mod cargo;
 pub mod client;
 pub mod config;

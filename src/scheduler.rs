@@ -47,8 +47,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cargo::{Compilation, Operation};
 use crate::passed::PassedBinary;
 use crate::protocol::{
-    EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild, SlotStatus,
-    Usage,
+    BuildReport, EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild,
+    SlotStatus, Usage,
 };
 use crate::slot::{CompilationRun, Pruning, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
@@ -70,6 +70,12 @@ pub(crate) trait Distance {
 /// A build the scheduler tracks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct JobId(u64);
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 /// A slot the scheduler tracks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -145,6 +151,8 @@ pub(crate) struct Start {
     pub(crate) revision: Revision,
     pub(crate) operation: Operation,
     pub(crate) copy_to: Option<PathBuf>,
+    /// Who asked, for its log.
+    pub(crate) who: Vec<String>,
     /// The test binaries that passed in the slot, which a run of every test
     /// may skip; empty when it must run them all.
     pub(crate) passed: Vec<PassedBinary>,
@@ -729,6 +737,7 @@ impl<D: Distance> Scheduler<D> {
         id: JobId,
         outcome: &Outcome,
         usage: Option<Usage>,
+        report: BuildReport,
     ) -> Vec<Effect> {
         let mut job = self.jobs.remove(&id).expect("only tracked jobs run");
         let State::Running {
@@ -794,6 +803,7 @@ impl<D: Distance> Scheduler<D> {
             compiled: job.compiled,
             fresh: job.fresh,
             usage,
+            report,
         })];
         effects.push(persist);
         if entry.unmeasured >= MAINTENANCE_DUE {
@@ -1048,6 +1058,7 @@ impl<D: Distance> Scheduler<D> {
                 revision: job.revision.clone(),
                 operation: job.operation.clone(),
                 copy_to: job.copy_to.clone(),
+                who: job.who(),
                 passed: if job.operation.runs_every_test() && !job.rerun_all {
                     self.slots[slot].passed.clone()
                 } else {
@@ -1551,7 +1562,7 @@ mod tests {
         let [(job, slot, _)] = starts(&effects)[..] else {
             panic!("{tree} starts at once: {effects:?}");
         };
-        scheduler.exited(job, &ok(), None);
+        scheduler.exited(job, &ok(), None, BuildReport::default());
         slot
     }
 
@@ -1569,7 +1580,7 @@ mod tests {
         assert!(starts(&second).is_empty());
         assert!(matches!(sent(&second, 2)[..], [Message::Started { .. }, m] if *m == line));
 
-        let finished = scheduler.exited(job, &ok(), None);
+        let finished = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert!(matches!(sent(&finished, 1)[..], [Message::Finished { .. }]));
         assert!(matches!(sent(&finished, 2)[..], [Message::Finished { .. }]));
     }
@@ -1599,7 +1610,7 @@ mod tests {
             [("t1".into(), 1), ("t2".into(), 2), ("u1".into(), 1)]
         );
 
-        let next = scheduler.exited(running, &ok(), None);
+        let next = scheduler.exited(running, &ok(), None, BuildReport::default());
         assert_eq!(
             starts(&next)
                 .iter()
@@ -1694,11 +1705,11 @@ mod tests {
         };
         assert_eq!(build.operation.args, ["--no-fail-fast", "--workspace"]);
         assert_eq!(build.who.len(), 3);
-        let next = scheduler.exited(running, &ok(), None);
+        let next = scheduler.exited(running, &ok(), None, BuildReport::default());
         let [(job, ..)] = starts(&next)[..] else {
             panic!("{next:?}");
         };
-        scheduler.exited(job, &ok(), None);
+        scheduler.exited(job, &ok(), None, BuildReport::default());
         // A running fail-fast build is not joined by a request wanting more.
         let running = submit_operation(
             &mut scheduler,
@@ -1746,7 +1757,12 @@ mod tests {
         // An equal request does not join the build being stopped.
         let again = submit(&mut scheduler, 3, "/a", "t1");
         assert!(matches!(sent(&again, 3)[..], [Message::Queued { .. }]));
-        let next = scheduler.exited(job, &Outcome::Signaled { signal: 15 }, None);
+        let next = scheduler.exited(
+            job,
+            &Outcome::Signaled { signal: 15 },
+            None,
+            BuildReport::default(),
+        );
         assert!(sent(&next, 1).is_empty());
         assert_eq!(starts(&next).len(), 1);
         assert!(scheduler.withdraw(WaiterId(1)).is_empty());
@@ -1764,8 +1780,8 @@ mod tests {
         let [(job_b, 1, _)] = starts(&b)[..] else {
             panic!("{b:?}")
         };
-        scheduler.exited(job_a, &ok(), None);
-        scheduler.exited(job_b, &ok(), None);
+        scheduler.exited(job_a, &ok(), None, BuildReport::default());
+        scheduler.exited(job_b, &ok(), None, BuildReport::default());
 
         // A worktree's next tree is closest to its previous one.
         scheduler.distance.0.insert(("b1".into(), "b2".into()), 1);
@@ -1801,7 +1817,7 @@ mod tests {
             panic!("{first:?}");
         };
         let ended = Instant::now();
-        assert!(maintains(&scheduler.exited(job, &ok(), None)).is_empty());
+        assert!(maintains(&scheduler.exited(job, &ok(), None, BuildReport::default())).is_empty());
         let due = scheduler.next_maintenance().expect("the slot is due");
         assert!(due >= ended + MAINTENANCE_QUIET);
         assert!(scheduler.maintenance_due(ended).is_empty());
@@ -1843,13 +1859,18 @@ mod tests {
             let [(job, ..)] = starts(&effects)[..] else {
                 panic!("{effects:?}");
             };
-            assert!(maintains(&scheduler.exited(job, &ok(), None)).is_empty());
+            assert!(
+                maintains(&scheduler.exited(job, &ok(), None, BuildReport::default())).is_empty()
+            );
         }
         let last = submit(&mut scheduler, 99, "/a", "last");
         let [(job, ..)] = starts(&last)[..] else {
             panic!("{last:?}");
         };
-        assert_eq!(maintains(&scheduler.exited(job, &ok(), None)), [0]);
+        assert_eq!(
+            maintains(&scheduler.exited(job, &ok(), None, BuildReport::default())),
+            [0]
+        );
     }
 
     /// Two slots: slot 0 did `check` at tree a1, slot 1 did `test` at b1.
@@ -1881,8 +1902,8 @@ mod tests {
         };
         used(&mut scheduler, job_a, &units("c", 12));
         used(&mut scheduler, job_b, &units("t", 12));
-        scheduler.exited(job_a, &ok(), None);
-        scheduler.exited(job_b, &ok(), None);
+        scheduler.exited(job_a, &ok(), None, BuildReport::default());
+        scheduler.exited(job_b, &ok(), None, BuildReport::default());
         scheduler
     }
 
@@ -1952,7 +1973,7 @@ mod tests {
         ));
         let (_, queue) = scheduler.status(|_| 0);
         assert!(queue[0].held.is_some());
-        let next = scheduler.exited(job, &ok(), None);
+        let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert!(matches!(starts(&next)[..], [(_, 1, _)]), "{next:?}");
     }
 
@@ -1985,7 +2006,7 @@ mod tests {
                 (Command::Test, Some(600_000))
             ]
         );
-        let next = scheduler.exited(running[0], &ok(), None);
+        let next = scheduler.exited(running[0], &ok(), None, BuildReport::default());
         assert!(
             matches!(&starts(&next)[..], [(_, _, tree)] if tree == "c1"),
             "{next:?}"
@@ -2010,7 +2031,7 @@ mod tests {
         let (_, queue) = scheduler.status(|_| 0);
         assert_eq!(queue[0].memory_needed, Some(8), "{queue:?}");
         assert_eq!(scheduler.memory(), (10, 4));
-        let next = scheduler.exited(job, &ok(), None);
+        let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert_eq!(starts(&next).len(), 1, "the test runs alone: {next:?}");
     }
 
@@ -2055,7 +2076,7 @@ mod tests {
                 panic!("{effects:?}");
             };
             used(&mut scheduler, job, units);
-            scheduler.exited(job, &Outcome::Exited { code }, None);
+            scheduler.exited(job, &Outcome::Exited { code }, None, BuildReport::default());
             scheduler.slots[0].compilations[0].units.len()
         };
         let all = units("u", 6);
@@ -2097,7 +2118,7 @@ mod tests {
         };
         assert!(starts(&second).is_empty());
         let first = Compilation::of(&scheduler.jobs[&job]);
-        let next = scheduler.exited(job, &ok(), None);
+        let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         let [(next, ..)] = starts(&next)[..] else {
             panic!("{next:?}")
         };
@@ -2155,7 +2176,7 @@ mod tests {
             cpu_ms: 1200,
             peak_memory: 1 << 20,
         };
-        let finished = scheduler.exited(job, &ok(), Some(usage));
+        let finished = scheduler.exited(job, &ok(), Some(usage), BuildReport::default());
         assert!(matches!(
             reports(&finished)[..],
             [
@@ -2183,7 +2204,7 @@ mod tests {
             Phase::Testing
         );
         std::thread::sleep(Duration::from_millis(20));
-        let finished = scheduler.exited(job, &ok(), None);
+        let finished = scheduler.exited(job, &ok(), None, BuildReport::default());
         let [
             Message::Finished {
                 test_ms: Some(test_ms),
@@ -2210,7 +2231,7 @@ mod tests {
             panic!("{effects:?}");
         };
         scheduler.compiled(job);
-        let finished = scheduler.exited(job, &ok(), None);
+        let finished = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert!(matches!(
             sent(&finished, 2)[..],
             [Message::Finished { test_ms: None, .. }]
@@ -2235,7 +2256,7 @@ mod tests {
             panic!("{first:?}");
         };
         used(&mut scheduler, job, &units("a", 3));
-        let finished = scheduler.exited(job, &ok(), None);
+        let finished = scheduler.exited(job, &ok(), None, BuildReport::default());
         let [(0, record)] = persisted(&finished)[..] else {
             panic!("{finished:?}");
         };
@@ -2328,7 +2349,7 @@ mod tests {
         };
         scheduler.crate_built(job, true, Some("debug/aaaaaaaaaaaaaaaa".into()));
         scheduler.unit_used(job, "debug/bbbbbbbbbbbbbbbb".into());
-        let finished = scheduler.exited(job, &ok(), None);
+        let finished = scheduler.exited(job, &ok(), None, BuildReport::default());
         let [(0, record)] = persisted(&finished)[..] else {
             panic!("{finished:?}");
         };

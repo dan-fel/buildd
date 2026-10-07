@@ -128,6 +128,33 @@ impl Message {
     }
 }
 
+/// What a build left for later: the log of its whole output, and what that
+/// output said about its tests and errors.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuildReport {
+    /// Its log's file name in the daemon's `logs` directory, when one was
+    /// written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    /// The tests that failed: nextest's `binary test`, or libtest's test
+    /// path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_tests: Vec<String>,
+    /// The slowest tests nextest timed, slowest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slowest_tests: Vec<TestTime>,
+    /// The first errors the compiler or Cargo reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+/// How long a test took.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestTime {
+    pub test: String,
+    pub ms: u64,
+}
+
 /// How a build ended.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -422,6 +449,8 @@ pub enum EventKind {
         fresh: u64,
         /// What Cargo and its compilers used, when it ran.
         usage: Option<Usage>,
+        #[serde(default)]
+        report: BuildReport,
     },
     /// A queued build nobody waited for any more was dropped.
     Dropped {

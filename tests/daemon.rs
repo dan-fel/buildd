@@ -346,6 +346,60 @@ fn nextest_runs_the_tests_test_compiles_and_reports_the_phase() {
     );
 }
 
+#[test]
+fn every_build_leaves_a_log_and_reports_its_errors_and_failed_tests() {
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    let reports = || {
+        daemon
+            .activity()
+            .events
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Finished { report, .. } => Some(report),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    std::fs::write(
+        repository.0.join("src/lib.rs"),
+        "pub fn answer() -> u32 {\n    \"forty-two\"\n}\n",
+    )
+    .unwrap();
+    daemon.build(&repository.0, Command::Check, &[]);
+    let broken = reports().pop().unwrap();
+    assert_eq!(
+        broken.errors.first().map(String::as_str),
+        Some("mismatched types (src/lib.rs:2)"),
+        "{broken:#?}"
+    );
+    let log = std::fs::read_to_string(
+        daemon
+            .home
+            .0
+            .join("logs")
+            .join(broken.log.as_deref().unwrap()),
+    )
+    .unwrap();
+    assert!(log.starts_with("# buildd check for "), "{log}");
+    assert!(log.contains("error[E0308]: mismatched types"), "{log}");
+
+    std::fs::write(
+        repository.0.join("src/lib.rs"),
+        "pub fn answer() -> u32 {\n    42\n}\n\n#[test]\nfn answers() {\n    assert_eq!(answer(), 41);\n}\n",
+    )
+    .unwrap();
+    daemon.build(&repository.0, Command::Test, &[]);
+    daemon.build(&repository.0, Command::Nextest, &[]);
+    let reports = reports();
+    let [.., test, nextest] = reports.as_slice() else {
+        panic!("three builds: {reports:#?}");
+    };
+    assert_eq!(test.failed_tests, ["answers"], "{test:#?}");
+    assert_eq!(nextest.failed_tests, ["fixture answers"], "{nextest:#?}");
+    assert_eq!(nextest.slowest_tests[0].test, "fixture answers");
+}
+
 /// A committed workspace of two independent packages, `a` and `b`, each
 /// with a unit test.
 fn two_package_workspace() -> TempDir {

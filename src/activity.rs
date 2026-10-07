@@ -247,7 +247,7 @@ fn epoch_millis(time: SystemTime) -> u64 {
 mod tests {
     use super::*;
     use crate::cargo::{Command, Operation};
-    use crate::protocol::{Outcome, Usage};
+    use crate::protocol::{BuildReport, Outcome, Usage};
     use crate::snapshot::Revision;
     use crate::snapshot::tests::TempDir;
 
@@ -309,6 +309,7 @@ mod tests {
                     cpu_ms: 1500,
                     peak_memory: 1,
                 }),
+                report: BuildReport::default(),
             },
         );
         let totals = log.activity(empty_status()).totals;
@@ -364,6 +365,7 @@ mod tests {
                     compiled: 0,
                     fresh: 0,
                     usage: None,
+                    report: BuildReport::default(),
                 },
             )
         };

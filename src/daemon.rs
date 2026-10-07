@@ -17,6 +17,7 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use crate::activity::{ActivityLog, EventFile};
 use crate::budget::{Budget, Lease};
+use crate::build_log::{self, BuildLog};
 use crate::cargo;
 use crate::cargo::Line;
 use crate::cargo::{Compilation, Operation};
@@ -28,8 +29,8 @@ use crate::memory;
 use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
-    Activity, BuildRequest, EventKind, Message, Mirror, Outcome, RemoteActivity, Request,
-    RevisionRequest, Status, Usage,
+    Activity, BuildReport, BuildRequest, EventKind, Message, Mirror, Outcome, RemoteActivity,
+    Request, RevisionRequest, Status, Usage,
 };
 use crate::remote;
 use crate::scheduler::{Effect, IdleSlot, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
@@ -97,11 +98,12 @@ enum Event {
         passed: Vec<PassedBinary>,
         skipped: u64,
     },
-    /// Cargo ended, having used `usage` when it ran.
+    /// Cargo ended, having used `usage` when it ran and left `report`.
     Exited {
         job: JobId,
         outcome: Outcome,
         usage: Option<Usage>,
+        report: BuildReport,
     },
     /// Idle slots gave up what builds used longest ago to free the `needed`
     /// bytes free disk lacked below the floor; each did what its result says.
@@ -757,9 +759,10 @@ impl Daemon {
                     job,
                     outcome,
                     usage,
+                    report,
                 } => {
                     self.runs.remove(&job);
-                    let effects = self.scheduler.exited(job, &outcome, usage);
+                    let effects = self.scheduler.exited(job, &outcome, usage, report);
                     for effect in effects {
                         self.apply(effect);
                     }
@@ -896,9 +899,13 @@ impl Daemon {
                     .distance_mut()
                     .workspace(&start.repository)
                     .cloned();
+                let logs = self.home.join("logs");
+                let log = BuildLog::create(&logs, log_name(start.job), &log_header(&start));
                 let building = Building {
                     slot: SlotDirectory::new(&self.home, &start.repository, start.slot),
                     start,
+                    log: Arc::new(Mutex::new(Some(log))),
+                    logs,
                     budget: self.budget.clone(),
                     test_jobs: self.config.test_jobs,
                     workspace,
@@ -917,6 +924,7 @@ impl Daemon {
                         job,
                         outcome,
                         usage: None,
+                        report: BuildReport::default(),
                     });
                 }
             }
@@ -1172,9 +1180,35 @@ fn maintain(
     }
 }
 
+/// A new build log's name: when the build started, then its job, so names
+/// sort by age.
+fn log_name(job: JobId) -> String {
+    let started = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_millis();
+    format!("{started}-{job}.log")
+}
+
+fn log_header(start: &Start) -> String {
+    format!(
+        "# buildd {} for {}\n# tree {} in slot {}, directory ./{}\n# started {}\n",
+        start.operation,
+        start.who.join(", "),
+        start.revision,
+        slot_name(&start.repository, start.slot),
+        start.prefix.display(),
+        crate::log::local_time(SystemTime::now()),
+    )
+}
+
 /// A build on its own thread.
 struct Building {
     start: Start,
+    /// Its log until the build ends; output read after that is not logged.
+    log: Arc<Mutex<Option<BuildLog>>>,
+    /// Where build logs are kept.
+    logs: PathBuf,
     slot: SlotDirectory,
     budget: Budget,
     /// Threads a test build's tests run on.
@@ -1189,10 +1223,22 @@ struct Building {
 impl Building {
     fn build(self) {
         let (outcome, usage) = self.outcome();
+        let log = self
+            .log
+            .lock()
+            .expect("no thread panics holding a build's log")
+            .take();
+        let mut log = log.expect("a build's log ends once, here");
+        if let Outcome::Failed { reason } = &outcome {
+            log.stderr(&format!("buildd: {reason}"));
+        }
+        let report = log.finish();
+        build_log::prune(&self.logs, build_log::LOG_LIMIT);
         let _ = self.events.send(Event::Exited {
             job: self.start.job,
             outcome,
             usage,
+            report,
         });
     }
 
@@ -1309,6 +1355,7 @@ impl Building {
 
     /// Tells the build's waiters `line`, as standard error.
     fn tell(&self, line: String) {
+        log_line(&self.log, &line, BuildLog::stderr);
         let _ = self.events.send(Event::Output {
             job: self.start.job,
             message: Message::Stderr { line },
@@ -1436,6 +1483,7 @@ impl Building {
     ) {
         let events = self.events.clone();
         let job = self.start.job;
+        let log = Arc::clone(&self.log);
         let spawned = std::thread::Builder::new()
             .name("buildd-output".into())
             .spawn(move || {
@@ -1451,10 +1499,13 @@ impl Building {
                         message: Message::Stdout { line },
                     };
                     let reported = match &target {
-                        None => vec![Event::Output {
-                            job,
-                            message: Message::Stderr { line },
-                        }],
+                        None => {
+                            log_line(&log, &line, BuildLog::stderr);
+                            vec![Event::Output {
+                                job,
+                                message: Message::Stderr { line },
+                            }]
+                        }
                         Some((target, products)) => match Line::of(&line) {
                             Line::Crate {
                                 fresh,
@@ -1478,8 +1529,14 @@ impl Building {
                                 .map(|unit| Event::BuildScript { job, unit })
                                 .into_iter()
                                 .collect(),
-                            Line::BuildFinished => vec![Event::Compiled { job }, stdout(line)],
-                            Line::Forward => vec![stdout(line)],
+                            Line::BuildFinished => {
+                                log_line(&log, &line, BuildLog::stdout);
+                                vec![Event::Compiled { job }, stdout(line)]
+                            }
+                            Line::Forward => {
+                                log_line(&log, &line, BuildLog::stdout);
+                                vec![stdout(line)]
+                            }
                         },
                     };
                     if reported
@@ -1494,6 +1551,17 @@ impl Building {
         if let Err(error) = spawned {
             log!("could not read a build's output: {error}");
         }
+    }
+}
+
+/// Adds `line` to a build's `log` as `stream` while the build runs.
+fn log_line(log: &Mutex<Option<BuildLog>>, line: &str, stream: fn(&mut BuildLog, &str)) {
+    if let Some(log) = log
+        .lock()
+        .expect("no thread panics holding a build's log")
+        .as_mut()
+    {
+        stream(log, line);
     }
 }
 
