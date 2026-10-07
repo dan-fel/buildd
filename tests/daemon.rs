@@ -398,6 +398,11 @@ fn every_build_leaves_a_log_and_reports_its_errors_and_failed_tests() {
     assert_eq!(test.failed_tests, ["answers"], "{test:#?}");
     assert_eq!(nextest.failed_tests, ["fixture answers"], "{nextest:#?}");
     assert_eq!(nextest.slowest_tests[0].test, "fixture answers");
+
+    let failures = buildd::client::failures(daemon.connect(), 1, None).unwrap();
+    assert_eq!((failures.builds, failures.failed), (3, 3), "{failures:#?}");
+    assert_eq!(failures.recent[0].report.failed_tests, ["fixture answers"]);
+    assert_eq!(failures.logs, daemon.home.0.join("logs"));
 }
 
 /// A committed workspace of two independent packages, `a` and `b`, each

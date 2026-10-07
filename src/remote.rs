@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::config::Remote;
 use crate::git;
-use crate::protocol::{Activity, Message, Mirror, Request, RevisionRequest};
+use crate::protocol::{Activity, Failures, Message, Mirror, Request, RevisionRequest};
 use crate::snapshot::{Revision, Source};
 
 /// Which of the two SSH connections to a host a session goes over: builds
@@ -117,6 +117,16 @@ fn failure(child: &mut Child, remote: &Remote, line: &str) -> String {
 /// What `remote`'s daemon is doing.
 pub(crate) fn activity(home: &Path, remote: &Remote) -> Result<Activity, String> {
     ask(home, remote, Connection::Status, &Request::Activity)
+}
+
+/// The builds that failed on `remote` in the last `hours`.
+pub(crate) fn failures(home: &Path, remote: &Remote, hours: u64) -> Result<Failures, String> {
+    ask::<Result<Failures, String>>(
+        home,
+        remote,
+        Connection::Status,
+        &Request::Failures { hours, os: None },
+    )?
 }
 
 /// Pushes tree `revision` of `source`'s repository into `remote`'s mirror

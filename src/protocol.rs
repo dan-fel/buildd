@@ -35,6 +35,71 @@ pub enum Request {
     /// Describe the slots and the queue, what the daemon did since it
     /// started, and its recent events.
     Activity,
+    /// Sum up the builds that failed in the last `hours`, from the event
+    /// file: on the remote host for `os` when that is not this machine's.
+    /// Answered with one [`Failures`].
+    Failures {
+        hours: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        os: Option<String>,
+    },
+}
+
+/// The builds that failed since `since_ms`, summed up to find what keeps
+/// failing: tests, errors, and code whose outcome changed between runs.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Failures {
+    pub since_ms: u64,
+    /// Where the daemon keeps build logs.
+    pub logs: PathBuf,
+    pub builds: u64,
+    pub failed: u64,
+    /// The latest failed builds, newest first.
+    pub recent: Vec<FailedBuild>,
+    /// Tests by how many builds they failed in, most first.
+    pub tests: Vec<FailingTest>,
+    /// Errors by how many builds reported them, most first; without the
+    /// file and line they point at.
+    pub errors: Vec<CommonError>,
+    /// The same tree and command, built more than once, passing one time and
+    /// failing another: flaky tests, or trouble outside the code.
+    pub mixed: Vec<MixedOutcome>,
+    /// The slowest tests, by their latest time, slowest first.
+    pub slowest: Vec<TestTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FailedBuild {
+    pub at_ms: u64,
+    pub who: Vec<String>,
+    pub operation: Operation,
+    pub revision: Revision,
+    pub outcome: Outcome,
+    pub report: BuildReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FailingTest {
+    pub test: String,
+    /// Builds it failed in.
+    pub failures: u64,
+    /// Distinct trees among them.
+    pub trees: u64,
+    pub who: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommonError {
+    pub error: String,
+    pub builds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MixedOutcome {
+    pub revision: Revision,
+    pub operation: Operation,
+    pub passed: u64,
+    pub failed: u64,
 }
 
 /// A build of a worktree's current content.

@@ -27,6 +27,7 @@ buildd nextest --workspace            # every test in its own process
 buildd test --os linux --workspace    # on a remote Linux host
 buildd status                         # one-shot summary
 buildd top                            # live view; q quits
+buildd failures                       # what failed lately, and why
 ```
 
 Set `BUILDD_LABEL` (an agent's or task's name) so `status` and `top` show
@@ -161,6 +162,26 @@ buildd nextest --workspace
   see changes to them. Keep such data in the test's own package or outside
   every package.
 
+## Logs and failures
+
+```text
+every build ──▶ logs/<started ms>-<job>.log    whole output, compiler-rendered
+            └─▶ finished event in events.jsonl
+                  report: log name · failed tests · 10 slowest tests · first errors
+
+buildd failures [--hours 24] [--os linux]
+  recent failures     who, command, exit, failed tests, first error, log
+  tests failing most  in how many builds and trees, by whom
+  passed and failed   same tree + command → flaky test, or trouble outside the code
+  errors most often   grouped without file:line
+  slowest tests       by their latest time
+```
+
+- Logs stay within 2 GiB in all, oldest removed first.
+- Failed tests come from nextest's status lines and libtest's `... FAILED`;
+  test times only from nextest.
+- `--os linux` asks the remote host's daemon, whose logs stay on that host.
+
 ## Remote hosts
 
 ```text
@@ -244,6 +265,7 @@ config.toml          slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
 sock                 the daemon's socket
 daemon.log           output of a daemon a client started
 events.jsonl         every event as JSON (rotates to .1 at 10 MB)
+logs/                every build's output (see Logs and failures)
 slots/               see Slots
 mirrors/<project>    repositories remote machines push into
 ssh-<hash>           SSH connection for builds  ┐ kept open
@@ -276,7 +298,7 @@ bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
 
 One JSON object per line over the Unix socket (`src/protocol.rs`): `build`
 streams a build, `status` describes slots and queue, `activity` adds what
-`top` shows. Programs integrate through the library's `client` module.
+`top` shows, `failures` sums up what failed. Programs integrate through the library's `client` module.
 
 ## Not yet
 

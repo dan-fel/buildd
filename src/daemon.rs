@@ -23,14 +23,15 @@ use crate::cargo::Line;
 use crate::cargo::{Compilation, Operation};
 use crate::config::{self, Config, Remote};
 use crate::distance::{GitDistance, Workspace};
+use crate::failures;
 use crate::git;
 use crate::log::log;
 use crate::memory;
 use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
-    Activity, BuildReport, BuildRequest, EventKind, Message, Mirror, Outcome, RemoteActivity,
-    Request, RevisionRequest, Status, Usage,
+    Activity, BuildReport, BuildRequest, EventKind, Failures, Message, Mirror, Outcome,
+    RemoteActivity, Request, RevisionRequest, Status, Usage,
 };
 use crate::remote;
 use crate::scheduler::{Effect, IdleSlot, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
@@ -307,6 +308,15 @@ impl Connection {
                     let _ = write_line(&mut stream, &activity);
                 }
             }
+            Ok(Request::Failures { hours, os }) => {
+                let failures = match os {
+                    Some(os) if os != std::env::consts::OS => self
+                        .remote_for(&os)
+                        .and_then(|remote| remote::failures(&self.home, remote, hours)),
+                    _ => Ok(self.failures(hours)),
+                };
+                let _ = write_line(&mut stream, &failures);
+            }
             Ok(Request::Drain { drain }) => {
                 let (reply, status) = crossbeam_channel::bounded(1);
                 if self.events.send(Event::Drain { drain, reply }).is_ok()
@@ -331,6 +341,30 @@ impl Connection {
             },
             Ok(Request::BuildRevision(request)) => self.build_revision(stream, reader, request),
         }
+    }
+
+    /// The remote host that builds for `os`.
+    fn remote_for(&self, os: &str) -> Result<&Remote, String> {
+        self.remotes
+            .iter()
+            .find(|remote| remote.os == os)
+            .ok_or_else(|| format!("no remote host builds for {os}; see [[remote]] in config.toml"))
+    }
+
+    /// The builds that failed here in the last `hours`, from the event file.
+    fn failures(&self, hours: u64) -> Failures {
+        let since = SystemTime::now()
+            .checked_sub(Duration::from_secs(hours.saturating_mul(3600)))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let since_ms = since
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_millis();
+        failures::summarize(
+            &EventFile::new(&self.home).read(),
+            u64::try_from(since_ms).expect("milliseconds since 1970 fit u64"),
+            self.home.join("logs"),
+        )
     }
 
     /// What each remote host's daemon does, asked in parallel.
@@ -420,13 +454,7 @@ impl Connection {
     ) {
         let os = request.os.clone().expect("only builds for an OS go remote");
         let prepared = request.operation.validate().and_then(|()| {
-            let remote = self
-                .remotes
-                .iter()
-                .find(|remote| remote.os == os)
-                .ok_or_else(|| {
-                    format!("no remote host builds for {os}; see [[remote]] in config.toml")
-                })?;
+            let remote = self.remote_for(&os)?;
             if request.copy_to.is_some() {
                 return Err("--copy-to builds on this machine only".into());
             }

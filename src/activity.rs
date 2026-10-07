@@ -87,6 +87,20 @@ impl EventFile {
         }
     }
 
+    /// Every event in the file and the one before it, oldest first. A line
+    /// that is not an event, such as one cut short by a crash, is left out.
+    pub(crate) fn read(&self) -> Vec<Event> {
+        [self.path.with_extension("jsonl.1"), self.path.clone()]
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn append(&self, event: &Event) {
         let mut line = serde_json::to_string(event).expect("events serialize");
         line.push('\n');

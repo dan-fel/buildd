@@ -8,7 +8,7 @@ use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use buildd::cargo::{Command, Operation};
-use buildd::protocol::{BuildRequest, Message, Outcome, Status};
+use buildd::protocol::{BuildRequest, Failures, Message, Outcome, Status};
 use buildd::{client, config};
 use serde::Deserialize;
 
@@ -34,6 +34,11 @@ usage:
                            config.toml names for it when it is not this one
   buildd status
       Show the build slots and the queue.
+  buildd failures [--hours N] [--os OS]
+      Sum up the builds that failed in the last N hours (24): the latest,
+      the tests and errors that fail most often, trees whose outcome
+      changed between runs (flaky tests), the slowest tests, and where each
+      build's log is. With --os, on the remote host for OS.
   buildd drain | undrain
       Stop taking new builds, letting running and queued ones end (to keep
       the machine quiet, as for a benchmark), or take them again.
@@ -58,7 +63,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let command = match name.as_str() {
-        "daemon" | "status" | "top" | "drain" | "undrain" | "serve" => None,
+        "daemon" | "status" | "top" | "drain" | "undrain" | "serve" | "failures" => None,
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -82,6 +87,7 @@ fn main() -> ExitCode {
             status(&home)
         }
         None if name == "serve" => serve(&home),
+        None if name == "failures" => failures(&home, args.collect()),
         None => status(&home),
     });
     result.unwrap_or_else(|message| {
@@ -277,6 +283,129 @@ fn render(message: &Message) {
         }
         Message::Rejected { reason } => eprintln!("buildd: {reason}"),
     }
+}
+
+fn failures(home: &Path, args: Vec<String>) -> Result<ExitCode, String> {
+    let mut hours = 24;
+    let mut os = None;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        let mut value = || {
+            args.next()
+                .ok_or_else(|| format!("{argument} needs a value"))
+        };
+        match argument.as_str() {
+            "--hours" => {
+                hours = value()?
+                    .parse()
+                    .map_err(|_| "--hours takes a whole number".to_owned())?;
+            }
+            "--os" => os = Some(value()?),
+            other => return Err(format!("unknown option `{other}`\n{USAGE}")),
+        }
+    }
+    let summary = client::failures(connect(home)?, hours, os)?;
+    print!("{}", render_failures(&summary, hours));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn render_failures(summary: &Failures, hours: u64) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "last {hours} h: {} of {} builds failed · logs in {}",
+        summary.failed,
+        summary.builds,
+        summary.logs.display()
+    );
+    if !summary.recent.is_empty() {
+        let _ = writeln!(out, "\nrecent failures, newest first");
+    }
+    for build in &summary.recent {
+        let at =
+            buildd::log::local_time(std::time::UNIX_EPOCH + Duration::from_millis(build.at_ms));
+        let outcome = match &build.outcome {
+            Outcome::Exited { code } => format!("exit {code}"),
+            Outcome::Signaled { signal } => format!("signal {signal}"),
+            Outcome::Failed { reason } => format!("buildd: {reason}"),
+        };
+        let _ = writeln!(
+            out,
+            "  {}  {} for {}  {outcome}  tree {}",
+            &at[5..16],
+            build.operation,
+            build.who.join(", "),
+            build.revision.short(),
+        );
+        let failed = &build.report.failed_tests;
+        if !failed.is_empty() {
+            let shown = failed
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = failed.len().saturating_sub(3);
+            let more = if more > 0 {
+                format!(" (+{more})")
+            } else {
+                String::new()
+            };
+            let _ = writeln!(out, "               failed: {shown}{more}");
+        }
+        if let Some(error) = build.report.errors.first() {
+            let _ = writeln!(out, "               error: {error}");
+        }
+        if let Some(log) = &build.report.log {
+            let _ = writeln!(out, "               log: {log}");
+        }
+    }
+    if !summary.tests.is_empty() {
+        let _ = writeln!(out, "\ntests failing most often");
+    }
+    for test in &summary.tests {
+        let _ = writeln!(
+            out,
+            "  {:>3} builds {:>3} trees  {}  ({})",
+            test.failures,
+            test.trees,
+            test.test,
+            test.who.join(", ")
+        );
+    }
+    if !summary.mixed.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nsame tree and command, passed and failed (flaky, or trouble outside the code)"
+        );
+    }
+    for mixed in &summary.mixed {
+        let _ = writeln!(
+            out,
+            "  tree {}  {}  {} passed, {} failed",
+            mixed.revision.short(),
+            mixed.operation,
+            mixed.passed,
+            mixed.failed
+        );
+    }
+    if !summary.errors.is_empty() {
+        let _ = writeln!(out, "\nerrors reported most often");
+    }
+    for error in &summary.errors {
+        let _ = writeln!(out, "  {:>3} builds  {}", error.builds, error.error);
+    }
+    if !summary.slowest.is_empty() {
+        let _ = writeln!(out, "\nslowest tests");
+    }
+    for test in &summary.slowest {
+        #[expect(clippy::cast_precision_loss, reason = "a duration for people")]
+        let seconds = test.ms as f64 / 1000.0;
+        let _ = writeln!(out, "  {seconds:>7.1} s  {}", test.test);
+    }
+    out
 }
 
 fn status(home: &Path) -> Result<ExitCode, String> {

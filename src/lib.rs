@@ -22,6 +22,7 @@ pub mod client;
 pub mod config;
 pub mod daemon;
 mod distance;
+mod failures;
 mod git;
 pub mod log;
 mod memory;
