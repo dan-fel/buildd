@@ -986,6 +986,10 @@ impl<D: Distance> Scheduler<D> {
     fn start_ready(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         let mut in_use = self.memory_in_use();
+        // What the builds held for each busy slot in this pass are expected
+        // to take there: a later build waiting for that slot waits for them
+        // too.
+        let mut claimed = HashMap::<usize, u64>::new();
         for id in self.queue_order() {
             if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
                 break;
@@ -998,13 +1002,15 @@ impl<D: Distance> Scheduler<D> {
                 self.jobs.get_mut(&id).expect("queued above").memory_needed = Some(memory);
                 break;
             }
-            let (slot, warm) = match self.choose_slot(id) {
+            let (slot, warm) = match self.choose_slot(id, &claimed) {
                 Placement::Start { slot, warm } => (slot, warm),
                 Placement::Wait => {
                     self.jobs.get_mut(&id).expect("queued above").hold = None;
                     continue;
                 }
-                Placement::Hold(hold) => {
+                Placement::Hold { hold, slot } => {
+                    let expected = self.estimate(&self.jobs[&id]).unwrap_or(0);
+                    *claimed.entry(slot).or_default() += expected;
                     let job = self.jobs.get_mut(&id).expect("queued above");
                     if job.hold.is_none() {
                         effects.push(Effect::Report(EventKind::Held {
@@ -1156,7 +1162,9 @@ impl<D: Distance> Scheduler<D> {
 
     /// The slot queued job `id` runs in now, as the module explains, and
     /// whether that slot holds everything the build needs; or why it waits.
-    fn choose_slot(&mut self, id: JobId) -> Placement {
+    /// `claimed` is what builds already held for each busy slot are expected
+    /// to take there.
+    fn choose_slot(&mut self, id: JobId, claimed: &HashMap<usize, u64>) -> Placement {
         let job = &self.jobs[&id];
         let repository = job.repository.clone();
         let revision = job.revision.clone();
@@ -1187,8 +1195,8 @@ impl<D: Distance> Scheduler<D> {
             // Owned: weighing busy slots measures distances, which need the
             // scheduler mutably.
             let needed = needed.into_iter().map(str::to_owned).collect();
-            return match self.hold(id, &needed, work) {
-                Some(hold) => Placement::Hold(hold),
+            return match self.hold(id, &needed, work, claimed) {
+                Some((hold, slot)) => Placement::Hold { hold, slot },
                 None => Placement::Start { slot: index, warm },
             };
         }
@@ -1230,16 +1238,23 @@ impl<D: Distance> Scheduler<D> {
     }
 
     /// Whether queued job `id`, whose best idle slot leaves `work` units to
-    /// compile, should wait for a busy slot of its repository instead: the
-    /// busy slot's build is expected to end, and the job to build there,
-    /// sooner than the idle slot would compile its share cold. Without
-    /// estimates it never waits.
-    fn hold(&mut self, id: JobId, needed: &HashSet<String>, work: u64) -> Option<Hold> {
+    /// compile, should wait for a busy slot of its repository instead, and
+    /// for which: the busy slot's build, and the builds already held for it
+    /// (`claimed`), are expected to end and the job to build there sooner
+    /// than the idle slot would compile its share cold. Without estimates it
+    /// never waits.
+    fn hold(
+        &mut self,
+        id: JobId,
+        needed: &HashSet<String>,
+        work: u64,
+        claimed: &HashMap<usize, u64>,
+    ) -> Option<(Hold, usize)> {
         let job = &self.jobs[&id];
         let unit_ms = *self.unit_ms.get(&job.repository)?;
         let cold_ms = work.saturating_mul(unit_ms);
-        let mut best: Option<Hold> = None;
-        for slot in &self.slots {
+        let mut best: Option<(Hold, usize)> = None;
+        for (index, slot) in self.slots.iter().enumerate() {
             let Some(running) = slot.job.filter(|_| slot.repository == job.repository) else {
                 continue;
             };
@@ -1264,13 +1279,15 @@ impl<D: Distance> Scheduler<D> {
                     .distance(&job.repository, &running.revision, &job.revision);
             let wait_ms = expected
                 .saturating_sub(elapsed)
+                .saturating_add(claimed.get(&index).copied().unwrap_or(0))
                 .saturating_add(missing.saturating_add(distance).saturating_mul(unit_ms));
-            if wait_ms < cold_ms && best.as_ref().is_none_or(|best| wait_ms < best.wait_ms) {
-                best = Some(Hold {
+            if wait_ms < cold_ms && best.as_ref().is_none_or(|(best, _)| wait_ms < best.wait_ms) {
+                let hold = Hold {
                     slot: slot_name(&slot.repository, slot.index),
                     wait_ms,
                     cold_ms,
-                });
+                };
+                best = Some((hold, index));
             }
         }
         best
@@ -1354,8 +1371,11 @@ enum Placement {
     },
     /// No slot is free for it.
     Wait,
-    /// It waits for a busy slot although one is idle.
-    Hold(Hold),
+    /// It waits for busy slot `slot` although one is idle.
+    Hold {
+        hold: Hold,
+        slot: usize,
+    },
 }
 
 /// The average wall time of `runs` that succeeded, if any did.
@@ -1973,6 +1993,26 @@ mod tests {
         ));
         let (_, queue) = scheduler.status(|_| 0);
         assert!(queue[0].held.is_some());
+        // A second build waits behind the first held one too: about 5 s more
+        // there, still sooner than 22 s cold.
+        let second = submit_operation(&mut scheduler, 5, "/d", "d1", Command::Test, &[]);
+        assert!(starts(&second).is_empty(), "{second:?}");
+        assert!(matches!(
+            reports(&second)[..],
+            [
+                _,
+                EventKind::Held {
+                    hold: Hold {
+                        wait_ms: 19_000..=20_000,
+                        ..
+                    },
+                    ..
+                }
+            ]
+        ));
+        // A third would wait about 25 s there: the idle slot is sooner.
+        let third = submit_operation(&mut scheduler, 6, "/e", "e1", Command::Test, &[]);
+        assert!(matches!(starts(&third)[..], [(_, 0, _)]), "{third:?}");
         let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert!(matches!(starts(&next)[..], [(_, 1, _)]), "{next:?}");
     }
