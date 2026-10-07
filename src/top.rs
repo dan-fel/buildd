@@ -219,16 +219,32 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         totals,
     );
 
-    let event_lines = activity
+    // This daemon's events and each reachable remote host's, newest first;
+    // a remote host's are marked with its name.
+    let mut merged = activity
         .events
         .iter()
-        .rev()
-        .filter_map(|event| {
+        .map(|event| (None, event))
+        .chain(activity.remotes.iter().flat_map(|remote| {
+            remote.activity.iter().flat_map(|remote_activity| {
+                remote_activity
+                    .events
+                    .iter()
+                    .map(|event| (Some(remote.name.as_str()), event))
+            })
+        }))
+        .collect::<Vec<_>>();
+    merged.sort_by_key(|(_, event)| std::cmp::Reverse(event.at_ms));
+    let event_lines = merged
+        .into_iter()
+        .filter_map(|(host, event)| {
             let (text, style) = describe(&event.kind)?;
-            Some(Line::from(vec![
-                Span::from(format!("{}  ", clock(event.at_ms))).dark_gray(),
-                Span::styled(text, style),
-            ]))
+            let mut spans = vec![Span::from(format!("{}  ", clock(event.at_ms))).dark_gray()];
+            if let Some(host) = host {
+                spans.push(Span::from(format!("{host} ")).cyan());
+            }
+            spans.push(Span::styled(text, style));
+            Some(Line::from(spans))
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -902,6 +918,28 @@ mod tests {
         );
         // Newest events first.
         assert!(text.find("agent-7 joined").unwrap() < text.find("finished check").unwrap());
+    }
+
+    #[test]
+    fn a_remote_hosts_events_join_the_list_marked_with_its_name() {
+        let now = SystemTime::now();
+        let mut local = sample(now);
+        let mut remote = sample(now);
+        remote.remotes.clear();
+        remote
+            .events
+            .retain(|event| matches!(event.kind, EventKind::Finished { .. }));
+        let EventKind::Finished { slot, .. } = &mut remote.events[0].kind else {
+            panic!("the sample has a finished build");
+        };
+        *slot = "linux-slot/0".into();
+        local.remotes[0].activity = Ok(Box::new(remote));
+        let text = screen(&Ok(local), now);
+        let line = text
+            .lines()
+            .find(|line| line.contains("linux-slot/0 finished"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(line.contains(" pc linux-slot/0"), "{line}");
     }
 
     #[test]
