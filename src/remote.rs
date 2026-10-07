@@ -87,6 +87,22 @@ fn ask<T: DeserializeOwned>(
     answer
 }
 
+pub(crate) fn cache(
+    home: &Path,
+    remote: &Remote,
+    operation: crate::cache::Operation,
+) -> Result<crate::cache::Response, String> {
+    ask(
+        home,
+        remote,
+        Connection::Status,
+        &Request::Cache {
+            host: None,
+            operation,
+        },
+    )
+}
+
 fn send(child: &mut Child, request: &Request) -> Result<(), String> {
     let mut text = serde_json::to_string(request).expect("requests serialize");
     text.push('\n');

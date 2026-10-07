@@ -298,10 +298,7 @@ pub(crate) fn reclaim(
         .map(|(slot, used)| {
             let target = slot.target();
             if !target.exists() {
-                let nothing = DiskUsage {
-                    total: 0,
-                    freeable: Vec::new(),
-                };
+                let nothing = DiskUsage::new(0);
                 return Ok((Vec::new(), nothing));
             }
             let items = evictables(&target, used)?;
@@ -486,10 +483,10 @@ fn unit_hash(name: &str) -> Option<&str> {
 
 /// Something keeping a slot within its limit may remove: one compilation
 /// unit's incremental cache, or one compiled unit's files.
-struct Evictable {
-    paths: Vec<PathBuf>,
+pub(crate) struct Evictable {
+    pub(crate) paths: Vec<PathBuf>,
     /// The compiled unit's key; None for an incremental cache.
-    unit: Option<String>,
+    pub(crate) unit: Option<String>,
     /// When a build last used it, as far as is known.
     used: SystemTime,
 }
@@ -527,70 +524,198 @@ fn profile_directories(target: &Path) -> Result<Vec<(PathBuf, String)>, String> 
 }
 
 /// Everything under `target` keeping to a limit may remove.
-fn evictables(target: &Path, used: &HashMap<String, u64>) -> Result<Vec<Evictable>, String> {
+pub(crate) fn evictables(
+    target: &Path,
+    used: &HashMap<String, u64>,
+) -> Result<Vec<Evictable>, String> {
     let modified = |path: &Path| {
         std::fs::symlink_metadata(path)
             .and_then(|metadata| metadata.modified())
             .map_err(|error| format!("{}: {error}", path.display()))
     };
-    let mut items = Vec::new();
-    for (profile, relative) in profile_directories(target)? {
+    let mut candidates = Vec::new();
+    for (profile, _) in profile_directories(target)? {
         let incremental = profile.join("incremental");
         if incremental.is_dir() {
             // rustc replaces a cache's session directory on every
             // incremental compilation of its unit.
             for path in read_directory(&incremental)? {
-                let used = modified(&path)?;
-                items.push(Evictable {
-                    paths: vec![path],
-                    unit: None,
-                    used,
-                });
+                let written = modified(&path)?;
+                candidates.push((path, written));
             }
         }
-        let mut units = BTreeMap::<String, (Vec<PathBuf>, SystemTime)>::new();
         for kind in ["deps", ".fingerprint", "build"] {
             let directory = profile.join(kind);
             if !directory.is_dir() {
                 continue;
             }
             for path in read_directory(&directory)? {
-                let Some(hash) = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(unit_hash)
-                else {
-                    continue;
-                };
                 let written = modified(&path)?;
-                let unit = units
-                    .entry(format!("{relative}/{hash}"))
-                    .or_insert_with(|| (Vec::new(), SystemTime::UNIX_EPOCH));
-                unit.0.push(path);
-                unit.1 = unit.1.max(written);
+                candidates.push((path, written));
             }
         }
-        for (key, (paths, written)) in units {
-            let used = used.get(&key).map_or(written, |seconds| {
-                SystemTime::UNIX_EPOCH + Duration::from_secs(*seconds)
-            });
+    }
+    Ok(group_eviction_paths(target, candidates, used))
+}
+
+/// Classify a complete measured target without additional filesystem reads.
+pub(crate) fn evictables_measured(
+    target: &Path,
+    measured: &BTreeMap<PathBuf, std::fs::Metadata>,
+    used: &HashMap<String, u64>,
+) -> Vec<Evictable> {
+    let profiles = measured
+        .iter()
+        .filter_map(|(path, metadata)| {
+            if !metadata.is_dir() {
+                return None;
+            }
+            let kind = path.file_name()?.to_str()?;
+            if !matches!(kind, "deps" | ".fingerprint" | "incremental") {
+                return None;
+            }
+            let profile = path.parent()?;
+            let depth = profile.strip_prefix(target).ok()?.components().count();
+            (depth == 1 || depth == 2).then_some(profile)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let profiles = profiles
+        .iter()
+        .filter(|profile| !profiles.contains(profile.parent().unwrap_or(target)))
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let candidates = measured
+        .iter()
+        .filter_map(|(path, metadata)| {
+            let parent = path.parent()?;
+            let kind = parent.file_name()?.to_str()?;
+            if !matches!(kind, "deps" | ".fingerprint" | "build" | "incremental")
+                || !profiles.contains(parent.parent()?)
+            {
+                return None;
+            }
+            Some((
+                path.clone(),
+                metadata
+                    .modified()
+                    .expect("measured Unix metadata has mtime"),
+            ))
+        })
+        .collect();
+    group_eviction_paths(target, candidates, used)
+}
+
+fn group_eviction_paths(
+    target: &Path,
+    candidates: Vec<(PathBuf, SystemTime)>,
+    used: &HashMap<String, u64>,
+) -> Vec<Evictable> {
+    let mut items = Vec::new();
+    let mut units = BTreeMap::<String, (Vec<PathBuf>, SystemTime)>::new();
+    for (path, written) in candidates {
+        if path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "incremental")
+        {
             items.push(Evictable {
-                paths,
-                unit: Some(key),
-                used,
+                paths: vec![path],
+                unit: None,
+                used: written,
             });
+        } else if let Some(key) = unit_key(target, &path) {
+            let unit = units
+                .entry(key)
+                .or_insert_with(|| (Vec::new(), SystemTime::UNIX_EPOCH));
+            unit.0.push(path);
+            unit.1 = unit.1.max(written);
         }
     }
-    Ok(items)
+    for (key, (mut paths, written)) in units {
+        paths.sort();
+        let used = used.get(&key).map_or(written, |seconds| {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(*seconds)
+        });
+        items.push(Evictable {
+            paths,
+            unit: Some(key),
+            used,
+        });
+    }
+    items
 }
 
 /// The disk space under a directory.
-struct DiskUsage {
+pub(crate) struct DiskUsage {
     /// Every file counted once, however many hard links it has.
     total: u64,
     /// For each item asked about, what removing it frees: its directories
     /// and the files with no hard link outside it.
-    freeable: Vec<u64>,
+    pub(crate) freeable: Vec<u64>,
+    inodes: HashMap<(u64, u64), Inode>,
+}
+
+impl DiskUsage {
+    fn new(caches: usize) -> Self {
+        Self {
+            total: 0,
+            freeable: vec![0; caches],
+            inodes: HashMap::new(),
+        }
+    }
+
+    fn record(&mut self, metadata: &std::fs::Metadata, cache: Option<usize>) {
+        let bytes = metadata.blocks() * 512;
+        if metadata.is_dir() {
+            self.total += bytes;
+            if let Some(cache) = cache {
+                self.freeable[cache] += bytes;
+            }
+            return;
+        }
+        let inode = self
+            .inodes
+            .entry((metadata.dev(), metadata.ino()))
+            .or_insert_with(|| {
+                self.total += bytes;
+                Inode {
+                    bytes,
+                    links: metadata.nlink(),
+                    seen: 0,
+                    cache,
+                }
+            });
+        inode.seen += 1;
+        if inode.cache != cache {
+            inode.cache = None;
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        for inode in self.inodes.values() {
+            if let Some(cache) = inode.cache
+                && inode.seen == inode.links
+            {
+                self.freeable[cache] += inode.bytes;
+            }
+        }
+        self.inodes.clear();
+        self
+    }
+}
+
+pub(crate) fn disk_usage_measured(
+    measured: &BTreeMap<PathBuf, std::fs::Metadata>,
+    caches: &[Evictable],
+) -> DiskUsage {
+    let mut usage = DiskUsage::new(caches.len());
+    for (path, metadata) in measured {
+        let cache = caches
+            .iter()
+            .position(|item| item.paths.iter().any(|root| path.starts_with(root)));
+        usage.record(metadata, cache);
+    }
+    usage.finish()
 }
 
 /// One file's blocks and where its hard links were found.
@@ -605,42 +730,21 @@ struct Inode {
 /// The disk space under `path`, not following symbolic links. rustc's
 /// incremental sessions and Cargo's artifacts are hard links, so each file
 /// counts once.
-fn disk_usage(path: &Path, caches: &[Evictable]) -> Result<DiskUsage, String> {
+pub(crate) fn disk_usage(path: &Path, caches: &[Evictable]) -> Result<DiskUsage, String> {
     fn walk(
         path: &Path,
         cache: Option<usize>,
         caches: &HashMap<&Path, usize>,
-        inodes: &mut HashMap<(u64, u64), Inode>,
         usage: &mut DiskUsage,
     ) -> Result<(), String> {
         let cache = caches.get(path).copied().or(cache);
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let bytes = metadata.blocks() * 512;
+        usage.record(&metadata, cache);
         if metadata.is_dir() {
-            usage.total += bytes;
-            if let Some(cache) = cache {
-                usage.freeable[cache] += bytes;
-            }
             for child in read_directory(path)? {
-                walk(&child, cache, caches, inodes, usage)?;
+                walk(&child, cache, caches, usage)?;
             }
-            return Ok(());
-        }
-        let inode = inodes
-            .entry((metadata.dev(), metadata.ino()))
-            .or_insert_with(|| {
-                usage.total += bytes;
-                Inode {
-                    bytes,
-                    links: metadata.nlink(),
-                    seen: 0,
-                    cache,
-                }
-            });
-        inode.seen += 1;
-        if inode.cache != cache {
-            inode.cache = None;
         }
         Ok(())
     }
@@ -649,20 +753,9 @@ fn disk_usage(path: &Path, caches: &[Evictable]) -> Result<DiskUsage, String> {
         .enumerate()
         .flat_map(|(index, item)| item.paths.iter().map(move |path| (path.as_path(), index)))
         .collect::<HashMap<_, _>>();
-    let mut inodes = HashMap::new();
-    let mut usage = DiskUsage {
-        total: 0,
-        freeable: vec![0; caches.len()],
-    };
-    walk(path, None, &index, &mut inodes, &mut usage)?;
-    for inode in inodes.values() {
-        if let Some(cache) = inode.cache
-            && inode.seen == inode.links
-        {
-            usage.freeable[cache] += inode.bytes;
-        }
-    }
-    Ok(usage)
+    let mut usage = DiskUsage::new(caches.len());
+    walk(path, None, &index, &mut usage)?;
+    Ok(usage.finish())
 }
 
 /// Removes a file, or a directory with everything under it.

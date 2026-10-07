@@ -50,6 +50,10 @@ const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 
 /// What the scheduler thread hears about.
 enum Event {
+    Cache {
+        operation: crate::cache::Operation,
+        reply: Sender<crate::cache::Response>,
+    },
     Submit {
         submission: Submission,
         messages: Sender<Message>,
@@ -172,6 +176,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     restore_slots(home, &config, &mut scheduler)?;
     Daemon {
         home: home.to_owned(),
+        cache: crate::cache::Cache::new(home)?,
         config,
         budget,
         events,
@@ -283,10 +288,36 @@ impl Connection {
             }
         };
         let mut line = String::new();
-        if reader.read_line(&mut line).is_err() || line.is_empty() {
+        if (&mut reader).take(1_048_577).read_line(&mut line).is_err()
+            || line.len() > 1_048_576
+            || !line.ends_with('\n')
+        {
             return;
         }
         match serde_json::from_str::<Request>(&line) {
+            Ok(Request::Cache { host, operation }) => {
+                let response = if let Some(host) = host {
+                    self.remotes
+                        .iter()
+                        .find(|remote| remote.name == host)
+                        .ok_or_else(|| format!("unknown cache host {host}"))
+                        .and_then(|remote| remote::cache(&self.home, remote, operation))
+                } else {
+                    let (reply, response) = crossbeam_channel::bounded(1);
+                    self.events
+                        .send(Event::Cache { operation, reply })
+                        .map_err(|_| "daemon ended".to_owned())
+                        .and_then(|()| response.recv().map_err(|_| "daemon ended".to_owned()))
+                };
+                match response {
+                    Ok(response) => {
+                        let _ = write_line(&mut stream, &response);
+                    }
+                    Err(reason) => {
+                        let _ = write_line(&mut stream, &Message::Rejected { reason });
+                    }
+                }
+            }
             Err(error) => {
                 let reason = format!("not a request: {error}");
                 let _ = write_line(&mut stream, &Message::Rejected { reason });
@@ -676,6 +707,7 @@ fn write_line(stream: &mut UnixStream, value: &impl serde::Serialize) -> std::io
 }
 
 struct Daemon {
+    cache: crate::cache::Cache,
     home: PathBuf,
     config: Config,
     budget: Budget,
@@ -714,6 +746,13 @@ impl Daemon {
                     .expect("the daemon holds a sender of its own events"),
             };
             let effects = match event {
+                Event::Cache { operation, reply } => {
+                    let (response, effects) =
+                        self.cache
+                            .operate(&self.home, &mut self.scheduler, operation);
+                    let _ = reply.send(response);
+                    effects
+                }
                 Event::Submit {
                     submission,
                     messages,

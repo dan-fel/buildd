@@ -843,6 +843,43 @@ impl<D: Distance> Scheduler<D> {
         }
     }
 
+    /// Only the cache owner resolves wire slot identities to scheduler slots.
+    pub(crate) fn cache_slots(&self) -> impl Iterator<Item = (String, bool)> + '_ {
+        self.slots
+            .iter()
+            .map(|slot| (slot_name(&slot.repository, slot.index), slot.busy()))
+    }
+
+    pub(crate) fn cache_acquire(&mut self, name: &str) -> Option<IdleSlot> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot_name(&slot.repository, slot.index) == name && !slot.busy())?;
+        Some(self.hand_out(index))
+    }
+
+    pub(crate) fn cache_release(&mut self, key: SlotKey, mutated: bool) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let slot = &mut self.slots[key.0];
+        assert!(slot.maintaining, "only an acquired cache slot comes back");
+        slot.maintaining = false;
+        if mutated {
+            // A partially removed unit cannot substantiate a warm compilation
+            // or a previously passed test. Retain no successful-test claims.
+            slot.units.clear();
+            slot.passed.clear();
+            slot.compilations.clear();
+            slot.size = None;
+            slot.duplicated = None;
+            // Selected cleanup never schedules whole-target pruning. The next
+            // build schedules the usual independent maintenance again.
+            slot.unmeasured = 0;
+            effects.push(slot.persist());
+        }
+        effects.extend(self.start_ready());
+        effects
+    }
+
     /// Hands out every idle slot to free `needed` bytes of disk; None when
     /// every slot is busy. Each is [`Self::maintained`] afterwards.
     pub(crate) fn reclaim(&mut self, needed: u64) -> Option<Effect> {

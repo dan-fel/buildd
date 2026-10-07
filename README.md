@@ -300,6 +300,61 @@ One JSON object per line over the Unix socket (`src/protocol.rs`): `build`
 streams a build, `status` describes slots and queue, `activity` adds what
 `top` shows, `failures` sums up what failed. Programs integrate through the library's `client` module.
 
+## Cache-owner protocol
+
+Library clients use `client::cache(stream, host, operation)` and typed
+`cache::{Operation, Response}`. The wire request is
+`{"type":"cache","host":null,"operation":{"operation":"capabilities"}}`.
+`host` may instead be a configured remote **name**; the existing SSH `serve`
+transport asks that host's actual daemon, without relaying local cache records.
+An old daemon rejects this request: clients must show capability-unavailable,
+not invent inventory. Protocol 1 capabilities return the host/cache-home
+identity, random daemon incarnation, and all limits. No general version
+handshake is assumed.
+
+1. Ask for capabilities, then inventory with that exact `Owner`.
+2. Inventory returns fresh measurement time, revision, expiry, slot protection
+   and service-issued item IDs. Select at most 64 IDs from one revision and
+   ask for preview. Never submit paths or commands. Preview deletes nothing
+   and holds no slot while a person approves it.
+3. Approve the **entire** returned preview in the caller's policy/UI, including
+   owner, expiry, IDs and estimates; send that exact preview to execute.
+   Buildd's private socket authorizes its OS owner, not workspace/UI policy.
+4. Execute acquires scheduler maintenance exclusion for every selected slot,
+   then checks the complete measured target identity/metadata again. Busy,
+   changed, symlink-containing and foreign targets are refused. Validation
+   claims are persisted as invalid before the first destructive syscall.
+   Only selected incremental caches and compiled-unit files are removed;
+   cleanup never invokes whole-target pruning or removes sources, records,
+   mirrors, logs, products, registry or unrelated paths. Subsequent builds
+   still schedule their ordinary automatic maintenance independently.
+5. Completed and partial outcomes are retained. Repeating execute with an
+   identical preview returns its receipt, never deletes again; changing any
+   payload field is refused. Query `receipt` after losing the connection:
+   do not blindly retry or mint a new operation. `unknown` (expired/missing
+   receipt or restarted/foreign daemon) preserves uncertainty about a prior
+   attempt. `cancel` is terminal before execution; once accepted, filesystem
+   execution completes independently of client disconnect. A cancellation
+   processed after completion returns that completion, not a fake rollback.
+
+Inventory is limited to 16 slots, 64 items, 8192 total visited entries and
+250 ms of scan work; each target's retained paths are limited to 512 KiB.
+Limits/active slots/unsupported filesystem entries label the result incomplete
+and produce no cleanup targets for the affected slot. Scans and removal check
+their deadline between filesystem operations; one blocked OS syscall cannot
+be preempted. Large targets are explicitly incomplete, not stale status sizes
+disguised as fresh inventory. Protocol 1 does not paginate within a target.
+Individual reclaimable estimates reuse hardlink accounting: links elsewhere
+are not counted as reclaimable, and removing several items can free more than
+the sum of their conservative individual estimates.
+
+There are at most eight inventories and eight receipts, expiring after 60 s;
+capacity is refused, never evicted behind an approval. Daemon request lines are
+limited to 1 MiB. Inventory IDs and outcomes are incarnation-scoped, not
+persisted across restart. A client applies its own authority to what a person
+may clean, binds approval to the full preview, labels incomplete or unknown
+outcomes, and refreshes after execution. Tests use owned temporary caches only.
+
 ## Not yet
 
 - A `cargo` shim that routes direct Cargo calls to the daemon.

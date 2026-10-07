@@ -49,6 +49,19 @@ pub fn status(stream: UnixStream) -> Result<Status, String> {
     ask(stream, &Request::Status)
 }
 
+/// Ask the cache owner; never retry a transport failure as a new cleanup.
+/// Query the exact preview again to recover its receipt while it is live.
+///
+/// # Errors
+/// When the transport fails or the daemon does not support this protocol.
+pub fn cache(
+    stream: UnixStream,
+    host: Option<String>,
+    operation: crate::cache::Operation,
+) -> Result<crate::cache::Response, String> {
+    ask(stream, &Request::Cache { host, operation })
+}
+
 /// The daemon's slots and queue, its totals since it started, and its
 /// recent events.
 ///

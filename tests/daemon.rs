@@ -1,5 +1,37 @@
 //! The daemon end to end: a real daemon process, git repositories and Cargo.
 
+#[test]
+fn cache_capabilities_and_foreign_owner_round_trip() {
+    use buildd::cache::{Operation, Refusal, Response};
+    let daemon = Daemon::start(1);
+    let Response::Capabilities(capabilities) =
+        client::cache(daemon.connect(), None, Operation::Capabilities).unwrap()
+    else {
+        panic!("typed capabilities");
+    };
+    assert_eq!(capabilities.protocol, 1);
+    let mut owner = capabilities.owner;
+    let Response::Inventory(inventory) = client::cache(
+        daemon.connect(),
+        None,
+        Operation::Inventory {
+            owner: owner.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("typed inventory");
+    };
+    assert!(inventory.complete);
+    assert!(inventory.items.is_empty());
+    owner.host = "foreign".into();
+    assert_eq!(
+        client::cache(daemon.connect(), None, Operation::Inventory { owner }).unwrap(),
+        Response::Refused {
+            reason: Refusal::ForeignOwner
+        }
+    );
+}
+
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process};

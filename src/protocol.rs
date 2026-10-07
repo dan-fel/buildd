@@ -18,6 +18,11 @@ use crate::snapshot::Revision;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    /// Cache-owner operations. `host` is a configured remote name, not a path.
+    Cache {
+        host: Option<String>,
+        operation: crate::cache::Operation,
+    },
     /// Build the current content of the worktree holding `directory`.
     Build(BuildRequest),
     /// Build a tree another machine's daemon pushed into this daemon's
