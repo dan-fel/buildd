@@ -266,13 +266,29 @@ impl Operation {
         if self.command != Command::Nextest {
             return false;
         }
+        // A nextest profile other than the default may choose other tests
+        // (its default filter), so its run is not the default run of every
+        // test whose passes later default runs skip.
+        let other_profile = |name: Option<&String>| name.is_some_and(|name| name != "default");
         let mut arguments = self.args.iter();
         while let Some(argument) = arguments.next() {
+            if let Some(name) = argument.strip_prefix("--profile=")
+                && name != "default"
+            {
+                return false;
+            }
             match argument.as_str() {
-                "--" | "-E" | "--filterset" | "--run-ignored" | "--partition" => return false,
+                "--"
+                | "-E"
+                | "--filterset"
+                | "--run-ignored"
+                | "--partition"
+                | "--ignore-default-filter" => return false,
+                "-P" | "--profile" if other_profile(arguments.next()) => return false,
+                "-P" | "--profile" => {}
                 "-p" | "--package" | "--exclude" | "--bin" | "--example" | "--test" | "--bench"
-                | "-F" | "--features" | "--cargo-profile" | "--target" | "-P" | "--profile"
-                | "--retries" | "--max-fail" | "--color" => {
+                | "-F" | "--features" | "--cargo-profile" | "--target" | "--retries"
+                | "--max-fail" | "--color" => {
                     arguments.next();
                 }
                 _ if !argument.starts_with('-') => return false,
@@ -538,7 +554,16 @@ mod tests {
             ..operation(args)
         };
         assert!(nextest(&["--workspace", "--no-fail-fast", "-p", "x"]).runs_every_test());
-        for filtered in [&["name"][..], &["-E", "test(x)"], &["--", "--exact", "x"]] {
+        assert!(nextest(&["--workspace", "--profile", "default"]).runs_every_test());
+        for filtered in [
+            &["name"][..],
+            &["-E", "test(x)"],
+            &["--", "--exact", "x"],
+            &["--profile", "scale"],
+            &["-P", "scale"],
+            &["--profile=scale"],
+            &["--ignore-default-filter"],
+        ] {
             assert!(!nextest(filtered).runs_every_test(), "{filtered:?}");
         }
         assert!(!operation(&["--workspace"]).runs_every_test());
