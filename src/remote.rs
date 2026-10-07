@@ -155,13 +155,29 @@ fn push(
         .chain(ssh_options(home, Connection::Builds))
         .collect::<Vec<_>>()
         .join(" ");
+    let destination = format!("{}:{}", remote.ssh, mirror.path.display());
+    let reference = format!("refs/buildd/{revision}");
     let mut push = git_dir(git::command(&source.repository));
-    push.env("GIT_SSH_COMMAND", ssh)
+    push.env("GIT_SSH_COMMAND", &ssh)
         .args(["push", "--quiet", "--no-verify"])
-        .arg(format!("{}:{}", remote.ssh, mirror.path.display()))
-        .arg(format!("{commit}:refs/buildd/{revision}"));
-    git::run(push)?;
-    Ok(project)
+        .arg(&destination)
+        .arg(format!("{commit}:{reference}"));
+    let Err(failed) = git::run(push) else {
+        return Ok(project);
+    };
+    // Two builds of one tree push its reference at once: the mirror refuses
+    // the second creation though both name the same commit, as one tree
+    // always makes one commit. That push failed only in form.
+    let mut listed = git_dir(git::command(&source.repository));
+    listed
+        .env("GIT_SSH_COMMAND", &ssh)
+        .args(["ls-remote", &destination, &reference]);
+    let there = git::run(listed)?;
+    if there.split_whitespace().next() == Some(commit.as_str()) {
+        Ok(project)
+    } else {
+        Err(failed)
+    }
 }
 
 /// Builds tree `revision` of `source` on `remote` as `request` asks,
