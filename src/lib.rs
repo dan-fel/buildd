@@ -27,6 +27,7 @@ mod git;
 pub mod log;
 mod memory;
 mod passed;
+mod prewarm;
 mod products;
 pub mod protocol;
 mod remote;

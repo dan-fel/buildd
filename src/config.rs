@@ -27,6 +27,25 @@ pub struct Config {
     pub memory: u64,
     /// Other machines' daemons, for builds that must run on another OS.
     pub remotes: Vec<Remote>,
+    /// Branches whose new commits are built before anyone asks.
+    pub prewarm: Vec<Prewarm>,
+}
+
+/// A branch whose new commits buildd builds as optional work, so the
+/// worktrees branching from it find warm slots.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Prewarm {
+    /// Any worktree of the repository.
+    pub repository: PathBuf,
+    /// The branch to follow: `main`.
+    pub branch: String,
+    /// The OS to build on, as `--os` names it; this machine when absent.
+    #[serde(default)]
+    pub os: Option<String>,
+    /// The builds, each a buildd command and Cargo's arguments:
+    /// `["test", "--workspace", "--no-run"]`.
+    pub builds: Vec<Vec<String>>,
 }
 
 /// Another machine whose buildd daemon builds for `os`, reached over SSH.
@@ -55,6 +74,8 @@ struct File {
     memory_gib: Option<f64>,
     #[serde(default)]
     remote: Vec<Remote>,
+    #[serde(default)]
+    prewarm: Vec<Prewarm>,
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -121,6 +142,7 @@ impl Config {
             )]
             memory: (memory_gib * GIB).round() as u64,
             remotes: file.remote,
+            prewarm: file.prewarm,
         };
         if config.slots == 0 || config.jobs == 0 {
             return Err(format!(
@@ -146,8 +168,32 @@ impl Config {
                 path.display()
             ));
         }
+        for prewarm in &config.prewarm {
+            for build in &prewarm.builds {
+                prewarm_operation(build)
+                    .map_err(|reason| format!("{}: prewarm {build:?}: {reason}", path.display()))?;
+            }
+        }
         Ok(config)
     }
+}
+
+/// The operation a prewarm build names: a buildd command and Cargo's
+/// arguments.
+///
+/// # Errors
+/// When it is empty, names no command, or takes over the slot.
+pub fn prewarm_operation(build: &[String]) -> Result<crate::cargo::Operation, String> {
+    let (command, args) = build.split_first().ok_or("an empty build")?;
+    let command = crate::cargo::Command::parse(command)
+        .ok_or_else(|| format!("unknown command `{command}`"))?;
+    let operation = crate::cargo::Operation {
+        command,
+        args: args.to_vec(),
+        rustflags: Vec::new(),
+    };
+    operation.validate()?;
+    Ok(operation)
 }
 
 /// buildd's home: `$BUILDD_HOME`, or `buildd` in the user's cache directory.
@@ -198,8 +244,30 @@ mod tests {
             min_free: 0,
             memory: 8 << 30,
             remotes: Vec::new(),
+            prewarm: Vec::new(),
         };
         assert_eq!(Config::load(&home.0).unwrap(), expected);
+        write(
+            "[[prewarm]]\nrepository = \"/work/app\"\nbranch = \"main\"\nos = \"linux\"\n\
+             builds = [[\"test\", \"--workspace\", \"--no-run\"]]\n",
+        );
+        let prewarm = &Config::load(&home.0).unwrap().prewarm[0];
+        assert_eq!(prewarm.branch, "main");
+        assert_eq!(prewarm.os.as_deref(), Some("linux"));
+        assert_eq!(
+            prewarm_operation(&prewarm.builds[0]).unwrap().command,
+            crate::cargo::Command::Test
+        );
+        for refused in [
+            "builds = [[]]",
+            "builds = [[\"frobnicate\"]]",
+            "builds = [[\"test\", \"--target-dir\", \"x\"]]",
+        ] {
+            write(&format!(
+                "[[prewarm]]\nrepository = \"/work/app\"\nbranch = \"main\"\n{refused}\n"
+            ));
+            assert!(Config::load(&home.0).is_err(), "{refused}");
+        }
         let other = if std::env::consts::OS == "linux" {
             "macos"
         } else {

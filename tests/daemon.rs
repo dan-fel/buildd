@@ -108,6 +108,7 @@ fn request(directory: &Path, command: Command, args: &[&str]) -> BuildRequest {
         label: None,
         copy_to: None,
         rerun_all: false,
+        optional: false,
         os: None,
     }
 }
@@ -405,6 +406,47 @@ fn every_build_leaves_a_log_and_reports_its_errors_and_failed_tests() {
     assert_eq!(failures.logs, daemon.home.0.join("logs"));
 }
 
+#[test]
+fn a_configured_branch_is_built_before_anyone_asks() {
+    let repository = crate_repository(None);
+    let daemon = Daemon::configured(&format!(
+        "slots = 2\njobs = 4\nmin_free_gib = 0\n\
+         [[prewarm]]\nrepository = {:?}\nbranch = \"main\"\nbuilds = [[\"check\"]]\n",
+        repository.0.display().to_string()
+    ));
+    let head = git(&repository.0, &["rev-parse", "HEAD^{tree}"]);
+    let finished = || {
+        daemon
+            .activity()
+            .events
+            .into_iter()
+            .find_map(|event| match event.kind {
+                EventKind::Finished {
+                    who,
+                    revision,
+                    outcome,
+                    ..
+                } if who == ["prewarm main"] => Some((revision, outcome)),
+                _ => None,
+            })
+    };
+    wait_until("the prewarm build finishes", || finished().is_some());
+    let (revision, outcome) = finished().unwrap();
+    assert_eq!(revision.to_string(), head.trim(), "the branch's commit");
+    assert!(outcome.success(), "{outcome:?}");
+    // The worktree it built from is buildd's own, at that commit.
+    let prewarmed = std::fs::read_dir(daemon.home.0.join("prewarm"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        git(&prewarmed, &["rev-parse", "HEAD^{tree}"]).trim(),
+        head.trim()
+    );
+}
+
 /// A committed workspace of two independent packages, `a` and `b`, each
 /// with a unit test.
 fn two_package_workspace() -> TempDir {
@@ -534,6 +576,7 @@ fn a_tree_pushed_into_a_mirror_builds_like_a_worktree_and_drain_stops_new_builds
             },
             label: Some("remote".into()),
             rerun_all: false,
+            optional: false,
         });
         ask(&request)
             .iter()

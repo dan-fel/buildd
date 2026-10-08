@@ -170,6 +170,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
     let mut scheduler = Scheduler::new(config.slots, config.memory, GitDistance::default());
     restore_slots(home, &config, &mut scheduler)?;
+    crate::prewarm::spawn(home, config.prewarm.clone());
     Daemon {
         home: home.to_owned(),
         config,
@@ -440,6 +441,7 @@ impl Connection {
             label: request.label,
             copy_to: None,
             rerun_all: request.rerun_all,
+            optional: request.optional,
         };
         self.submit(stream, reader, submission);
     }
@@ -483,6 +485,7 @@ impl Connection {
             operation: request.operation,
             label,
             rerun_all: request.rerun_all,
+            optional: request.optional,
         };
         let pushing = format!(
             "buildd: pushing tree {} to {} ({})",
@@ -557,6 +560,7 @@ impl Connection {
             label: request.label,
             copy_to,
             rerun_all: request.rerun_all,
+            optional: request.optional,
         };
         self.submit(stream, reader, submission);
     }

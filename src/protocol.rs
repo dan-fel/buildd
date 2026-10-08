@@ -127,6 +127,11 @@ pub struct BuildRequest {
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// Optional work, such as prewarming a branch: it waits behind every
+    /// other build and starts only while another slot stays free. A build
+    /// anyone else asks for is no longer optional.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
 }
 
 /// A build of a tree pushed into a project's mirror.
@@ -145,6 +150,8 @@ pub struct RevisionRequest {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rerun_all: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
 }
 
 /// Where a project's mirror is.
@@ -581,6 +588,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            optional: false,
             os: None,
         });
         let text = serde_json::to_string(&request).unwrap();
