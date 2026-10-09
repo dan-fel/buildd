@@ -200,7 +200,7 @@ impl SlotDirectory {
             })
             .map_err(|error| format!("could not write {}: {error}", alternates.display()))?;
 
-        let commit = git::snapshot_commit(git::command(&source), revision)?;
+        let commit = git::snapshot_commit(git::command(&source), revision, None)?;
         let mut reset = git::command(&source);
         reset.args(["reset", "-q", "--hard", &commit]);
         git::run(reset)?;

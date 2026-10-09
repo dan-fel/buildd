@@ -210,8 +210,9 @@ units. `git worktree list` shows buildd's worktree.
 ```text
  this machine                                  remote (os = linux)
  buildd test --os linux
-   │ snapshot → commit
-   ├── git push over ssh ───────────────────▶ mirrors/<project>  (last 20 trees)
+   │ snapshot → commit on HEAD
+   ├── git push over ssh ───────────────────▶ mirrors/<project>  (last 20 trees,
+   │     only what changed since              packed by git gc now and then)
    ├── ssh 'buildd serve' ──────────────────▶ daemon: own slots, budget, config
    ◀── messages streamed back ─────────────── slot shows as  pc:<slot>
 

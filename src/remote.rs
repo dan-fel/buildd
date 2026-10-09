@@ -1,8 +1,9 @@
 //! Builds on another machine: its buildd daemon, reached over SSH.
 //!
 //! The remote daemon knows nothing about this one. This daemon pushes the
-//! snapshot's commit into the remote's mirror of the project (`git push`
-//! over the same SSH connection, so only objects the mirror lacks travel),
+//! snapshot's commit, on the worktree's `HEAD`, into the remote's mirror of
+//! the project (`git push` over the same SSH connection, so only objects the
+//! mirror lacks travel),
 //! then asks it, through `buildd serve` on the other end, to build that
 //! tree, and passes its messages on. Closing the client closes the SSH
 //! session, which withdraws the build there as a closed socket does here.
@@ -146,35 +147,53 @@ fn push(
             project: project.clone(),
         },
     )?;
-    let git_dir = |mut command: Command| {
-        command.arg("--git-dir").arg(&source.repository);
-        command
-    };
-    let commit = git::snapshot_commit(git_dir(git::command(&source.repository)), revision)?;
     let ssh = std::iter::once("ssh".to_owned())
         .chain(ssh_options(home, Connection::Builds))
         .collect::<Vec<_>>()
         .join(" ");
+    let git = || {
+        let mut command = git::command(&source.repository);
+        command
+            .env("GIT_SSH_COMMAND", &ssh)
+            .arg("--git-dir")
+            .arg(&source.repository);
+        command
+    };
     let destination = format!("{}:{}", remote.ssh, mirror.path.display());
-    let reference = format!("refs/buildd/{revision}");
-    let mut push = git_dir(git::command(&source.repository));
-    push.env("GIT_SSH_COMMAND", &ssh)
-        .args(["push", "--quiet", "--no-verify"])
-        .arg(&destination)
+    push_snapshot(git, source, revision, &destination)?;
+    Ok(project)
+}
+
+/// Pushes tree `revision` of `source` to the repository at `destination`,
+/// as a commit under a reference of its own; `git` makes a git command for
+/// `source`'s repository.
+///
+/// The commit sits on the worktree's `HEAD`, so it shares history with what
+/// earlier pushes sent and git sends only the objects that changed since. A
+/// commit without a parent shares no history, and git sent its whole tree.
+fn push_snapshot(
+    git: impl Fn() -> Command,
+    source: &Source,
+    revision: &Revision,
+    destination: &str,
+) -> Result<(), String> {
+    let parent = git::head_commit(&source.worktree)?;
+    let commit = git::snapshot_commit(git(), revision, parent.as_deref())?;
+    let reference = format!("refs/buildd/{commit}");
+    let mut push = git();
+    push.args(["push", "--quiet", "--no-verify", destination])
         .arg(format!("{commit}:{reference}"));
     let Err(failed) = git::run(push) else {
-        return Ok(project);
+        return Ok(());
     };
-    // Two builds of one tree push its reference at once: the mirror refuses
-    // the second creation though both name the same commit, as one tree
-    // always makes one commit. That push failed only in form.
-    let mut listed = git_dir(git::command(&source.repository));
-    listed
-        .env("GIT_SSH_COMMAND", &ssh)
-        .args(["ls-remote", &destination, &reference]);
+    // Two builds of one tree on one HEAD push its commit at once: the mirror
+    // refuses the second creation of the reference, though both name the
+    // same commit. That push failed only in form.
+    let mut listed = git();
+    listed.args(["ls-remote", destination, &reference]);
     let there = git::run(listed)?;
     if there.split_whitespace().next() == Some(commit.as_str()) {
-        Ok(project)
+        Ok(())
     } else {
         Err(failed)
     }
@@ -235,5 +254,67 @@ pub(crate) fn build(
     match last {
         Some(_) => Ok(()),
         None => Err(format!("lost {} before the build ended", remote.name)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::tests::{TempDir, git, repository};
+
+    /// The objects in the repository at `directory`, loose and packed.
+    fn objects(directory: &Path) -> u64 {
+        git(directory, &["count-objects", "-v"])
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(": ")?;
+                matches!(name, "count" | "in-pack").then(|| value.parse::<u64>().unwrap())
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_push_sends_only_what_changed_since_the_last() {
+        let repository = repository();
+        for directory in 0..10 {
+            std::fs::create_dir(repository.0.join(format!("d{directory}"))).unwrap();
+            for file in 0..30 {
+                std::fs::write(
+                    repository.0.join(format!("d{directory}/{file}.txt")),
+                    format!("{directory} {file}\n"),
+                )
+                .unwrap();
+            }
+        }
+        git(&repository.0, &["add", "--all"]);
+        git(&repository.0, &["commit", "-q", "-m", "files"]);
+        let mirror = TempDir::new();
+        git(&mirror.0, &["init", "-q", "--bare"]);
+        let scratch = TempDir::new();
+        let source = crate::snapshot::resolve(&repository.0).unwrap();
+        let source_git = || {
+            let mut command = git::command(&source.repository);
+            command.arg("--git-dir").arg(&source.repository);
+            command
+        };
+        let destination = mirror.0.to_str().unwrap();
+
+        let first = source.snapshot(&scratch.0).unwrap();
+        push_snapshot(source_git, &source, &first, destination).unwrap();
+        let after_first = objects(&mirror.0);
+        assert!(after_first > 300, "the first push sends every file");
+
+        std::fs::write(repository.0.join("d3/7.txt"), "changed\n").unwrap();
+        let second = source.snapshot(&scratch.0).unwrap();
+        push_snapshot(source_git, &source, &second, destination).unwrap();
+        // The changed file, its directory, the root tree and the commit.
+        assert_eq!(objects(&mirror.0) - after_first, 4);
+        git(
+            &mirror.0,
+            &["cat-file", "-e", &format!("{second}^{{tree}}")],
+        );
+
+        // Pushing a tree again is no error.
+        push_snapshot(source_git, &source, &second, destination).unwrap();
     }
 }
