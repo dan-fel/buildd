@@ -7,7 +7,7 @@
 //! tree, and passes its messages on. Closing the client closes the SSH
 //! session, which withdraws the build there as a closed socket does here.
 
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -92,15 +92,58 @@ pub(crate) fn cache(
     remote: &Remote,
     operation: crate::cache::Operation,
 ) -> Result<crate::cache::Response, String> {
-    ask(
-        home,
-        remote,
-        Connection::Status,
-        &Request::Cache {
-            host: None,
-            operation,
-        },
+    cache_request(
+        serve(home, remote, Connection::Status)?,
+        operation,
+        crate::client::MAX_CACHE_RESPONSE_BYTES,
     )
+    .map_err(|error| format!("{} ({}) {error}", remote.name, remote.ssh))
+}
+
+/// This SSH session owns only one cache request. Reap it on every path,
+/// including failed writes, oversized replies and daemon rejections. Closing
+/// transport never requests a new cleanup or changes the service receipt.
+fn cache_request(
+    mut child: Child,
+    operation: crate::cache::Operation,
+    limit: usize,
+) -> Result<crate::cache::Response, crate::client::CacheError> {
+    let mut response = (|| {
+        send(
+            &mut child,
+            &Request::Cache {
+                host: None,
+                operation,
+            },
+        )
+        .map_err(crate::client::CacheError::Transport)?;
+        crate::client::read_cache_response(
+            BufReader::new(child.stdout.take().expect("piped")),
+            limit,
+        )
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(crate::client::CacheError::Transport(reason)) = &mut response {
+        let mut stderr = Vec::new();
+        let pipe = child.stderr.take().expect("piped");
+        // An SSH control process may outlive this session and keep its stderr
+        // pipe open. Diagnostics must not add another wait after retirement.
+        if let Ok(flags) = rustix::fs::fcntl_getfl(&pipe)
+            && rustix::fs::fcntl_setfl(&pipe, flags | rustix::fs::OFlags::NONBLOCK).is_ok()
+        {
+            let _ = pipe.take(4097).read_to_end(&mut stderr);
+            let details = String::from_utf8_lossy(&stderr[..stderr.len().min(4096)]);
+            if !details.trim().is_empty() {
+                reason.push_str(": ");
+                reason.push_str(details.trim());
+            }
+            if stderr.len() > 4096 {
+                reason.push_str(" [SSH diagnostics exceeded 4 KiB]");
+            }
+        }
+    }
+    response
 }
 
 fn send(child: &mut Child, request: &Request) -> Result<(), String> {
@@ -251,5 +294,114 @@ pub(crate) fn build(
     match last {
         Some(_) => Ok(()),
         None => Err(format!("lost {} before the build ended", remote.name)),
+    }
+}
+
+#[cfg(test)]
+mod cache_end_to_end {
+    use super::*;
+    use crate::cache::{Operation, Refusal, Response};
+    use crate::client::CacheError;
+
+    // A fixture-owned subprocess supplies the same stdin/stdout service
+    // protocol as the SSH session. No SSH configuration or live host changes.
+    fn fixture(reply: &str) -> Child {
+        let script = format!(
+            "import json, sys\n\
+             request = json.loads(sys.stdin.readline())\n\
+             assert request == {{'type':'cache', 'host':None, 'operation':{{'operation':'capabilities'}}}}\n\
+             {reply}\n"
+        );
+        Command::new("python3")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn ask(reply: &str) -> Result<Response, CacheError> {
+        let child = fixture(reply);
+        let pid = rustix::process::Pid::from_raw(child.id().try_into().unwrap()).unwrap();
+        let response = cache_request(child, Operation::Capabilities, 4096);
+        assert!(
+            matches!(
+                rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+                Err(rustix::io::Errno::CHILD)
+            ),
+            "the completed fixture session has already been reaped"
+        );
+        response
+    }
+
+    #[test]
+    fn cache_session_decodes_bounded_replies_and_reaps_all_outcomes() {
+        assert_eq!(
+            ask("print('{\"type\":\"refused\",\"reason\":\"busy\"}', flush=True)"),
+            Ok(Response::Refused {
+                reason: Refusal::Busy
+            })
+        );
+        assert_eq!(
+            ask(
+                "print('{\"type\":\"rejected\",\"reason\":\"unsupported cache protocol\"}', flush=True)"
+            ),
+            Err(CacheError::Rejected("unsupported cache protocol".into()))
+        );
+        assert!(matches!(ask("pass"), Err(CacheError::Transport(_))));
+        // The fixture descendant holds stderr until the session's stdin closes.
+        // Waiting for stderr EOF here would prevent that very close forever.
+        assert!(matches!(
+            ask(
+                "import os\npid = os.fork()\nif pid == 0:\n os.close(1)\n sys.stdin.read()\n os._exit(0)"
+            ),
+            Err(CacheError::Transport(_))
+        ));
+        assert!(matches!(
+            ask("sys.stderr.write('fixture transport denied'); sys.stderr.flush()"),
+            Err(CacheError::Transport(reason)) if reason.ends_with("fixture transport denied")
+        ));
+        assert!(matches!(
+            ask("print('{}', flush=True)"),
+            Err(CacheError::InvalidResponse(_))
+        ));
+        assert_eq!(
+            ask("sys.stdout.write('x' * 8192); sys.stdout.flush()"),
+            Err(CacheError::InvalidResponse(
+                "answer exceeds 4096 bytes".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn failed_cache_write_still_reaps_its_session() {
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import os, sys; os.close(0); print('closed', flush=True)",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id().try_into().unwrap()).unwrap();
+        let mut event = [0; 7];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut event)
+            .unwrap();
+        assert_eq!(&event, b"closed\n");
+        assert!(matches!(
+            cache_request(child, Operation::Capabilities, 4096),
+            Err(CacheError::Transport(reason)) if reason.starts_with("could not send the request:")
+        ));
+        assert!(matches!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
     }
 }

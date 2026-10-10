@@ -32,6 +32,248 @@ fn cache_capabilities_and_foreign_owner_round_trip() {
     );
 }
 
+mod cache_end_to_end {
+    use super::*;
+    use buildd::cache::{Inventory, Operation, Outcome, Preview, Refusal, Response};
+
+    // All artifact mutation and cleanup in these tests is under this daemon's
+    // temporary home. Its slot and source checkout are created by a real build.
+    fn fixture() -> (Daemon, TempDir, PathBuf) {
+        let daemon = Daemon::start(1);
+        let repository = crate_repository(None);
+        let built = daemon.build(&repository.0, Command::Check, &[]);
+        assert!(super::outcome(&built).success(), "{built:#?}");
+        let projects = std::fs::read_dir(daemon.home.0.join("slots"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(projects.len(), 1);
+        let target = projects[0].join("0/target");
+        for directory in [
+            "debug/deps",
+            "debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa",
+            "debug/incremental/approval-unselected",
+        ] {
+            std::fs::create_dir_all(target.join(directory)).unwrap();
+        }
+        for path in [
+            "debug/deps/pkg-aaaaaaaaaaaaaaaa",
+            "debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa/file",
+            "debug/incremental/approval-unselected/file",
+            "debug/approval-keep",
+        ] {
+            std::fs::write(target.join(path), [7_u8; 8192]).unwrap();
+        }
+        std::fs::write(daemon.home.0.join("approval-keep.log"), "keep").unwrap();
+        (daemon, repository, target)
+    }
+
+    fn operate(daemon: &Daemon, operation: Operation) -> Response {
+        client::cache(daemon.connect(), None, operation).unwrap()
+    }
+
+    fn inventory(daemon: &Daemon) -> Inventory {
+        let Response::Capabilities(capabilities) = operate(daemon, Operation::Capabilities) else {
+            panic!("cache capabilities");
+        };
+        let Response::Inventory(inventory) = operate(
+            daemon,
+            Operation::Inventory {
+                owner: capabilities.owner,
+            },
+        ) else {
+            panic!("cache inventory");
+        };
+        inventory
+    }
+
+    fn preview(daemon: &Daemon, inventory: &Inventory) -> Preview {
+        let item = inventory
+            .items
+            .iter()
+            .find(|item| item.unit.as_deref() == Some("debug/aaaaaaaaaaaaaaaa"))
+            .unwrap();
+        let Response::Preview(preview) = operate(
+            daemon,
+            Operation::Preview {
+                owner: inventory.owner.clone(),
+                inventory: inventory.revision.clone(),
+                items: vec![item.id.clone()],
+            },
+        ) else {
+            panic!("exact cleanup preview");
+        };
+        preview
+    }
+
+    #[test]
+    fn cache_cleanup_preview_is_inert_and_receipt_replay_is_exact() {
+        let (daemon, repository, target) = fixture();
+        let inventory = inventory(&daemon);
+        assert!(inventory.complete, "{inventory:?}");
+        let preview = preview(&daemon, &inventory);
+        let artifact = target.join("debug/deps/pkg-aaaaaaaaaaaaaaaa");
+        assert!(artifact.exists());
+        let pending = Response::Receipt {
+            preview: preview.clone(),
+            result: None,
+        };
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Receipt {
+                    preview: preview.clone()
+                }
+            ),
+            pending
+        );
+
+        let mut changed = preview.clone();
+        changed.items[0].reclaimable_bytes += 1;
+        assert_eq!(
+            operate(&daemon, Operation::Execute { preview: changed }),
+            Response::Refused {
+                reason: Refusal::PayloadChanged
+            }
+        );
+        assert!(artifact.exists());
+
+        let cancelled = self::preview(&daemon, &inventory);
+        let cancelled_receipt = Response::Receipt {
+            preview: cancelled.clone(),
+            result: Some(Outcome::Cancelled),
+        };
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Cancel {
+                    preview: cancelled.clone()
+                }
+            ),
+            cancelled_receipt
+        );
+        assert_eq!(
+            operate(&daemon, Operation::Execute { preview: cancelled }),
+            cancelled_receipt
+        );
+        assert!(artifact.exists());
+
+        let complete = Response::Receipt {
+            preview: preview.clone(),
+            result: Some(Outcome::Completed {
+                removed: vec![preview.items[0].id.clone()],
+            }),
+        };
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Execute {
+                    preview: preview.clone()
+                }
+            ),
+            complete
+        );
+        assert!(!artifact.exists());
+        assert!(
+            !target
+                .join("debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa")
+                .exists()
+        );
+        for path in [
+            "debug/incremental/approval-unselected/file",
+            "debug/approval-keep",
+        ] {
+            assert_eq!(std::fs::read(target.join(path)).unwrap(), [7_u8; 8192]);
+        }
+        assert_eq!(
+            std::fs::read_to_string(daemon.home.0.join("approval-keep.log")).unwrap(),
+            "keep"
+        );
+        assert!(repository.0.join("src/lib.rs").exists());
+        assert!(target.parent().unwrap().join("src/src/lib.rs").exists());
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(target.parent().unwrap().join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["units"], serde_json::json!({}));
+        assert_eq!(record["compilations"], serde_json::json!([]));
+        assert!(
+            record
+                .get("passed")
+                .is_none_or(|passed| passed.as_array().unwrap().is_empty())
+        );
+
+        // A replay returns the original outcome; it must not delete a new
+        // artifact that subsequently occupies the formerly approved path.
+        std::fs::write(&artifact, "new artifact").unwrap();
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Execute {
+                    preview: preview.clone()
+                }
+            ),
+            complete
+        );
+        assert_eq!(operate(&daemon, Operation::Receipt { preview }), complete);
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "new artifact");
+    }
+
+    #[test]
+    fn cache_changed_and_protected_targets_are_refused_without_cleanup() {
+        let (daemon, _repository, target) = fixture();
+        let inventory = inventory(&daemon);
+        assert!(inventory.complete, "{inventory:?}");
+        let preview = preview(&daemon, &inventory);
+        let artifact = target.join("debug/deps/pkg-aaaaaaaaaaaaaaaa");
+        std::fs::write(&artifact, [9_u8; 8193]).unwrap();
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Execute {
+                    preview: preview.clone()
+                }
+            ),
+            Response::Refused {
+                reason: Refusal::Changed
+            }
+        );
+        assert_eq!(std::fs::read(&artifact).unwrap(), [9_u8; 8193]);
+        assert!(
+            target
+                .join("debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa/file")
+                .exists()
+        );
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Receipt {
+                    preview: preview.clone()
+                }
+            ),
+            Response::Receipt {
+                preview,
+                result: None
+            }
+        );
+
+        let source = target.parent().unwrap().join("src/src/lib.rs");
+        let before = std::fs::read(&source).unwrap();
+        let link = target.join("debug/incremental/approval-protected");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let protected = self::inventory(&daemon);
+        assert!(!protected.complete);
+        assert!(protected.items.is_empty());
+        assert_eq!(protected.slots.len(), 1);
+        assert!(protected.slots[0].protected);
+        assert_eq!(protected.slots[0].incomplete, Some(Refusal::Protected));
+        assert_eq!(std::fs::read(source).unwrap(), before);
+        assert_eq!(std::fs::read(artifact).unwrap(), [9_u8; 8193]);
+        std::fs::remove_file(link).unwrap();
+        assert!(self::inventory(&daemon).complete);
+    }
+}
+
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process};
