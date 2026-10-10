@@ -52,7 +52,8 @@ pub fn status(stream: UnixStream) -> Result<Status, String> {
 /// A cache request did not produce a service-issued response. None of these
 /// errors establishes whether an earlier cleanup executed; only its exact
 /// receipt can settle that question.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "reason", rename_all = "snake_case")]
 pub enum CacheError {
     Transport(String),
     /// Includes a daemon that does not understand cache requests. Preserve its
@@ -113,13 +114,19 @@ pub(crate) fn read_cache_response(
             "the daemon closed the connection before its answer ended".into(),
         ));
     }
-    serde_json::from_slice(&bytes).map_err(|error| {
-        if let Ok(Message::Rejected { reason }) = serde_json::from_slice(&bytes) {
-            CacheError::Rejected(reason)
-        } else {
-            CacheError::InvalidResponse(error.to_string())
-        }
-    })
+    decode_cache_response(&bytes)
+}
+
+pub(crate) fn decode_cache_response(bytes: &[u8]) -> Result<crate::cache::Response, CacheError> {
+    serde_json::from_slice::<Result<crate::cache::Response, CacheError>>(bytes).map_err(
+        |error| {
+            if let Ok(Message::Rejected { reason }) = serde_json::from_slice(bytes) {
+                CacheError::Rejected(reason)
+            } else {
+                CacheError::InvalidResponse(error.to_string())
+            }
+        },
+    )?
 }
 
 /// The daemon's slots and queue, its totals since it started, and its
@@ -199,11 +206,28 @@ mod cache_tests {
             ));
         }
         assert_eq!(
-            answer(b"{\"type\":\"refused\",\"reason\":\"busy\"}\n", 4096),
+            answer(
+                b"{\"Ok\":{\"type\":\"refused\",\"reason\":\"busy\"}}\n",
+                4096
+            ),
             Ok(Response::Refused {
                 reason: Refusal::Busy
             })
         );
+    }
+
+    #[test]
+    fn forwarded_errors_keep_their_wire_types() {
+        for error in [
+            CacheError::Transport("lost remote after execute".into()),
+            CacheError::Rejected("unsupported cache request".into()),
+            CacheError::InvalidResponse("remote sent malformed data".into()),
+        ] {
+            let response: Result<Response, CacheError> = Err(error.clone());
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            assert_eq!(answer(&bytes, 4096), Err(error));
+        }
     }
 
     #[test]
@@ -216,7 +240,7 @@ mod cache_tests {
                 "answer exceeds 4096 bytes".into()
             ))
         );
-        let bytes = b"{\"type\":\"refused\",\"reason\":\"busy\"}\n";
+        let bytes = b"{\"Ok\":{\"type\":\"refused\",\"reason\":\"busy\"}}\n";
         assert!(answer(bytes, bytes.len()).is_ok());
         assert!(matches!(
             answer(bytes, bytes.len() - 1),

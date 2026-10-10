@@ -220,6 +220,102 @@ mod cache_end_to_end {
     }
 
     #[test]
+    fn cache_remote_forwarding_preserves_typed_failures_and_old_daemon_rejection() {
+        use buildd::client::CacheError;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Only this fixture daemon gets a PATH containing the fixture SSH.
+        // Exercise its actual request dispatch and forwarding wire boundary
+        // without contacting hosts or changing the process-wide environment.
+        let commands = TempDir::new();
+        let ssh = commands.0.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/usr/bin/env python3
+import json, sys
+request = json.loads(sys.stdin.readline())
+assert request == {'type':'cache', 'host':None, 'operation':{'operation':'capabilities'}}
+sys.stdout.write(sys.argv[-1] + '\n')
+sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut paths = vec![commands.0.clone()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let path = std::env::join_paths(paths).unwrap();
+        let cases = [
+            (
+                "transport",
+                serde_json::to_string(&Err::<Response, _>(CacheError::Transport(
+                    "fixture remote transport lost".into(),
+                )))
+                .unwrap(),
+            ),
+            (
+                "invalid",
+                serde_json::to_string(&Err::<Response, _>(CacheError::InvalidResponse(
+                    "fixture invalid reply".into(),
+                )))
+                .unwrap(),
+            ),
+            (
+                "old",
+                serde_json::to_string(&Message::Rejected {
+                    reason: "fixture unsupported cache request".into(),
+                })
+                .unwrap(),
+            ),
+            ("malformed", "{}".into()),
+            (
+                "valid",
+                serde_json::to_string(&Ok::<_, CacheError>(Response::Refused {
+                    reason: Refusal::Busy,
+                }))
+                .unwrap(),
+            ),
+        ];
+        let remote_os = if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        };
+        let mut config = "slots = 1\njobs = 4\nmin_free_gib = 0\n".to_owned();
+        for (name, reply) in &cases {
+            config.push_str(&format!(
+                "\n[[remote]]\nname = {name:?}\nssh = \"fixture\"\nos = {remote_os:?}\ncommand = {}\n",
+                serde_json::to_string(reply).unwrap()
+            ));
+        }
+        let daemon = Daemon::configured_path(&config, Some(&path));
+        let ask = |host: &str| {
+            client::cache(daemon.connect(), Some(host.into()), Operation::Capabilities)
+        };
+        assert!(
+            matches!(ask("transport"), Err(CacheError::Transport(reason)) if reason.contains("fixture remote transport lost"))
+        );
+        assert!(
+            matches!(ask("invalid"), Err(CacheError::InvalidResponse(reason)) if reason.contains("fixture invalid reply"))
+        );
+        assert!(
+            matches!(ask("old"), Err(CacheError::Rejected(reason)) if reason.contains("fixture unsupported cache request"))
+        );
+        assert!(matches!(
+            ask("malformed"),
+            Err(CacheError::InvalidResponse(_))
+        ));
+        assert_eq!(
+            ask("valid"),
+            Ok(Response::Refused {
+                reason: Refusal::Busy
+            })
+        );
+        assert!(
+            matches!(ask("absent"), Err(CacheError::Rejected(reason)) if reason.contains("unknown cache host"))
+        );
+    }
+
+    #[test]
     fn cache_changed_and_protected_targets_are_refused_without_cleanup() {
         let (daemon, _repository, target) = fixture();
         let inventory = inventory(&daemon);
@@ -321,13 +417,18 @@ impl Daemon {
     }
 
     fn configured(config: &str) -> Self {
+        Self::configured_path(config, None)
+    }
+
+    fn configured_path(config: &str, path: Option<&std::ffi::OsStr>) -> Self {
         let home = TempDir::new();
         std::fs::write(home.0.join("config.toml"), config).unwrap();
-        let process = Process::new(env!("CARGO_BIN_EXE_buildd"))
-            .arg("daemon")
-            .env("BUILDD_HOME", &home.0)
-            .spawn()
-            .unwrap();
+        let mut command = Process::new(env!("CARGO_BIN_EXE_buildd"));
+        command.arg("daemon").env("BUILDD_HOME", &home.0);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let process = command.spawn().unwrap();
         let daemon = Self { home, process };
         let deadline = Instant::now() + Duration::from_secs(10);
         while client::connect(&daemon.home.0).is_err() {

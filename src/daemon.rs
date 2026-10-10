@@ -301,23 +301,24 @@ impl Connection {
                     self.remotes
                         .iter()
                         .find(|remote| remote.name == host)
-                        .ok_or_else(|| format!("unknown cache host {host}"))
-                        .and_then(|remote| remote::cache(&self.home, remote, operation))
+                        .ok_or_else(|| {
+                            crate::client::CacheError::Rejected(format!(
+                                "unknown cache host {host}"
+                            ))
+                        })
+                        .and_then(|remote| remote::cache(&self.home, remote, operation, &stream))
                 } else {
                     let (reply, response) = crossbeam_channel::bounded(1);
                     self.events
                         .send(Event::Cache { operation, reply })
-                        .map_err(|_| "daemon ended".to_owned())
-                        .and_then(|()| response.recv().map_err(|_| "daemon ended".to_owned()))
+                        .map_err(|_| crate::client::CacheError::Transport("daemon ended".into()))
+                        .and_then(|()| {
+                            response.recv().map_err(|_| {
+                                crate::client::CacheError::Transport("daemon ended".into())
+                            })
+                        })
                 };
-                match response {
-                    Ok(response) => {
-                        let _ = write_line(&mut stream, &response);
-                    }
-                    Err(reason) => {
-                        let _ = write_line(&mut stream, &Message::Rejected { reason });
-                    }
-                }
+                let _ = write_line(&mut stream, &response);
             }
             Err(error) => {
                 let reason = format!("not a request: {error}");

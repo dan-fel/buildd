@@ -335,11 +335,25 @@ transport asks that host's actual daemon, without relaying local cache records.
 An old daemon rejects this request: clients must show capability-unavailable,
 not invent inventory. Protocol 1 capabilities return the host/cache-home
 identity, random daemon incarnation, and all limits. No general version
-handshake is assumed.
+handshake is assumed. Cache replies serialize
+`Result<cache::Response, client::CacheError>`: `Ok` carries the service response;
+`Err` preserves transport, rejection or invalid-response failure across remote
+forwarding. An old daemon's `Message::Rejected` remains a real rejection.
+Both request and response lines are bounded at 1 MiB before decoding.
+
+A remote cache exchange owns its SSH session, with nonblocking input, output
+and diagnostics, one 10 s deadline covering partial writes and reads, and
+requester-disconnect detection. Diagnostics are drained continuously but retain
+at most 4 KiB. Every result retires and reaps the session. Timeout/disconnect
+can happen after execute reached the owner: they never imply rollback, cancel
+an approval or cause an automatic retry. Recover through the exact receipt.
 
 1. Ask for capabilities, then inventory with that exact `Owner`.
 2. Inventory returns fresh measurement time, revision, expiry, slot protection
-   and service-issued item IDs. Select at most 64 IDs from one revision and
+   and up to 64 service-issued item IDs per page. Follow `next` with an
+   `inventory_page` request naming that revision and the returned item ID;
+   continuation reads the same bounded measurement without rescanning. Select
+   at most 64 IDs across pages of one revision and
    ask for preview. Never submit paths or commands. Preview deletes nothing
    and holds no slot while a person approves it.
 3. Approve the **entire** returned preview in the caller's policy/UI, including
@@ -347,7 +361,11 @@ handshake is assumed.
    Buildd's private socket authorizes its OS owner, not workspace/UI policy.
 4. Execute acquires scheduler maintenance exclusion for every selected slot,
    then checks the complete measured target identity/metadata again. Busy,
-   changed, symlink-containing and foreign targets are refused. Validation
+   changed, symlink-containing and foreign targets are refused. These checks
+   rely on exclusive buildd ownership of slot targets: direct filesystem
+   writers must stop before inventory and remain stopped through execute.
+   Scheduler exclusion covers buildd writers; it cannot prevent an external
+   writer replacing a pathname between validation and removal. Validation
    claims are persisted as invalid before the first destructive syscall.
    Only selected incremental caches and compiled-unit files are removed;
    cleanup never invokes whole-target pruning or removes sources, records,
@@ -362,13 +380,17 @@ handshake is assumed.
    execution completes independently of client disconnect. A cancellation
    processed after completion returns that completion, not a fake rollback.
 
-Inventory is limited to 16 slots, 64 items, 8192 total visited entries and
-250 ms of scan work; each target's retained paths are limited to 512 KiB.
+Inventory is limited to 16 slots, 64 items per response page, 8192 total visited entries and
+250 ms of scan work; each target's retained root and relative paths are limited
+to 512 KiB. The root is retained once rather than repeated in every entry.
 Limits/active slots/unsupported filesystem entries label the result incomplete
 and produce no cleanup targets for the affected slot. Scans and removal check
 their deadline between filesystem operations; one blocked OS syscall cannot
 be preempted. Large targets are explicitly incomplete, not stale status sizes
-disguised as fresh inventory. Protocol 1 does not paginate within a target.
+disguised as fresh inventory. Pagination bounds responses and approval batches;
+it does not bypass the complete-target scan limits. All pages share one
+measurement revision and expiry, and invalid or expired continuation IDs are
+refused.
 Individual reclaimable estimates reuse hardlink accounting: links elsewhere
 are not counted as reclaimable, and removing several items can free more than
 the sum of their conservative individual estimates.

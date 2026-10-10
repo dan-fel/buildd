@@ -19,6 +19,7 @@ use crate::slot::{self, SlotDirectory};
 const MAX_ENTRIES: usize = 8192;
 const MAX_PATH_BYTES: usize = 512 * 1024;
 const MAX_ITEMS: usize = 64;
+const MAX_INVENTORY_PAGE_ITEMS: usize = 64;
 const MAX_SLOTS: usize = 16;
 const MAX_RECEIPTS: usize = 8;
 const TTL: Duration = Duration::from_secs(60);
@@ -36,6 +37,11 @@ pub enum Operation {
     Capabilities,
     Inventory {
         owner: Owner,
+    },
+    InventoryPage {
+        owner: Owner,
+        inventory: String,
+        after: String,
     },
     Preview {
         owner: Owner,
@@ -59,6 +65,7 @@ pub struct Capabilities {
     pub protocol: u32,
     pub max_slots: usize,
     pub max_items: usize,
+    pub max_inventory_page_items: usize,
     pub max_entries: usize,
     pub max_path_bytes: usize,
     pub scan_ms: u64,
@@ -75,6 +82,8 @@ pub struct Inventory {
     pub complete: bool,
     pub slots: Vec<Slot>,
     pub items: Vec<Item>,
+    /// Last item ID in this page when more items remain in the same measurement.
+    pub next: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -162,13 +171,21 @@ struct Fingerprint {
     changed: (i64, i64),
 }
 
-type Snapshot = BTreeMap<PathBuf, std::fs::Metadata>;
+#[derive(Debug)]
+struct Snapshot {
+    root: PathBuf,
+    entries: BTreeMap<PathBuf, std::fs::Metadata>,
+}
 
 fn same_snapshot(a: &Snapshot, b: &Snapshot) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|((path, metadata), (other, current))| {
-            path == other && fingerprint(metadata) == fingerprint(current)
-        })
+    a.root == b.root
+        && a.entries.len() == b.entries.len()
+        && a.entries
+            .iter()
+            .zip(&b.entries)
+            .all(|((path, metadata), (other, current))| {
+                path == other && fingerprint(metadata) == fingerprint(current)
+            })
 }
 
 fn fingerprint(metadata: &std::fs::Metadata) -> Fingerprint {
@@ -189,7 +206,7 @@ fn fingerprint(metadata: &std::fs::Metadata) -> Fingerprint {
 /// the existing classifier must not discover a profile outside the target.
 fn snapshot(root: &Path, deadline: Instant, remaining: &mut usize) -> Result<Snapshot, Refusal> {
     let mut found = BTreeMap::new();
-    let mut pending = vec![root.to_owned()];
+    let mut pending = vec![PathBuf::new()];
     let mut path_bytes = root.as_os_str().len();
     while let Some(path) = pending.pop() {
         if Instant::now() >= deadline || *remaining == 0 {
@@ -199,17 +216,18 @@ fn snapshot(root: &Path, deadline: Instant, remaining: &mut usize) -> Result<Sna
         if path_bytes > MAX_PATH_BYTES {
             return Err(Refusal::Limit);
         }
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| Refusal::Io)?;
+        let absolute = root.join(&path);
+        let metadata = std::fs::symlink_metadata(&absolute).map_err(|_| Refusal::Io)?;
         if metadata.file_type().is_symlink() || !(metadata.is_dir() || metadata.is_file()) {
             return Err(Refusal::Protected);
         }
         if metadata.is_dir() {
-            let entries = std::fs::read_dir(&path).map_err(|_| Refusal::Io)?;
+            let entries = std::fs::read_dir(&absolute).map_err(|_| Refusal::Io)?;
             for entry in entries {
                 if pending.len() + found.len() >= MAX_ENTRIES || Instant::now() >= deadline {
                     return Err(Refusal::Limit);
                 }
-                let child = entry.map_err(|_| Refusal::Io)?.path();
+                let child = path.join(entry.map_err(|_| Refusal::Io)?.file_name());
                 path_bytes += child.as_os_str().len();
                 if path_bytes > MAX_PATH_BYTES {
                     return Err(Refusal::Limit);
@@ -219,7 +237,10 @@ fn snapshot(root: &Path, deadline: Instant, remaining: &mut usize) -> Result<Sna
         }
         found.insert(path, metadata);
     }
-    Ok(found)
+    Ok(Snapshot {
+        root: root.to_owned(),
+        entries: found,
+    })
 }
 
 struct Measured {
@@ -330,6 +351,7 @@ impl Cache {
                 protocol: 1,
                 max_slots: MAX_SLOTS,
                 max_items: MAX_ITEMS,
+                max_inventory_page_items: MAX_INVENTORY_PAGE_ITEMS,
                 max_entries: MAX_ENTRIES,
                 max_path_bytes: MAX_PATH_BYTES,
                 scan_ms: SCAN_TIME.as_millis() as u64,
@@ -339,6 +361,18 @@ impl Cache {
             Operation::Inventory { owner } => {
                 self.check_owner(&owner)?;
                 self.inventory(home, scheduler, effects)
+            }
+            Operation::InventoryPage {
+                owner,
+                inventory,
+                after,
+            } => {
+                self.check_owner(&owner)?;
+                let measured = self.inventories.get(&inventory).ok_or(Refusal::Expired)?;
+                if milliseconds() >= measured.wire.expires_ms {
+                    return Err(Refusal::Expired);
+                }
+                inventory_page(&measured.wire, Some(&after)).map(Response::Inventory)
             }
             Operation::Preview {
                 owner,
@@ -458,6 +492,7 @@ impl Cache {
             complete: true,
             slots: Vec::new(),
             items: Vec::new(),
+            next: None,
         };
         let mut snapshots = HashMap::new();
         let mut paths = HashMap::new();
@@ -486,11 +521,10 @@ impl Cache {
                 .expect("scheduler thread owns slot transitions");
             let target = SlotDirectory::new(home, &idle.repository, idle.slot).target();
             let measured = snapshot(&target, deadline, &mut remaining).and_then(|before| {
-                let items = slot::evictables_measured(&target, &before, &idle.used);
-                if wire.items.len() + items.len() > MAX_ITEMS {
-                    return Err(Refusal::Limit);
-                }
-                let sizes = slot::disk_usage_measured(&before, &items);
+                // Classification and retained keys share target-relative
+                // coordinates; the absolute target root is retained once.
+                let items = slot::evictables_measured(Path::new(""), &before.entries, &idle.used);
+                let sizes = slot::disk_usage_measured(&before.entries, &items);
                 let after = snapshot(&target, deadline, &mut remaining)?;
                 if !same_snapshot(&before, &after) {
                     return Err(Refusal::Changed);
@@ -520,16 +554,17 @@ impl Cache {
             }
             wire.slots.push(record);
         }
+        let page = inventory_page(&wire, None).expect("initial inventory page");
         self.inventories.insert(
             revision,
             Measured {
                 expires: Instant::now() + TTL,
-                wire: wire.clone(),
+                wire,
                 snapshots,
                 paths,
             },
         );
-        Ok(Response::Inventory(wire))
+        Ok(Response::Inventory(page))
     }
 
     fn execute<D: Distance>(
@@ -616,12 +651,42 @@ impl Cache {
     }
 }
 
+fn inventory_page(measured: &Inventory, after: Option<&str>) -> Result<Inventory, Refusal> {
+    let start = match after {
+        None => 0,
+        Some(id) => {
+            let start = measured
+                .items
+                .iter()
+                .position(|item| item.id == id)
+                .ok_or(Refusal::PayloadChanged)?
+                + 1;
+            if start >= measured.items.len() || start % MAX_INVENTORY_PAGE_ITEMS != 0 {
+                return Err(Refusal::PayloadChanged);
+            }
+            start
+        }
+    };
+    let end = (start + MAX_INVENTORY_PAGE_ITEMS).min(measured.items.len());
+    Ok(Inventory {
+        owner: measured.owner.clone(),
+        revision: measured.revision.clone(),
+        measured_ms: measured.measured_ms,
+        expires_ms: measured.expires_ms,
+        complete: measured.complete,
+        slots: measured.slots.clone(),
+        items: measured.items[start..end].to_vec(),
+        next: (end < measured.items.len()).then(|| measured.items[end - 1].id.clone()),
+    })
+}
+
 fn remove_selected(measured: &Measured, items: &[Item], deadline: Instant) -> Outcome {
     let mut removed = Vec::new();
     for item in items {
         let roots = &measured.paths[&item.id];
         let snapshot = &measured.snapshots[&item.slot];
         let mut paths = snapshot
+            .entries
             .iter()
             .filter(|(path, _)| roots.iter().any(|root| path.starts_with(root)))
             .collect::<Vec<_>>();
@@ -630,10 +695,11 @@ fn remove_selected(measured: &Measured, items: &[Item], deadline: Instant) -> Ou
             let failure = if Instant::now() >= deadline {
                 Some(Refusal::Limit)
             } else {
+                let absolute = snapshot.root.join(path);
                 let result = if metadata.is_dir() {
-                    std::fs::remove_dir(path)
+                    std::fs::remove_dir(&absolute)
                 } else {
-                    std::fs::remove_file(path)
+                    std::fs::remove_file(&absolute)
                 };
                 result.err().map(|_| Refusal::Io)
             };
@@ -842,6 +908,170 @@ mod tests {
     }
 
     #[test]
+    fn workspace_sized_inventory_pages_preserve_one_exact_measurement_and_batch_limit() {
+        let mut fixture = Fixture::new();
+        // A package-sized artifact fixture: more than the 64-item approval
+        // batch and enough compiled units for a large workspace lockfile.
+        for number in 0..659 {
+            let name = format!("package{number}-{number:016x}");
+            std::fs::write(
+                fixture.target.join(format!("debug/deps/lib{name}.rlib")),
+                [number as u8; 32],
+            )
+            .unwrap();
+            let fingerprint = fixture.target.join(format!("debug/.fingerprint/{name}"));
+            std::fs::create_dir(&fingerprint).unwrap();
+            std::fs::write(fingerprint.join("lib-package"), "fingerprint").unwrap();
+        }
+        let first = fixture.inventory();
+        assert_eq!(first.items.len(), MAX_INVENTORY_PAGE_ITEMS);
+        let mut all = first.items.clone();
+        let mut next = first.next.clone();
+        while let Some(after) = next {
+            let (Response::Inventory(page), effects) = fixture.operate(Operation::InventoryPage {
+                owner: first.owner.clone(),
+                inventory: first.revision.clone(),
+                after,
+            }) else {
+                panic!("page");
+            };
+            assert!(effects.is_empty());
+            assert_eq!(page.revision, first.revision);
+            assert_eq!(page.measured_ms, first.measured_ms);
+            assert_eq!(page.expires_ms, first.expires_ms);
+            assert_eq!(page.slots, first.slots);
+            assert!(page.complete);
+            assert!(page.items.len() <= MAX_INVENTORY_PAGE_ITEMS);
+            all.extend(page.items);
+            next = page.next;
+        }
+        assert_eq!(all.len(), 662);
+        assert_eq!(
+            all.iter()
+                .map(|item| &item.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            all.len()
+        );
+        for after in [&first.items[0].id, &all.last().unwrap().id, "not-an-item"] {
+            assert_eq!(
+                fixture
+                    .operate(Operation::InventoryPage {
+                        owner: first.owner.clone(),
+                        inventory: first.revision.clone(),
+                        after: after.to_owned(),
+                    })
+                    .0,
+                Response::Refused {
+                    reason: Refusal::PayloadChanged
+                }
+            );
+        }
+        assert_eq!(
+            fixture
+                .operate(Operation::Preview {
+                    owner: first.owner.clone(),
+                    inventory: first.revision.clone(),
+                    items: all
+                        .iter()
+                        .take(MAX_ITEMS + 1)
+                        .map(|item| item.id.clone())
+                        .collect(),
+                })
+                .0,
+            Response::Refused {
+                reason: Refusal::Limit
+            }
+        );
+        let selected = [&all[10], &all[100]];
+        let preview = fixture.preview(
+            &first,
+            selected.iter().map(|item| item.id.clone()).collect(),
+        );
+        assert_eq!(
+            preview.items,
+            selected.into_iter().cloned().collect::<Vec<_>>()
+        );
+        let (response, _) = fixture.operate(Operation::Execute {
+            preview: preview.clone(),
+        });
+        assert_eq!(
+            response,
+            Response::Receipt {
+                preview: preview.clone(),
+                result: Some(Outcome::Completed {
+                    removed: preview.items.iter().map(|item| item.id.clone()).collect()
+                }),
+            }
+        );
+        assert!(
+            fixture
+                .target
+                .join("debug/deps/libpackage658-0000000000000292.rlib")
+                .exists()
+        );
+        fixture
+            .cache
+            .inventories
+            .get_mut(&first.revision)
+            .unwrap()
+            .expires = Instant::now();
+        assert_eq!(
+            fixture
+                .operate(Operation::InventoryPage {
+                    owner: first.owner,
+                    inventory: first.revision,
+                    after: first.next.unwrap(),
+                })
+                .0,
+            Response::Refused {
+                reason: Refusal::Expired
+            }
+        );
+    }
+
+    #[test]
+    fn custom_profile_kind_names_match_direct_and_measured_classification() {
+        let mut fixture = Fixture::new();
+        for profile in ["build", "deps", "x86_64-unknown-linux-gnu/build"] {
+            let deps = fixture.target.join(profile).join("deps");
+            let fingerprint = fixture
+                .target
+                .join(profile)
+                .join(".fingerprint/pkg-0123456789abcdef");
+            std::fs::create_dir_all(&deps).unwrap();
+            std::fs::create_dir_all(&fingerprint).unwrap();
+            std::fs::write(deps.join("libpkg-0123456789abcdef.rlib"), "artifact").unwrap();
+            std::fs::write(fingerprint.join("lib-pkg"), "fingerprint").unwrap();
+        }
+        let inventory = fixture.inventory();
+        let measured = &fixture.cache.inventories[&inventory.revision];
+        let original = slot::evictables(&fixture.target, &HashMap::new()).unwrap();
+        assert_eq!(original.len(), inventory.items.len());
+        for profile in ["build", "deps", "x86_64-unknown-linux-gnu/build"] {
+            let key = format!("{profile}/0123456789abcdef");
+            let item = inventory
+                .items
+                .iter()
+                .find(|item| item.unit.as_ref() == Some(&key))
+                .unwrap();
+            let direct = original
+                .iter()
+                .find(|item| item.unit.as_ref() == Some(&key))
+                .unwrap();
+            assert_eq!(
+                measured.paths[&item.id],
+                direct
+                    .paths
+                    .iter()
+                    .map(|path| path.strip_prefix(&fixture.target).unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(direct.paths.len(), 2);
+        }
+    }
+
+    #[test]
     fn changed_busy_foreign_and_mutated_payloads_delete_nothing() {
         let mut fixture = Fixture::new();
         let inventory = fixture.inventory();
@@ -977,7 +1207,14 @@ mod tests {
             let (id, _) = measured
                 .paths
                 .iter()
-                .find(|(_, paths)| **paths == item.paths)
+                .find(|(_, paths)| {
+                    **paths
+                        == item
+                            .paths
+                            .iter()
+                            .map(|path| path.strip_prefix(&fixture.target).unwrap().to_owned())
+                            .collect::<Vec<_>>()
+                })
                 .unwrap();
             assert_eq!(
                 inventory
@@ -992,7 +1229,14 @@ mod tests {
         let (id, _) = measured
             .paths
             .iter()
-            .find(|(_, paths)| paths.iter().any(|path| linked.starts_with(path)))
+            .find(|(_, paths)| {
+                paths.iter().any(|path| {
+                    linked
+                        .strip_prefix(&fixture.target)
+                        .unwrap()
+                        .starts_with(path)
+                })
+            })
             .unwrap();
         let linked_item = inventory.items.iter().find(|item| item.id == *id).unwrap();
         assert_eq!(
@@ -1016,7 +1260,7 @@ mod tests {
         // A real fixture I/O failure at the removal boundary, after a separate
         // successful validation. Execute's changed-target rejection is covered
         // above; this directly exercises the partial filesystem outcome.
-        let missing = second[0].join("file");
+        let missing = fixture.target.join(&second[0]).join("file");
         std::fs::remove_file(&missing).unwrap();
         let outcome = remove_selected(measured, &inventory.items, Instant::now() + SCAN_TIME);
         assert_eq!(

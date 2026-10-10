@@ -466,11 +466,20 @@ pub(crate) fn unit_key(target: &Path, path: &Path) -> Option<String> {
         .components()
         .map(|part| part.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()?;
-    let at = parts
+    // Cargo's kind directory follows a profile, optionally preceded by a
+    // target triple. A custom profile itself may be named `build` or `deps`.
+    parts
         .iter()
-        .position(|part| matches!(*part, "deps" | ".fingerprint" | "build"))?;
-    let hash = unit_hash(parts.get(at + 1)?)?;
-    Some(format!("{}/{hash}", parts[..at].join("/")))
+        .enumerate()
+        .skip(1)
+        .take(2)
+        .find_map(|(at, part)| {
+            if !matches!(*part, "deps" | ".fingerprint" | "build") {
+                return None;
+            }
+            let hash = unit_hash(parts.get(at + 1)?)?;
+            Some(format!("{}/{hash}", parts[..at].join("/")))
+        })
 }
 
 /// The 16-digit hash in a unit's file or directory name: after its last
@@ -708,11 +717,12 @@ pub(crate) fn disk_usage_measured(
     measured: &BTreeMap<PathBuf, std::fs::Metadata>,
     caches: &[Evictable],
 ) -> DiskUsage {
+    let index = eviction_roots(caches);
     let mut usage = DiskUsage::new(caches.len());
     for (path, metadata) in measured {
-        let cache = caches
-            .iter()
-            .position(|item| item.paths.iter().any(|root| path.starts_with(root)));
+        let cache = path
+            .ancestors()
+            .find_map(|ancestor| index.get(ancestor).copied());
         usage.record(metadata, cache);
     }
     usage.finish()
@@ -748,14 +758,18 @@ pub(crate) fn disk_usage(path: &Path, caches: &[Evictable]) -> Result<DiskUsage,
         }
         Ok(())
     }
-    let index = caches
-        .iter()
-        .enumerate()
-        .flat_map(|(index, item)| item.paths.iter().map(move |path| (path.as_path(), index)))
-        .collect::<HashMap<_, _>>();
+    let index = eviction_roots(caches);
     let mut usage = DiskUsage::new(caches.len());
     walk(path, None, &index, &mut usage)?;
     Ok(usage.finish())
+}
+
+fn eviction_roots(caches: &[Evictable]) -> HashMap<&Path, usize> {
+    caches
+        .iter()
+        .enumerate()
+        .flat_map(|(index, item)| item.paths.iter().map(move |path| (path.as_path(), index)))
+        .collect()
 }
 
 /// Removes a file, or a directory with everything under it.
@@ -1089,6 +1103,23 @@ mod tests {
             (
                 "aarch64-apple-darwin/release/deps/libx-0123456789abcdef.rmeta",
                 Some("aarch64-apple-darwin/release/0123456789abcdef"),
+            ),
+            (
+                "build/deps/libapp-0123456789abcdef.rlib",
+                Some("build/0123456789abcdef"),
+            ),
+            (
+                "deps/.fingerprint/app-0123456789abcdef",
+                Some("deps/0123456789abcdef"),
+            ),
+            (
+                "x86_64-unknown-linux-gnu/build/build/app-0123456789abcdef/out",
+                Some("x86_64-unknown-linux-gnu/build/0123456789abcdef"),
+            ),
+            ("deps/app-0123456789abcdef", None),
+            (
+                "debug/out/deps/app-0123456789abcdef",
+                Some("debug/out/0123456789abcdef"),
             ),
             ("debug/app", None),
             ("debug/deps/libnohash.rlib", None),
