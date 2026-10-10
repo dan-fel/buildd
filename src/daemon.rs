@@ -174,6 +174,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
     let mut scheduler = Scheduler::new(config.slots, config.memory, GitDistance::default());
     restore_slots(home, &config, &mut scheduler)?;
+    crate::prewarm::spawn(home, config.prewarm.clone());
     Daemon {
         home: home.to_owned(),
         cache: crate::cache::Cache::new(home)?,
@@ -358,7 +359,11 @@ impl Connection {
             }
             Ok(Request::Mirror { project }) => match mirror(&self.home, &project) {
                 Ok(path) => {
-                    let _ = write_line(&mut stream, &Mirror { path });
+                    let _ = write_line(&mut stream, &Mirror { path: path.clone() });
+                    // After the answer: the push that asked need not wait.
+                    if let Err(error) = maintain_mirror(&path) {
+                        log!("mirror {project}: {error}");
+                    }
                 }
                 Err(reason) => {
                     let _ = write_line(&mut stream, &Message::Rejected { reason });
@@ -471,6 +476,7 @@ impl Connection {
             label: request.label,
             copy_to: None,
             rerun_all: request.rerun_all,
+            optional: request.optional,
         };
         self.submit(stream, reader, submission);
     }
@@ -514,6 +520,7 @@ impl Connection {
             operation: request.operation,
             label,
             rerun_all: request.rerun_all,
+            optional: request.optional,
         };
         let pushing = format!(
             "buildd: pushing tree {} to {} ({})",
@@ -588,6 +595,7 @@ impl Connection {
             label: request.label,
             copy_to,
             rerun_all: request.rerun_all,
+            optional: request.optional,
         };
         self.submit(stream, reader, submission);
     }
@@ -674,7 +682,8 @@ fn mirror(home: &Path, project: &str) -> Result<PathBuf, String> {
         let mut init = git::command(&path);
         init.args(["init", "--bare", "-q", "--template="]);
         git::run(init)?;
-        // Loose refs keep their push times, which pruning goes by.
+        // Loose refs keep their push times, which pruning goes by: no
+        // packing after each push. [`maintain_mirror`] packs objects.
         let mut config = git::command(&path);
         config.args(["config", "gc.auto", "0"]);
         git::run(config)?;
@@ -698,6 +707,28 @@ fn mirror(home: &Path, project: &str) -> Result<PathBuf, String> {
         }
     }
     std::fs::canonicalize(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Lets git pack `mirror` once pushes have left many loose objects or packs
+/// in it, dropping the objects no reference keeps; objects of the last hour
+/// stay, for a push still arriving. Its references stay loose: [`mirror`]
+/// prunes them by their push times. Git's lock keeps it to one at a time.
+fn maintain_mirror(mirror: &Path) -> Result<(), String> {
+    let mut gc = git::command(mirror);
+    gc.args([
+        "-c",
+        "gc.auto=6700",
+        "-c",
+        "gc.autoDetach=false",
+        "-c",
+        "gc.packRefs=false",
+        "-c",
+        "gc.pruneExpire=1.hour.ago",
+        "gc",
+        "--auto",
+        "--quiet",
+    ]);
+    git::run(gc).map(drop)
 }
 
 fn write_line(stream: &mut UnixStream, value: &impl serde::Serialize) -> std::io::Result<()> {
@@ -1684,5 +1715,60 @@ fn outcome(status: ExitStatus) -> Outcome {
         (Some(code), _) => Outcome::Exited { code },
         (None, Some(signal)) => Outcome::Signaled { signal },
         (None, None) => panic!("a reaped process exited or was signaled"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::tests::{TempDir, git, repository};
+
+    fn packs(mirror: &Path) -> usize {
+        std::fs::read_dir(mirror.join("objects/pack"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_mirror_with_many_packs_is_packed_again_keeping_its_references_loose() {
+        let home = TempDir::new();
+        let mirror = mirror(&home.0, "app-1").unwrap();
+        let repository = repository();
+        git(
+            &repository.0,
+            &[
+                "push",
+                "-q",
+                mirror.to_str().unwrap(),
+                "HEAD:refs/buildd/pushed",
+            ],
+        );
+        maintain_mirror(&mirror).unwrap();
+        let few = packs(&mirror);
+
+        let scratch = TempDir::new();
+        for push in 0..60 {
+            let file = scratch.0.join("blob");
+            std::fs::write(&file, format!("push {push}\n")).unwrap();
+            let blob = git(&mirror, &["hash-object", "-w", file.to_str().unwrap()]);
+            // Repacking without -a packs only what references reach.
+            git(
+                &mirror,
+                &["update-ref", &format!("refs/kept/{push}"), blob.trim()],
+            );
+            git(&mirror, &["repack", "-q"]);
+        }
+        assert!(packs(&mirror) > 50);
+        maintain_mirror(&mirror).unwrap();
+        assert!(packs(&mirror) <= few + 1, "{} packs", packs(&mirror));
+        git(&mirror, &["cat-file", "-e", "refs/buildd/pushed^{tree}"]);
+        assert!(mirror.join("refs/buildd/pushed").is_file());
     }
 }

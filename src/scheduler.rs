@@ -97,6 +97,8 @@ pub(crate) struct Submission {
     pub(crate) copy_to: Option<PathBuf>,
     /// Run test binaries that passed before and are unchanged too.
     pub(crate) rerun_all: bool,
+    /// Optional work: see [`crate::protocol::BuildRequest::optional`].
+    pub(crate) optional: bool,
 }
 
 /// What the daemon must do.
@@ -170,6 +172,8 @@ struct Waiter {
     /// Who asked, for people watching.
     who: String,
     since: Instant,
+    /// It asked for optional work.
+    optional: bool,
 }
 
 struct Job {
@@ -364,6 +368,11 @@ impl Job {
         matches!(self.state, State::Queued)
     }
 
+    /// Whether only optional work waits for it.
+    fn optional(&self) -> bool {
+        self.waiters.iter().all(|waiter| waiter.optional)
+    }
+
     fn cancelled(&self) -> bool {
         matches!(
             self.state,
@@ -483,6 +492,7 @@ impl<D: Distance> Scheduler<D> {
             label,
             copy_to,
             rerun_all,
+            optional,
         } = submission;
         assert!(!self.waiting.contains_key(&waiter), "a waiter submits once");
         self.clock += 1;
@@ -498,6 +508,7 @@ impl<D: Distance> Scheduler<D> {
             worktree: source.worktree.clone(),
             who: who.clone(),
             since: Instant::now(),
+            optional,
         }];
         let mut reports = Vec::new();
         for id in superseded {
@@ -1027,9 +1038,19 @@ impl<D: Distance> Scheduler<D> {
         // to take there: a later build waiting for that slot waits for them
         // too.
         let mut claimed = HashMap::<usize, u64>::new();
+        // Optional work starts only while no other build waits and another
+        // slot stays free for one that arrives.
+        let others_wait = self
+            .jobs
+            .values()
+            .any(|job| job.queued() && !job.optional());
         for id in self.queue_order() {
-            if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
+            let busy = self.slots.iter().filter(|slot| slot.busy()).count();
+            if busy >= self.capacity {
                 break;
+            }
+            if self.jobs[&id].optional() && (others_wait || self.capacity - busy < 2) {
+                continue;
             }
             // A build that does not fit waits, and so does everything behind
             // it: smaller builds slipping past would keep it waiting for good.
@@ -1126,11 +1147,17 @@ impl<D: Distance> Scheduler<D> {
                     .estimate(job)
                     .or_else(|| typical(&self.slots, &job.repository))
                     .unwrap_or(0);
-                (expected.saturating_sub(waited), job.order, *id)
+                // Optional work comes after every other build.
+                (
+                    job.optional(),
+                    expected.saturating_sub(waited),
+                    job.order,
+                    *id,
+                )
             })
             .collect::<Vec<_>>();
         queued.sort_unstable();
-        queued.into_iter().map(|(_, _, id)| id).collect()
+        queued.into_iter().map(|(.., id)| id).collect()
     }
 
     /// What the running builds are expected to use at their peaks.
@@ -1288,6 +1315,11 @@ impl<D: Distance> Scheduler<D> {
         claimed: &HashMap<usize, u64>,
     ) -> Option<(Hold, usize)> {
         let job = &self.jobs[&id];
+        // Optional work never waits for a busy slot: it holds an idle one
+        // at most.
+        if job.optional() {
+            return None;
+        }
         let unit_ms = *self.unit_ms.get(&job.repository)?;
         let cold_ms = work.saturating_mul(unit_ms);
         let mut best: Option<(Hold, usize)> = None;
@@ -1540,6 +1572,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            optional: false,
         })
     }
 
@@ -1563,7 +1596,96 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            optional: false,
         })
+    }
+
+    fn submit_optional(
+        scheduler: &mut Scheduler<Table>,
+        waiter: u64,
+        worktree: &str,
+        tree: &str,
+    ) -> Vec<Effect> {
+        scheduler.submit(Submission {
+            waiter: WaiterId(waiter),
+            source: source(worktree),
+            revision: revision(tree),
+            operation: check(),
+            label: None,
+            copy_to: None,
+            rerun_all: false,
+            optional: true,
+        })
+    }
+
+    #[test]
+    fn optional_work_waits_behind_other_builds_and_leaves_a_slot_free() {
+        let mut scheduler = scheduler(3);
+        let [(running, ..)] = starts(&submit(&mut scheduler, 1, "/a", "a1"))[..] else {
+            panic!("a build starts in an idle slot");
+        };
+        // Two slots are idle: optional work may take one.
+        assert_eq!(
+            starts(&submit_optional(&mut scheduler, 2, "/p", "p1")).len(),
+            1
+        );
+        // One is left: it stays free for a build someone asks for.
+        assert!(starts(&submit_optional(&mut scheduler, 3, "/q", "q1")).is_empty());
+        assert_eq!(starts(&submit(&mut scheduler, 4, "/b", "b1")).len(), 1);
+        // A queued build waits behind the optional one until someone asks
+        // for the optional one too.
+        assert!(starts(&submit(&mut scheduler, 5, "/c", "c1")).is_empty());
+        let (_, queue) = scheduler.status(|_| 0);
+        let order = queue
+            .iter()
+            .map(|build| build.revision.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["c1", "q1"], "optional work queues last");
+        submit(&mut scheduler, 6, "/q", "q1");
+        let (_, queue) = scheduler.status(|_| 0);
+        assert_eq!(queue[0].revision.to_string(), "q1", "joined: ordinary work");
+        let next = scheduler.exited(running, &ok(), None, BuildReport::default());
+        assert_eq!(starts(&next)[0].2, "q1");
+    }
+
+    #[test]
+    fn cache_exclusion_counts_against_optional_work_and_release_starts_it() {
+        let mut scheduler = scheduler(3);
+        let [(running, ..)] = starts(&submit(&mut scheduler, 1, "/a", "a1"))[..] else {
+            panic!("the first build starts");
+        };
+        scheduler.exited(running, &ok(), None, BuildReport::default());
+        let name = scheduler.status(|_| 0).0[0].name.clone();
+        let acquired = scheduler.cache_acquire(&name).unwrap();
+        for (waiter, tree, optional) in [(2, "b1", false), (3, "p1", true)] {
+            let mut source = source(&format!("/{tree}"));
+            source.repository = PathBuf::from(format!("/{tree}/.git"));
+            let effects = scheduler.submit(Submission {
+                waiter: WaiterId(waiter),
+                source,
+                revision: revision(tree),
+                operation: check(),
+                label: None,
+                copy_to: None,
+                rerun_all: false,
+                optional,
+            });
+            assert_eq!(starts(&effects).len(), usize::from(!optional));
+        }
+        let ready = scheduler.cache_release(acquired.key, false);
+        let started = starts(&ready);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].2, "p1");
+        assert_eq!(
+            scheduler
+                .status(|_| 0)
+                .0
+                .iter()
+                .filter(|slot| slot.build.is_some())
+                .count(),
+            2,
+            "cache exclusion is released and optional work leaves one slot free"
+        );
     }
 
     fn starts(effects: &[Effect]) -> Vec<(JobId, usize, String)> {
@@ -1691,6 +1813,7 @@ mod tests {
             label: None,
             copy_to: copy_to.map(PathBuf::from),
             rerun_all: false,
+            optional: false,
         };
         let first = scheduler.submit(request(1, Some("/out"), &[]));
         assert_eq!(starts(&first).len(), 1);
@@ -1895,6 +2018,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            optional: false,
         });
         assert_eq!(starts(&other).len(), 1);
         let (slots, queue) = scheduler.status(|_| 0);
@@ -2214,6 +2338,7 @@ mod tests {
             label: Some("agent-1".into()),
             copy_to: None,
             rerun_all: false,
+            optional: false,
         });
         let [(job, ..)] = starts(&first)[..] else {
             panic!("{first:?}");

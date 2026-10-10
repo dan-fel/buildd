@@ -188,6 +188,7 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
         copy_to: options.copy_to,
         rerun_all: options.rerun_all,
         os: options.os,
+        optional: false,
     };
     let last = if options.json {
         client::build(connect(home)?, request, |message| {

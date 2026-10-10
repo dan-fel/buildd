@@ -1068,6 +1068,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            optional: false,
         });
         assert!(
             !effects

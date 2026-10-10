@@ -182,13 +182,37 @@ buildd failures [--hours 24] [--os linux]
   test times only from nextest.
 - `--os linux` asks the remote host's daemon, whose logs stay on that host.
 
+## Prewarming a branch
+
+```text
+every minute: has main moved?
+  └─ yes → $BUILDD_HOME/prewarm/<project> (buildd's own worktree) at the new commit
+           → each configured build submitted as optional work
+                 queues behind every other build
+                 starts only while another slot stays free
+                 becomes ordinary work when someone asks for the same build
+```
+
+```toml
+[[prewarm]]
+repository = "/home/me/src/app"     # any worktree of it
+branch = "main"
+os = "linux"                        # optional: build on that remote host
+builds = [["test", "--workspace", "--no-run"],
+          ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]]
+```
+
+Worktrees branching from the branch then find a slot holding its compiled
+units. `git worktree list` shows buildd's worktree.
+
 ## Remote hosts
 
 ```text
  this machine                                  remote (os = linux)
  buildd test --os linux
-   │ snapshot → commit
-   ├── git push over ssh ───────────────────▶ mirrors/<project>  (last 20 trees)
+   │ snapshot → commit on HEAD
+   ├── git push over ssh ───────────────────▶ mirrors/<project>  (last 20 trees,
+   │     only what changed since              packed by git gc now and then)
    ├── ssh 'buildd serve' ──────────────────▶ daemon: own slots, budget, config
    ◀── messages streamed back ─────────────── slot shows as  pc:<slot>
 
@@ -268,6 +292,7 @@ events.jsonl         every event as JSON (rotates to .1 at 10 MB)
 logs/                every build's output (see Logs and failures)
 slots/               see Slots
 mirrors/<project>    repositories remote machines push into
+prewarm/<project>    buildd's worktree of each prewarmed repository
 ssh-<hash>           SSH connection for builds  ┐ kept open
 ssh-s-<hash>         SSH connection for status  ┘ 10 minutes
 ```

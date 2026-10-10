@@ -141,7 +141,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
                 let held = build.held.as_ref().map_or_else(String::new, |hold| {
                     format!(
                         " · for {} (~{}, cold ~{})",
-                        hold.slot,
+                        short_slot(&hold.slot),
                         seconds(hold.wait_ms),
                         seconds(hold.cold_ms)
                     )
@@ -312,19 +312,37 @@ fn remote_lines(remote: &RemoteActivity) -> Vec<Line<'static>> {
     let mut first = vec![
         name,
         Span::from(format!(
-            "  jobs {}/{} · memory {:.1}/{} · {free} · {} queued",
+            "  jobs {}/{} · memory {:.1}/{} · {free}",
             status.jobs - status.idle_jobs,
             status.jobs,
             gib_number(status.memory_in_use),
             gib(status.memory),
-            status.queue.len()
         )),
     ];
     if status.draining {
         first.push(Span::from("  draining").yellow());
     }
-    std::iter::once(Line::from(first))
-        .chain(status.slots.iter().map(|slot| {
+    // Slots grouped by repository, in the daemon's order.
+    let mut repositories: Vec<(String, Vec<(&str, &SlotStatus)>)> = Vec::new();
+    for slot in &status.slots {
+        let (repository, index) = split_slot(&slot.name);
+        match repositories.last_mut() {
+            Some((last, slots)) if *last == repository => slots.push((index, slot)),
+            _ => repositories.push((repository, vec![(index, slot)])),
+        }
+    }
+    let width = repositories
+        .iter()
+        .map(|(repository, _)| repository.len())
+        .chain(std::iter::once("queued".len()))
+        .max()
+        .expect("the chain holds one width");
+    let mut lines = vec![Line::from(first)];
+    for (repository, slots) in &repositories {
+        // The repository's name heads its first line only.
+        let mut label = repository.as_str();
+        let mut idle = Vec::new();
+        for (index, slot) in slots {
             let what = match &slot.build {
                 Some(build) => {
                     let phase = match build.phase {
@@ -333,20 +351,76 @@ fn remote_lines(remote: &RemoteActivity) -> Vec<Line<'static>> {
                         Phase::Copying => "copying",
                     };
                     format!(
-                        "{} @ {} for {}  {} {}",
+                        "{index}  {} @ {} for {}  {phase} {}",
                         build.operation,
                         build.revision.short(),
                         build.who.join(", "),
-                        phase,
                         seconds(build.elapsed_ms)
                     )
                 }
-                None if slot.maintaining => "pruning".to_owned(),
-                None => "idle".to_owned(),
+                None if slot.maintaining => format!("{index}  pruning"),
+                None => {
+                    idle.push(*index);
+                    continue;
+                }
             };
-            Line::from(format!("    {:<26} {what}", slot.name))
-        }))
-        .collect()
+            lines.push(Line::from(format!("    {label:<width$}  {what}")));
+            label = "";
+        }
+        if !idle.is_empty() {
+            lines.push(
+                Line::from(format!("    {label:<width$}  idle: {}", idle.join(", "))).dark_gray(),
+            );
+        }
+    }
+    for build in &status.queue {
+        lines.push(
+            Line::from(format!(
+                "    {:<width$}  {} @ {} for {}  waiting {}",
+                "queued",
+                build.operation,
+                build.revision.short(),
+                build.who.join(", "),
+                seconds(build.waited_ms)
+            ))
+            .yellow(),
+        );
+    }
+    lines
+}
+
+/// A slot's name as the view shows it: `short_slot("app-c71684b27238d845/2")`
+/// is `app-c716/2`. See [`split_slot`].
+fn short_slot(name: &str) -> String {
+    match split_slot(name) {
+        (repository, "") => repository,
+        (repository, index) => format!("{repository}/{index}"),
+    }
+}
+
+/// A slot name's repository, shortened, and the slot's number. A slot is
+/// named after its repository's directory and the 16-digit hash of the
+/// repository's path, and a remote host names its mirror of a repository
+/// after that name and hashes again. The view keeps the first 4 digits of the
+/// first hash, enough to tell repositories apart, so a mirror's slots show
+/// the name of the repository it mirrors.
+fn split_slot(name: &str) -> (String, &str) {
+    let (repository, index) = name.rsplit_once('/').unwrap_or((name, ""));
+    let mut parts = Vec::new();
+    let mut hashed = false;
+    for part in repository.split('-') {
+        let hash = part.len() == 16
+            && part
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        if !hash {
+            parts.push(part);
+        } else if !hashed {
+            parts.push(&part[..4]);
+            hashed = true;
+        }
+    }
+    (parts.join("-"), index)
 }
 
 /// A slot's two lines: its disk and what it does, then for whom.
@@ -371,7 +445,7 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
         Style::new().fg(Color::Cyan)
     };
     let mut first = vec![
-        Span::from(format!("{:<26} ", slot.name)).bold(),
+        Span::from(format!("{:<26} ", short_slot(&slot.name))).bold(),
         Span::styled(bar, bar_style),
         Span::from("  "),
     ];
@@ -486,6 +560,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             warm,
             first,
         } => {
+            let slot = short_slot(slot);
             let mut text = format!(
                 "{slot} started {operation} @ {} for {}",
                 revision.short(),
@@ -511,6 +586,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             usage,
             ..
         } => {
+            let slot = short_slot(slot);
             let (ended, style) = match outcome {
                 Outcome::Exited { code: 0 } => ("finished", plain),
                 Outcome::Exited { .. } => ("failed", Style::new().fg(Color::Red)),
@@ -549,14 +625,16 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             revision,
         } => (
             format!(
-                "{slot} stopped {operation} @ {}: nobody waits",
+                "{} stopped {operation} @ {}: nobody waits",
+                short_slot(slot),
                 revision.short()
             ),
             Style::new().fg(Color::Yellow),
         ),
         EventKind::Duplicated { slot, crates } => (
             format!(
-                "{slot} holds {crates} crates in several variants: builds select different features"
+                "{} holds {crates} crates in several variants: builds select different features",
+                short_slot(slot)
             ),
             Style::new().fg(Color::Yellow),
         ),
@@ -568,7 +646,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             format!(
                 "{} waits for {} to {operation}: ~{} there, ~{} cold in an idle slot",
                 who.join(", "),
-                hold.slot,
+                short_slot(&hold.slot),
                 seconds(hold.wait_ms),
                 seconds(hold.cold_ms)
             ),
@@ -603,6 +681,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             in_use,
             cleared,
         } => {
+            let slot = short_slot(slot);
             if *cleared {
                 (
                     format!(
@@ -940,6 +1019,51 @@ mod tests {
             .find(|line| line.contains("linux-slot/0 finished"))
             .unwrap_or_else(|| panic!("{text}"));
         assert!(line.contains(" pc linux-slot/0"), "{line}");
+    }
+
+    #[test]
+    fn a_remote_host_lists_each_repositorys_busy_slots_and_folds_idle_ones() {
+        let now = SystemTime::now();
+        let mut local = sample(now);
+        let mut remote = sample(now);
+        remote.remotes.clear();
+        let busy = remote.status.slots[0].clone();
+        let idle = SlotStatus {
+            build: None,
+            ..busy.clone()
+        };
+        let named = |slot: &SlotStatus, name: &str| SlotStatus {
+            name: name.into(),
+            ..slot.clone()
+        };
+        remote.status.slots = vec![
+            named(&busy, "app-c71684b27238d845-94eb9688803b5f5f/0"),
+            named(&idle, "app-c71684b27238d845-94eb9688803b5f5f/1"),
+            named(&idle, "app-c71684b27238d845-94eb9688803b5f5f/2"),
+            named(&idle, "app-49ce9bdcdd686f74/0"),
+        ];
+        local.remotes[0].activity = Ok(Box::new(remote));
+        let text = screen(&Ok(local), now);
+        for expected in [
+            "pc (linux)  jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free",
+            "    app-c716  0  check -p app-ui @ 7f3a9c0d1e for agent-1, agent-7  testing 4.2 s",
+            "              idle: 1, 2",
+            "    app-49ce  idle: 0",
+            "    queued    check -p app-protocol @ 3d2e000000 for agent-5  waiting 2.1 s",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn slot_names_keep_four_digits_of_their_repositorys_hash() {
+        assert_eq!(short_slot("app-c71684b27238d845/2"), "app-c716/2");
+        assert_eq!(
+            short_slot("app-c71684b27238d845-94eb9688803b5f5f/0"),
+            "app-c716/0"
+        );
+        assert_eq!(short_slot("my-app-282a148ae2b801ed/1"), "my-app-282a/1");
+        assert_eq!(short_slot("app-c716/1"), "app-c716/1");
     }
 
     #[test]
