@@ -9,23 +9,29 @@ fn cache_capabilities_and_foreign_owner_round_trip() {
     else {
         panic!("typed capabilities");
     };
-    assert_eq!(capabilities.protocol, 1);
+    assert_eq!(capabilities.protocol, 2);
     let mut owner = capabilities.owner;
-    let Response::Inventory(inventory) = client::cache(
+    let Response::Slots { slots, next, .. } = client::cache(
         daemon.connect(),
         None,
-        Operation::Inventory {
+        Operation::Slots {
             owner: owner.clone(),
+            after: None,
         },
     )
     .unwrap() else {
-        panic!("typed inventory");
+        panic!("typed slot listing");
     };
-    assert!(inventory.complete);
-    assert!(inventory.items.is_empty());
+    assert!(slots.is_empty());
+    assert!(next.is_none());
     owner.host = "foreign".into();
     assert_eq!(
-        client::cache(daemon.connect(), None, Operation::Inventory { owner }).unwrap(),
+        client::cache(
+            daemon.connect(),
+            None,
+            Operation::Slots { owner, after: None }
+        )
+        .unwrap(),
         Response::Refused {
             reason: Refusal::ForeignOwner
         }
@@ -35,6 +41,7 @@ fn cache_capabilities_and_foreign_owner_round_trip() {
 mod cache_end_to_end {
     use super::*;
     use buildd::cache::{Inventory, Operation, Outcome, Preview, Refusal, Response};
+    use std::io::{BufRead as _, BufReader, Write as _};
 
     // All artifact mutation and cleanup in these tests is under this daemon's
     // temporary home. Its slot and source checkout are created by a real build.
@@ -69,21 +76,75 @@ mod cache_end_to_end {
     }
 
     fn operate(daemon: &Daemon, operation: Operation) -> Response {
-        client::cache(daemon.connect(), None, operation).unwrap()
+        let owner = match &operation {
+            Operation::Preview { owner, .. } | Operation::PreviewStatus { owner, .. } => {
+                Some(owner.clone())
+            }
+            _ => None,
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut response = client::cache(daemon.connect(), None, operation).unwrap();
+        loop {
+            assert!(
+                Instant::now() < until,
+                "cache owner work did not complete: {response:?}"
+            );
+            let next = match &response {
+                Response::Preparing { preparation } => Operation::PreviewStatus {
+                    owner: owner.clone().expect("preparation owner"),
+                    preparation: preparation.clone(),
+                },
+                Response::Receipt {
+                    preview,
+                    executing: true,
+                    ..
+                } => Operation::Receipt {
+                    preview: preview.clone(),
+                },
+                _ => return response,
+            };
+            response = client::cache(daemon.connect(), None, next).unwrap();
+        }
     }
 
     fn inventory(daemon: &Daemon) -> Inventory {
         let Response::Capabilities(capabilities) = operate(daemon, Operation::Capabilities) else {
             panic!("cache capabilities");
         };
-        let Response::Inventory(inventory) = operate(
+        let Response::Slots {
+            slots, next: None, ..
+        } = operate(
+            daemon,
+            Operation::Slots {
+                owner: capabilities.owner.clone(),
+                after: None,
+            },
+        )
+        else {
+            panic!("fixture slot listing")
+        };
+        let Response::Inventory(mut inventory) = operate(
             daemon,
             Operation::Inventory {
                 owner: capabilities.owner,
+                slots: slots.into_iter().map(|slot| slot.id).collect(),
             },
         ) else {
             panic!("cache inventory");
         };
+        while inventory.items.is_empty() && inventory.next.is_some() && !inventory.complete {
+            let Response::Inventory(page) = operate(
+                daemon,
+                Operation::InventoryPage {
+                    owner: inventory.owner.clone(),
+                    inventory: inventory.revision.clone(),
+                    after: inventory.next.take().unwrap(),
+                },
+            ) else {
+                panic!("inventory progress")
+            };
+            inventory = page;
+        }
         inventory
     }
 
@@ -117,6 +178,7 @@ mod cache_end_to_end {
         let pending = Response::Receipt {
             preview: preview.clone(),
             result: None,
+            executing: false,
         };
         assert_eq!(
             operate(
@@ -129,7 +191,7 @@ mod cache_end_to_end {
         );
 
         let mut changed = preview.clone();
-        changed.items[0].reclaimable_bytes += 1;
+        changed.items[0].reclaimable_bytes = Some(changed.items[0].reclaimable_bytes.unwrap() + 1);
         assert_eq!(
             operate(&daemon, Operation::Execute { preview: changed }),
             Response::Refused {
@@ -142,6 +204,7 @@ mod cache_end_to_end {
         let cancelled_receipt = Response::Receipt {
             preview: cancelled.clone(),
             result: Some(Outcome::Cancelled),
+            executing: false,
         };
         assert_eq!(
             operate(
@@ -158,11 +221,34 @@ mod cache_end_to_end {
         );
         assert!(artifact.exists());
 
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::ReleaseInventory {
+                    owner: inventory.owner.clone(),
+                    inventory: inventory.revision.clone(),
+                }
+            ),
+            Response::Released {
+                inventory: inventory.revision.clone()
+            }
+        );
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Receipt {
+                    preview: preview.clone()
+                }
+            ),
+            pending
+        );
+
         let complete = Response::Receipt {
             preview: preview.clone(),
             result: Some(Outcome::Completed {
                 removed: vec![preview.items[0].id.clone()],
             }),
+            executing: false,
         };
         assert_eq!(
             operate(
@@ -217,6 +303,93 @@ mod cache_end_to_end {
         );
         assert_eq!(operate(&daemon, Operation::Receipt { preview }), complete);
         assert_eq!(std::fs::read_to_string(artifact).unwrap(), "new artifact");
+    }
+
+    #[test]
+    fn cache_owned_execution_survives_requester_disconnect_and_keeps_status_responsive() {
+        let (daemon, _, target) = fixture();
+        let group = target.join("debug/incremental/approval-unselected");
+        for index in 0..2000 {
+            std::fs::write(group.join(format!("artifact-{index:04}")), "artifact").unwrap();
+        }
+        let inventory = inventory(&daemon);
+        let item = inventory
+            .items
+            .iter()
+            .find(|item| {
+                item.unit.is_none() && item.reclaimable_bytes.is_some_and(|bytes| bytes > 100_000)
+            })
+            .expect("large measured incremental scope");
+        let Response::Preview(preview) = operate(
+            &daemon,
+            Operation::Preview {
+                owner: inventory.owner.clone(),
+                inventory: inventory.revision.clone(),
+                items: vec![item.id.clone()],
+            },
+        ) else {
+            panic!("approval");
+        };
+        let mut requester = daemon.connect();
+        serde_json::to_writer(
+            &mut requester,
+            &buildd::protocol::Request::Cache {
+                host: None,
+                operation: Operation::Execute {
+                    preview: preview.clone(),
+                },
+            },
+        )
+        .unwrap();
+        requester.write_all(b"\n").unwrap();
+        let mut line = String::new();
+        let mut requester = BufReader::new(requester);
+        requester.read_line(&mut line).unwrap();
+        let response: Result<Response, buildd::client::CacheError> =
+            serde_json::from_str(&line).unwrap();
+        assert!(
+            matches!(
+                response.unwrap(),
+                Response::Receipt {
+                    executing: true,
+                    result: None,
+                    ..
+                }
+            ),
+            "acceptance owns execution before a worker completion"
+        );
+        drop(requester);
+        let status = daemon.connect();
+        status
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            client::status(status).unwrap().slots.len(),
+            1,
+            "status is serviced by the event loop while filesystem work has its own worker"
+        );
+        assert!(matches!(
+            operate(
+                &daemon,
+                Operation::Receipt {
+                    preview: preview.clone()
+                }
+            ),
+            Response::Receipt {
+                result: Some(Outcome::Completed { .. }),
+                executing: false,
+                ..
+            }
+        ));
+        let completed = operate(
+            &daemon,
+            Operation::Receipt {
+                preview: preview.clone(),
+            },
+        );
+        assert_eq!(operate(&daemon, Operation::Execute { preview }), completed);
+        assert!(!group.exists());
+        assert!(target.join("debug/deps/pkg-aaaaaaaaaaaaaaaa").exists());
     }
 
     #[test]
@@ -316,13 +489,20 @@ sys.stdout.flush()
     }
 
     #[test]
-    fn cache_changed_and_protected_targets_are_refused_without_cleanup() {
+    fn cache_changed_targets_are_terminal_refusals_and_symlink_leaves_preserve_sources() {
         let (daemon, _repository, target) = fixture();
         let inventory = inventory(&daemon);
         assert!(inventory.complete, "{inventory:?}");
         let preview = preview(&daemon, &inventory);
         let artifact = target.join("debug/deps/pkg-aaaaaaaaaaaaaaaa");
         std::fs::write(&artifact, [9_u8; 8193]).unwrap();
+        let refused = Response::Receipt {
+            preview: preview.clone(),
+            result: Some(Outcome::Refused {
+                reason: Refusal::Changed,
+            }),
+            executing: false,
+        };
         assert_eq!(
             operate(
                 &daemon,
@@ -330,43 +510,45 @@ sys.stdout.flush()
                     preview: preview.clone()
                 }
             ),
-            Response::Refused {
-                reason: Refusal::Changed
-            }
+            refused
         );
+        assert_eq!(operate(&daemon, Operation::Receipt { preview }), refused);
         assert_eq!(std::fs::read(&artifact).unwrap(), [9_u8; 8193]);
         assert!(
             target
                 .join("debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa/file")
                 .exists()
         );
-        assert_eq!(
-            operate(
-                &daemon,
-                Operation::Receipt {
-                    preview: preview.clone()
-                }
-            ),
-            Response::Receipt {
-                preview,
-                result: None
-            }
-        );
-
         let source = target.parent().unwrap().join("src/src/lib.rs");
         let before = std::fs::read(&source).unwrap();
-        let link = target.join("debug/incremental/approval-protected");
+        let link = target.join("debug/incremental/approval-link");
         std::os::unix::fs::symlink(&source, &link).unwrap();
-        let protected = self::inventory(&daemon);
-        assert!(!protected.complete);
-        assert!(protected.items.is_empty());
-        assert_eq!(protected.slots.len(), 1);
-        assert!(protected.slots[0].protected);
-        assert_eq!(protected.slots[0].incomplete, Some(Refusal::Protected));
+        let fresh = self::inventory(&daemon);
+        assert!(fresh.complete, "{fresh:?}");
+        let Response::Preview(preview) = operate(
+            &daemon,
+            Operation::Preview {
+                owner: fresh.owner.clone(),
+                inventory: fresh.revision.clone(),
+                items: fresh
+                    .items
+                    .iter()
+                    .filter(|item| item.unit.is_none())
+                    .map(|item| item.id.clone())
+                    .collect(),
+            },
+        ) else {
+            panic!("symlink leaf preview")
+        };
+        assert!(matches!(
+            operate(&daemon, Operation::Execute { preview }),
+            Response::Receipt {
+                result: Some(Outcome::Completed { .. }),
+                ..
+            }
+        ));
+        assert!(std::fs::symlink_metadata(link).is_err());
         assert_eq!(std::fs::read(source).unwrap(), before);
-        assert_eq!(std::fs::read(artifact).unwrap(), [9_u8; 8193]);
-        std::fs::remove_file(link).unwrap();
-        assert!(self::inventory(&daemon).complete);
     }
 }
 

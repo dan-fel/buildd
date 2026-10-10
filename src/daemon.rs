@@ -54,6 +54,10 @@ enum Event {
         operation: crate::cache::Operation,
         reply: Sender<crate::cache::Response>,
     },
+    CacheCompleted {
+        work: crate::cache::Work,
+        result: Result<bool, crate::cache::Refusal>,
+    },
     Submit {
         submission: Submission,
         messages: Sender<Message>,
@@ -162,6 +166,22 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     );
 
     let (events, received) = crossbeam_channel::unbounded();
+    let (cache_work, cache_received) = crossbeam_channel::bounded::<crate::cache::Work>(1);
+    let cache_events = events.clone();
+    std::thread::Builder::new()
+        .name("buildd-cache".into())
+        .spawn(move || {
+            while let Ok(work) = cache_received.recv() {
+                let (work, result) = work.run();
+                if cache_events
+                    .send(Event::CacheCompleted { work, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| format!("could not start the cache worker: {error}"))?;
     let accepting = Accepting {
         home: home.to_owned(),
         remotes: Arc::new(config.remotes.clone()),
@@ -178,6 +198,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     Daemon {
         home: home.to_owned(),
         cache: crate::cache::Cache::new(home)?,
+        cache_work,
         config,
         budget,
         events,
@@ -740,6 +761,7 @@ fn write_line(stream: &mut UnixStream, value: &impl serde::Serialize) -> std::io
 
 struct Daemon {
     cache: crate::cache::Cache,
+    cache_work: Sender<crate::cache::Work>,
     home: PathBuf,
     config: Config,
     budget: Budget,
@@ -760,7 +782,14 @@ struct Daemon {
 impl Daemon {
     fn drive(mut self, received: &Receiver<Event>) -> ! {
         loop {
-            let event = match self.scheduler.next_maintenance() {
+            self.cache.expire(Instant::now());
+            let due = self
+                .scheduler
+                .next_maintenance()
+                .into_iter()
+                .chain(self.cache.next_expiry())
+                .min();
+            let event = match due {
                 Some(due) => match received.recv_deadline(due) {
                     Ok(event) => event,
                     Err(RecvTimeoutError::Timeout) => {
@@ -784,6 +813,10 @@ impl Daemon {
                             .operate(&self.home, &mut self.scheduler, operation);
                     let _ = reply.send(response);
                     effects
+                }
+                Event::CacheCompleted { work, result } => {
+                    self.cache
+                        .completed(&self.home, &mut self.scheduler, work, result)
                 }
                 Event::Submit {
                     submission,
@@ -889,6 +922,11 @@ impl Daemon {
             };
             for effect in effects {
                 self.apply(effect);
+            }
+            if let Some(work) = self.cache.take_work() {
+                self.cache_work
+                    .try_send(work)
+                    .expect("one live cache worker owns its work");
             }
         }
     }
@@ -1032,6 +1070,7 @@ impl Daemon {
                 repository,
                 slot,
                 used,
+                ..
             }) => {
                 let directory = SlotDirectory::new(&self.home, &repository, slot);
                 let name = slot_name(&repository, slot);

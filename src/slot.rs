@@ -116,6 +116,10 @@ impl SlotDirectory {
         )
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
     /// The slot's checkout.
     pub(crate) fn source(&self) -> PathBuf {
         self.0.join("src")
@@ -503,11 +507,21 @@ pub(crate) struct Evictable {
 /// The profile directories under `target`, for the host and each target
 /// triple: `<target>/[<triple>/]<profile>`, each with the target-relative
 /// name used in unit keys.
+fn real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
 fn profile_directories(target: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    if !real_directory(target) {
+        return Err(format!(
+            "{} is not a real target directory",
+            target.display()
+        ));
+    }
     let is_profile = |path: &Path| {
         ["deps", ".fingerprint", "incremental"]
             .iter()
-            .any(|part| path.join(part).is_dir())
+            .any(|part| real_directory(&path.join(part)))
     };
     let mut profiles = Vec::new();
     for entry in read_directory(target)? {
@@ -516,11 +530,12 @@ fn profile_directories(target: &Path) -> Result<Vec<(PathBuf, String)>, String> 
             .and_then(|name| name.to_str())
             .map(str::to_owned);
         let Some(name) = name else { continue };
-        if is_profile(&entry) {
+        if real_directory(&entry) && is_profile(&entry) {
             profiles.push((entry, name));
-        } else if entry.is_dir() {
+        } else if real_directory(&entry) {
             for profile in read_directory(&entry)? {
-                if is_profile(&profile)
+                if real_directory(&profile)
+                    && is_profile(&profile)
                     && let Some(inner) = profile.file_name().and_then(|inner| inner.to_str())
                 {
                     let relative = format!("{name}/{inner}");
@@ -545,7 +560,7 @@ pub(crate) fn evictables(
     let mut candidates = Vec::new();
     for (profile, _) in profile_directories(target)? {
         let incremental = profile.join("incremental");
-        if incremental.is_dir() {
+        if real_directory(&incremental) {
             // rustc replaces a cache's session directory on every
             // incremental compilation of its unit.
             for path in read_directory(&incremental)? {
@@ -555,7 +570,7 @@ pub(crate) fn evictables(
         }
         for kind in ["deps", ".fingerprint", "build"] {
             let directory = profile.join(kind);
-            if !directory.is_dir() {
+            if !real_directory(&directory) {
                 continue;
             }
             for path in read_directory(&directory)? {
@@ -565,53 +580,6 @@ pub(crate) fn evictables(
         }
     }
     Ok(group_eviction_paths(target, candidates, used))
-}
-
-/// Classify a complete measured target without additional filesystem reads.
-pub(crate) fn evictables_measured(
-    target: &Path,
-    measured: &BTreeMap<PathBuf, std::fs::Metadata>,
-    used: &HashMap<String, u64>,
-) -> Vec<Evictable> {
-    let profiles = measured
-        .iter()
-        .filter_map(|(path, metadata)| {
-            if !metadata.is_dir() {
-                return None;
-            }
-            let kind = path.file_name()?.to_str()?;
-            if !matches!(kind, "deps" | ".fingerprint" | "incremental") {
-                return None;
-            }
-            let profile = path.parent()?;
-            let depth = profile.strip_prefix(target).ok()?.components().count();
-            (depth == 1 || depth == 2).then_some(profile)
-        })
-        .collect::<std::collections::HashSet<_>>();
-    let profiles = profiles
-        .iter()
-        .filter(|profile| !profiles.contains(profile.parent().unwrap_or(target)))
-        .copied()
-        .collect::<std::collections::HashSet<_>>();
-    let candidates = measured
-        .iter()
-        .filter_map(|(path, metadata)| {
-            let parent = path.parent()?;
-            let kind = parent.file_name()?.to_str()?;
-            if !matches!(kind, "deps" | ".fingerprint" | "build" | "incremental")
-                || !profiles.contains(parent.parent()?)
-            {
-                return None;
-            }
-            Some((
-                path.clone(),
-                metadata
-                    .modified()
-                    .expect("measured Unix metadata has mtime"),
-            ))
-        })
-        .collect();
-    group_eviction_paths(target, candidates, used)
 }
 
 fn group_eviction_paths(
@@ -711,21 +679,6 @@ impl DiskUsage {
         self.inodes.clear();
         self
     }
-}
-
-pub(crate) fn disk_usage_measured(
-    measured: &BTreeMap<PathBuf, std::fs::Metadata>,
-    caches: &[Evictable],
-) -> DiskUsage {
-    let index = eviction_roots(caches);
-    let mut usage = DiskUsage::new(caches.len());
-    for (path, metadata) in measured {
-        let cache = path
-            .ancestors()
-            .find_map(|ancestor| index.get(ancestor).copied());
-        usage.record(metadata, cache);
-    }
-    usage.finish()
 }
 
 /// One file's blocks and where its hard links were found.

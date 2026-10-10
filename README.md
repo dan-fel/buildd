@@ -333,7 +333,7 @@ Library clients use `client::cache(stream, host, operation)` and typed
 `host` may instead be a configured remote **name**; the existing SSH `serve`
 transport asks that host's actual daemon, without relaying local cache records.
 An old daemon rejects this request: clients must show capability-unavailable,
-not invent inventory. Protocol 1 capabilities return the host/cache-home
+not invent inventory. Protocol 2 capabilities return the host/cache-home
 identity, random daemon incarnation, and all limits. No general version
 handshake is assumed. Cache replies serialize
 `Result<cache::Response, client::CacheError>`: `Ok` carries the service response;
@@ -348,52 +348,86 @@ at most 4 KiB. Every result retires and reaps the session. Timeout/disconnect
 can happen after execute reached the owner: they never imply rollback, cancel
 an approval or cause an automatic retry. Recover through the exact receipt.
 
-1. Ask for capabilities, then inventory with that exact `Owner`.
-2. Inventory returns fresh measurement time, revision, expiry, slot protection
-   and up to 64 service-issued item IDs per page. Follow `next` with an
-   `inventory_page` request naming that revision and the returned item ID;
-   continuation reads the same bounded measurement without rescanning. Select
-   at most 64 IDs across pages of one revision and
-   ask for preview. Never submit paths or commands. Preview deletes nothing
-   and holds no slot while a person approves it.
-3. Approve the **entire** returned preview in the caller's policy/UI, including
+1. Ask for capabilities, then `slots` with that exact `Owner`. This cache-local
+   listing returns at most 16 service-owned slot IDs and their current protection;
+   follow its `next` with `slots.after` to reach every slot. Choose one to 16 of
+   these IDs for `inventory.slots`. Unknown or duplicate IDs are refused. Each
+   inventory scans only those slots, so earlier caches cannot hide a later slot.
+2. Inventory returns a revision, fixed expiry, slot protection and at most 64
+   service-issued item IDs per page. Empty progress pages may precede measured
+   items. Follow every `next` using `inventory_page` with that revision and the
+   exact cursor; a progress cursor resumes the owner's directory iterators,
+   while an item cursor reads the completed catalog. Select at most 64 IDs
+   from one revision. IDs name compiled-unit groups or incremental caches;
+   callers never submit paths or commands. An unfinished group has no invented
+   size, and unsupported groups explicitly refuse approval. `release_inventory`
+   retires a discovery revision and its iterators/catalog, cancelling active
+   discovery through the same worker-expiry boundary. Release before inspecting
+   other slots when discovery approaches the global quota. Already issued
+   preparations and approval/execution receipts remain usable independently.
+3. Preview returns `preparing` while a bounded worker measures only selected
+   scopes under scheduler exclusion. Poll `preview_status` with its owner and
+   preparation ID for the exact preview or refusal. This measurement is the
+   approval truth; inventory estimates are discovery only. Preview deletes
+   nothing, and all exclusion is released before a person approves it.
+4. Approve the **entire** returned preview in the caller's policy/UI, including
    owner, expiry, IDs and estimates; send that exact preview to execute.
    Buildd's private socket authorizes its OS owner, not workspace/UI policy.
-4. Execute acquires scheduler maintenance exclusion for every selected slot,
-   then checks the complete measured target identity/metadata again. Busy,
-   changed, symlink-containing and foreign targets are refused. These checks
-   rely on exclusive buildd ownership of slot targets: direct filesystem
-   writers must stop before inventory and remain stopped through execute.
-   Scheduler exclusion covers buildd writers; it cannot prevent an external
-   writer replacing a pathname between validation and removal. Validation
-   claims are persisted as invalid before the first destructive syscall.
-   Only selected incremental caches and compiled-unit files are removed;
-   cleanup never invokes whole-target pruning or removes sources, records,
-   mirrors, logs, products, registry or unrelated paths. Subsequent builds
-   still schedule their ordinary automatic maintenance independently.
-5. Completed and partial outcomes are retained. Repeating execute with an
-   identical preview returns its receipt, never deletes again; changing any
-   payload field is refused. Query `receipt` after losing the connection:
-   do not blindly retry or mint a new operation. `unknown` (expired/missing
-   receipt or restarted/foreign daemon) preserves uncertainty about a prior
-   attempt. `cancel` is terminal before execution; once accepted, filesystem
-   execution completes independently of client disconnect. A cancellation
-   processed after completion returns that completion, not a fake rollback.
+   Execute accepts ownership and returns a pending receipt with `executing`.
+   Its worker revalidates exactly the selected scopes under exclusion for all
+   selected slots, including the same Cargo roots, entry identities/metadata
+   and real ancestor directories. Changes in unrelated scopes do not invalidate
+   approval. Normal symlink leaves are measured and unlinked without following
+   their referents; symlink ancestors and unsupported entry kinds are protected.
+   Validation claims are persisted as invalid before the first artifact removal.
+   Cleanup removes only selected incremental caches and compiled-unit artifacts;
+   it never prunes the whole target or removes sources, mirrors, logs, products,
+   registry or unrelated paths. Ordinary automatic maintenance remains independent.
+5. Query `receipt` until execution publishes completed, partial or refused.
+   Repeating execute with an identical preview returns that receipt and never
+   deletes again; changing any payload field is refused. A lost connection,
+   transport failure or deadline never implies rollback: recover through the
+   same receipt, without an implicit retry or a new cleanup. `unknown`
+   (expired/missing receipt or restarted/foreign daemon) preserves uncertainty.
+   `cancel` is terminal before accepted execution; accepted execution belongs
+   to the owner and continues after the requester disconnects.
 
-Inventory is limited to 16 slots, 64 items per response page, 8192 total visited entries and
-250 ms of scan work; each target's retained root and relative paths are limited
-to 512 KiB. The root is retained once rather than repeated in every entry.
-Limits/active slots/unsupported filesystem entries label the result incomplete
-and produce no cleanup targets for the affected slot. Scans and removal check
-their deadline between filesystem operations; one blocked OS syscall cannot
-be preempted. Large targets are explicitly incomplete, not stale status sizes
-disguised as fresh inventory. Pagination bounds responses and approval batches;
-it does not bypass the complete-target scan limits. All pages share one
-measurement revision and expiry, and invalid or expired continuation IDs are
-refused.
-Individual reclaimable estimates reuse hardlink accounting: links elsewhere
-are not counted as reclaimable, and removing several items can free more than
-the sum of their conservative individual estimates.
+A single filesystem worker runs slices of at most 8192 iterator/removal steps
+and 250 ms, keeping directory iterators between slices and leaving the daemon
+scheduler/event loop responsive. Inventory retains compact group accounting,
+not every target pathname. It publishes a scope only after its entire
+measurement completes. Inventory exclusion is released after every slice;
+any intervening daemon-owned filesystem writer advances its slot generation
+before writing and invalidates continuation/selection from the old revision.
+Preview and execute keep all selected-slot exclusion for their technical work,
+with no lease across user approval. Selected manifests across all selected
+slots retain at most 8192 entries. A scope that cannot fit is explicitly
+unsupported; pagination does not relax the manifest bound.
+
+The owner has one global 512 KiB admission budget for retained path/string
+bytes across its inventories, preparations, approvals and active worker. It
+counts roots, relative paths, scope selectors, iterator contexts,
+catalog text and receipt payloads, reserving publication/terminal receipt text
+before dispatch. This is a text quota, not a claim about total allocator/OS
+memory; entry/slot/receipt limits bound bookkeeping. Completed catalogs own
+one row per item; unresolved inodes refer to its existing measurement by a
+stable numeric identity rather than cloning scope text. Verification transfers approved manifest entries instead of
+keeping a second copy; removal retains roots once and uses relative paths with
+numeric item indexes. Limits and protected slots are reported explicitly,
+never replaced by cached status sizes. All pages and preparation share one
+revision and expiry; continuation never refreshes the lifetime.
+
+These guarantees require exclusive buildd ownership of slot targets. Direct
+filesystem writers must stop before owner work and remain stopped through
+execute. Scheduler exclusion covers every buildd writer, but cannot stop an
+external writer replacing a pathname between validation and unlink; hostile
+same-owner mutation is outside this contract. Deadline/expiry is checked between
+filesystem operations, and one blocked OS syscall cannot be preempted. Released or expired
+inventory/preparation results drop their worker resources before releasing
+exclusion; accepted execute retains a terminal receipt independently of the
+requester. Reclaimable estimates count a hardlinked inode only when all its
+links belong to that individual scope; external/cross-scope links stay
+conservative, so combined removal can free more than the sum of estimates.
 
 There are at most eight inventories and eight receipts, expiring after 60 s;
 capacity is refused, never evicted behind an approval. Daemon request lines are

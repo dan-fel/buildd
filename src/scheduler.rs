@@ -139,6 +139,7 @@ pub(crate) struct IdleSlot {
     pub(crate) repository: PathBuf,
     pub(crate) slot: usize,
     pub(crate) used: HashMap<String, u64>,
+    pub(crate) generation: u64,
 }
 
 /// A build to start in slot `slot` of `repository`.
@@ -231,6 +232,8 @@ struct Slot {
     used: u64,
     /// Its target is being kept within its disk limit.
     maintaining: bool,
+    /// Incarnation-local identity of the target contents. Advance before writers start.
+    generation: u64,
     /// Builds since its target was last measured.
     unmeasured: u32,
     /// When its latest build ended.
@@ -253,6 +256,13 @@ struct Slot {
 }
 
 impl Slot {
+    fn advance_generation(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("target generation exhausted");
+    }
+
     fn busy(&self) -> bool {
         self.job.is_some() || self.maintaining
     }
@@ -458,6 +468,7 @@ impl<D: Distance> Scheduler<D> {
             worktree: record.worktree,
             used: 0,
             maintaining: false,
+            generation: 0,
             unmeasured: 1,
             idle_since: Instant::now(),
             size: None,
@@ -838,6 +849,7 @@ impl<D: Distance> Scheduler<D> {
     }
 
     fn maintain(&mut self, index: usize) -> Effect {
+        self.slots[index].advance_generation();
         Effect::Maintain(self.hand_out(index))
     }
 
@@ -851,6 +863,7 @@ impl<D: Distance> Scheduler<D> {
             repository: slot.repository.clone(),
             slot: slot.index,
             used: slot.units.clone(),
+            generation: slot.generation,
         }
     }
 
@@ -861,12 +874,32 @@ impl<D: Distance> Scheduler<D> {
             .map(|slot| (slot_name(&slot.repository, slot.index), slot.busy()))
     }
 
-    pub(crate) fn cache_acquire(&mut self, name: &str) -> Option<IdleSlot> {
+    pub(crate) fn cache_acquire(&mut self, name: &str) -> Option<SlotKey> {
         let index = self
             .slots
             .iter()
             .position(|slot| slot_name(&slot.repository, slot.index) == name && !slot.busy())?;
-        Some(self.hand_out(index))
+        self.slots[index].maintaining = true;
+        Some(SlotKey(index))
+    }
+
+    pub(crate) fn cache_identity(&self, key: SlotKey) -> (&Path, usize, u64) {
+        let slot = &self.slots[key.0];
+        assert!(slot.maintaining, "cache identity requires exclusion");
+        (&slot.repository, slot.index, slot.generation)
+    }
+
+    pub(crate) fn cache_generation(&self, name: &str) -> Option<u64> {
+        self.slots
+            .iter()
+            .find(|slot| slot_name(&slot.repository, slot.index) == name)
+            .map(|slot| slot.generation)
+    }
+
+    pub(crate) fn cache_writing(&mut self, key: SlotKey) {
+        let slot = &mut self.slots[key.0];
+        assert!(slot.maintaining, "cache writing requires exclusion");
+        slot.advance_generation();
     }
 
     pub(crate) fn cache_release(&mut self, key: SlotKey, mutated: bool) -> Vec<Effect> {
@@ -900,7 +933,13 @@ impl<D: Distance> Scheduler<D> {
         if idle.is_empty() {
             return None;
         }
-        let slots = idle.into_iter().map(|index| self.hand_out(index)).collect();
+        let slots = idle
+            .into_iter()
+            .map(|index| {
+                self.slots[index].advance_generation();
+                self.hand_out(index)
+            })
+            .collect();
         Some(Effect::Reclaim { slots, needed })
     }
 
@@ -1086,6 +1125,7 @@ impl<D: Distance> Scheduler<D> {
             let job = &self.jobs[&id];
             let first = self.built_worktrees.insert(job.waiters[0].worktree.clone());
             let entry = &mut self.slots[slot];
+            entry.advance_generation();
             entry.job = Some(id);
             entry.revision = job.revision.clone();
             entry.worktree = Some(job.waiters[0].worktree.clone());
@@ -1285,6 +1325,7 @@ impl<D: Distance> Scheduler<D> {
             worktree: Some(job.waiters[0].worktree.clone()),
             used: 0,
             maintaining: false,
+            generation: 0,
             unmeasured: 0,
             idle_since: Instant::now(),
             size: None,
@@ -1672,7 +1713,7 @@ mod tests {
             });
             assert_eq!(starts(&effects).len(), usize::from(!optional));
         }
-        let ready = scheduler.cache_release(acquired.key, false);
+        let ready = scheduler.cache_release(acquired, false);
         let started = starts(&ready);
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].2, "p1");
@@ -1686,6 +1727,64 @@ mod tests {
             2,
             "cache exclusion is released and optional work leaves one slot free"
         );
+    }
+
+    #[test]
+    fn target_generation_advances_before_every_writer_and_not_for_read_exclusion() {
+        let mut scheduler = scheduler(1);
+        let [(job, ..)] = starts(&submit(&mut scheduler, 1, "/a", "a1"))[..] else {
+            panic!("start");
+        };
+        let name = scheduler.status(|_| 0).0[0].name.clone();
+        assert_eq!(
+            scheduler.cache_generation(&name),
+            Some(1),
+            "Start already owns the new generation"
+        );
+        scheduler.exited(job, &ok(), None, BuildReport::default());
+        let read = scheduler.cache_acquire(&name).unwrap();
+        assert_eq!(scheduler.cache_identity(read).2, 1);
+        scheduler.cache_release(read, false);
+        assert_eq!(scheduler.cache_generation(&name), Some(1));
+        let maintenance = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
+        let [Effect::Maintain(idle)] = &maintenance[..] else {
+            panic!("maintenance");
+        };
+        assert_eq!(idle.generation, 2);
+        assert_eq!(scheduler.cache_generation(&name), Some(2));
+        scheduler.maintained(idle.key, None, &[]);
+        let Some(Effect::Reclaim { slots, .. }) = scheduler.reclaim(1) else {
+            panic!("reclaim");
+        };
+        assert_eq!(slots[0].generation, 3);
+        scheduler.reclaimed(slots[0].key, None, &[]);
+        let cleanup = scheduler.cache_acquire(&name).unwrap();
+        scheduler.cache_writing(cleanup);
+        assert_eq!(
+            scheduler.cache_generation(&name),
+            Some(4),
+            "advance before invalidation/deletion"
+        );
+        scheduler.cache_release(cleanup, true);
+        assert_eq!(scheduler.cache_generation(&name), Some(4));
+        assert_eq!(starts(&submit(&mut scheduler, 2, "/a", "a2")).len(), 1);
+        assert_eq!(scheduler.cache_generation(&name), Some(5));
+    }
+
+    #[test]
+    fn queued_writer_advances_generation_as_read_exclusion_is_released() {
+        let mut scheduler = scheduler(1);
+        let [(job, ..)] = starts(&submit(&mut scheduler, 1, "/a", "a1"))[..] else {
+            panic!("start");
+        };
+        scheduler.exited(job, &ok(), None, BuildReport::default());
+        let name = scheduler.status(|_| 0).0[0].name.clone();
+        let held = scheduler.cache_acquire(&name).unwrap();
+        assert!(starts(&submit(&mut scheduler, 2, "/a", "a2")).is_empty());
+        let generation = scheduler.cache_identity(held).2;
+        assert_eq!(scheduler.cache_generation(&name), Some(generation));
+        assert_eq!(starts(&scheduler.cache_release(held, false)).len(), 1);
+        assert_eq!(scheduler.cache_generation(&name), Some(generation + 1));
     }
 
     fn starts(effects: &[Effect]) -> Vec<(JobId, usize, String)> {
