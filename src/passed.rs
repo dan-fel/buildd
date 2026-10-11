@@ -13,6 +13,7 @@
 //!
 //! Anything else runs again.
 
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
@@ -137,7 +138,7 @@ fn package_name(id: &str) -> Option<String> {
 
 /// The binaries among `binaries` that may be skipped at `tree`, given what
 /// `passed` in the slot, the `workspace`'s packages, and `changed`, the paths
-/// that differ between an earlier tree and `tree`.
+/// that differ between an earlier tree and `tree`, asked once per tree.
 pub(crate) fn skippable<'a>(
     binaries: &'a [TestBinary],
     passed: &[PassedBinary],
@@ -145,6 +146,8 @@ pub(crate) fn skippable<'a>(
     workspace: &Workspace,
     mut changed: impl FnMut(&Revision) -> Result<Vec<String>, String>,
 ) -> Vec<&'a TestBinary> {
+    // None for a tree that cannot be compared.
+    let mut changes = HashMap::<&Revision, Option<Vec<String>>>::new();
     binaries
         .iter()
         .filter(|binary| {
@@ -161,9 +164,13 @@ pub(crate) fn skippable<'a>(
                 return true;
             }
             // A tree that cannot be compared is not trusted.
-            changed(&record.tree).is_ok_and(|paths| {
-                !workspace.invalidates(paths.iter().map(String::as_str), &binary.package)
-            })
+            changes
+                .entry(&record.tree)
+                .or_insert_with(|| changed(&record.tree).ok())
+                .as_ref()
+                .is_some_and(|paths| {
+                    !workspace.invalidates(paths.iter().map(String::as_str), &binary.package)
+                })
         })
         .collect()
 }
@@ -287,12 +294,16 @@ mod tests {
                 .iter()
                 .map(|path| (*path).to_owned())
                 .collect::<Vec<_>>();
-            skippable(&binaries, &passed, &tree("t2"), &workspace(), |_| {
+            let mut asked = 0;
+            let skipped = skippable(&binaries, &passed, &tree("t2"), &workspace(), |_| {
+                asked += 1;
                 Ok(changes.clone())
             })
             .iter()
             .map(|binary| binary.id.clone())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+            assert!(asked <= 1, "both passed at t1: one comparison");
+            skipped
         };
         assert_eq!(skipped(&[]), ["app", "leaf"]);
         // A fixture of a package app depends on: app runs, leaf does not.
