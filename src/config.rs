@@ -15,10 +15,10 @@ pub struct Config {
     /// Of those, what one build's tests take while they run: their threads
     /// and the processes they start use the machine without job tokens.
     pub test_jobs: usize,
-    /// Disk one slot's target may keep between builds, in bytes. Build disk
-    /// is at most this times `slots` per repository, plus what a running
-    /// build adds before it is pruned.
-    pub slot_limit: u64,
+    /// Disk the targets of all slots, of every repository, may keep together
+    /// between builds, in bytes, plus what running builds add before their
+    /// slots are measured.
+    pub disk: u64,
     /// Disk the volume holding the home keeps free, in bytes: below it,
     /// idle slots give up what builds used longest ago.
     pub min_free: u64,
@@ -69,7 +69,7 @@ struct File {
     slots: Option<usize>,
     jobs: Option<usize>,
     test_jobs: Option<usize>,
-    slot_limit_gib: Option<f64>,
+    disk_gib: Option<f64>,
     min_free_gib: Option<f64>,
     memory_gib: Option<f64>,
     #[serde(default)]
@@ -83,8 +83,8 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
     /// two slots, one job per available CPU, half of them for a build's
-    /// tests, 20 GiB per slot, 15 GiB of free disk, and the machine's memory
-    /// less 6 GiB for builds.
+    /// tests, 20 GiB of build disk per slot, 15 GiB of free disk, and the
+    /// machine's memory less 6 GiB for builds.
     ///
     /// # Errors
     /// When the file cannot be read or parsed, or a limit is not positive.
@@ -96,12 +96,11 @@ impl Config {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => File::default(),
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
-        let slot_limit_gib = file.slot_limit_gib.unwrap_or(20.0);
-        if !(slot_limit_gib.is_finite() && slot_limit_gib > 0.0) {
-            return Err(format!(
-                "{}: slot_limit_gib must be positive",
-                path.display()
-            ));
+        let slots = file.slots.unwrap_or(2);
+        #[expect(clippy::cast_precision_loss, reason = "a slot count in GiB")]
+        let disk_gib = file.disk_gib.unwrap_or(20.0 * slots as f64);
+        if !(disk_gib.is_finite() && disk_gib > 0.0) {
+            return Err(format!("{}: disk_gib must be positive", path.display()));
         }
         #[expect(clippy::cast_precision_loss, reason = "memory in GiB")]
         let physical_gib = crate::memory::physical() as f64 / GIB;
@@ -120,7 +119,7 @@ impl Config {
             std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
         });
         let config = Self {
-            slots: file.slots.unwrap_or(2),
+            slots,
             jobs,
             test_jobs: file.test_jobs.unwrap_or((jobs / 2).max(1)),
             #[expect(
@@ -128,7 +127,7 @@ impl Config {
                 clippy::cast_sign_loss,
                 reason = "a positive, finite number of GiB rounds to bytes"
             )]
-            slot_limit: (slot_limit_gib * GIB).round() as u64,
+            disk: (disk_gib * GIB).round() as u64,
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -230,17 +229,17 @@ mod tests {
         let defaults = Config::load(&home.0).unwrap();
         assert_eq!(defaults.slots, 2);
         assert!(defaults.jobs >= 1);
-        assert_eq!(defaults.slot_limit, 20 << 30);
+        assert_eq!(defaults.disk, 40 << 30);
         let write = |text: &str| std::fs::write(home.0.join("config.toml"), text).unwrap();
         assert_eq!(defaults.test_jobs, (defaults.jobs / 2).max(1));
         assert_eq!(defaults.min_free, 15 << 30);
         assert!(defaults.memory >= 1 << 30);
-        write("slots = 3\njobs = 6\nslot_limit_gib = 0.5\nmin_free_gib = 0\nmemory_gib = 8\n");
+        write("slots = 3\njobs = 6\ndisk_gib = 0.5\nmin_free_gib = 0\nmemory_gib = 8\n");
         let expected = Config {
             slots: 3,
             jobs: 6,
             test_jobs: 3,
-            slot_limit: 1 << 29,
+            disk: 1 << 29,
             min_free: 0,
             memory: 8 << 30,
             remotes: Vec::new(),
@@ -282,13 +281,16 @@ mod tests {
             std::env::consts::OS
         ));
         assert!(Config::load(&home.0).is_err(), "a remote for this OS");
-        write("slot_limit_gib = 12\n");
-        assert_eq!(Config::load(&home.0).unwrap().slot_limit, 12 << 30);
+        write("slots = 3\n");
+        assert_eq!(Config::load(&home.0).unwrap().disk, 60 << 30);
+        write("disk_gib = 12\n");
+        assert_eq!(Config::load(&home.0).unwrap().disk, 12 << 30);
         write("jobs = 6\ntest_jobs = 6\n");
         assert_eq!(Config::load(&home.0).unwrap().test_jobs, 6);
         for invalid in [
             "slots = 0\n",
-            "slot_limit_gib = 0\n",
+            "disk_gib = 0\n",
+            "slot_limit_gib = 12\n",
             "slot = 1\n",
             "jobs = 4\ntest_jobs = 5\n",
             "test_jobs = 0\n",

@@ -80,7 +80,7 @@ def main():
     parser.add_argument("--buildd-home", type=Path, help="buildd home for --mode buildd")
     parser.add_argument("--slots", type=int, default=2)
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
-    parser.add_argument("--slot-limit-gib", type=float, default=20)
+    parser.add_argument("--disk-gib", type=float, help="build disk all slots share (20 GiB per slot)")
     parser.add_argument("--report", type=Path, required=True)
     options = parser.parse_args()
     if options.mode == "buildd" and options.buildd_home is None:
@@ -110,8 +110,9 @@ def main():
     if options.mode == "buildd":
         home = options.buildd_home.resolve()
         home.mkdir(parents=True, exist_ok=True)
+        disk_gib = options.disk_gib if options.disk_gib is not None else 20 * options.slots
         (home / "config.toml").write_text(
-            f"slots = {options.slots}\njobs = {options.jobs}\nslot_limit_gib = {options.slot_limit_gib}\n"
+            f"slots = {options.slots}\njobs = {options.jobs}\ndisk_gib = {disk_gib}\n"
         )
         environment["BUILDD_HOME"] = str(home)
         log = open(home / "daemon.log", "a")

@@ -126,18 +126,20 @@ memory   a queued build starts when
          peak = summed RSS of the build's process group, recorded per compilation
          a build that doesn't fit holds the queue, so big builds aren't starved
 
-disk     per slot     target ≤ slot_limit_gib, trimmed while idle,
-                      least recently used first:
-                      incremental caches → compiled units → whole target (last resort)
-         per volume   free < min_free_gib → idle slots give up their oldest units,
-                      never anything used in the last 10 minutes
+disk     a slot quiet for 2 s is measured: what its target holds, and what
+         removing each part frees (it stays true until the slot's next build)
+
+         Σ targets > disk_gib  or  free < min_free_gib
+           → idle slots give up what builds used longest ago, across all
+             slots: compiled units (with their examples), incremental
+             caches, files tests left in target/tmp
 ```
 
-**Sizing.** A slot must hold the working set of the builds it serves.
-Below that, trimming deletes caches still in use and builds start cold;
-`status` flags slots that are too small. Fewer, larger slots win. Builds of
-a few crates need 12–15 GiB per slot. Full-workspace `test` plus
-`clippy --all-targets` need about 30 GiB.
+**Sizing.** `disk_gib` must hold the working set of the builds the slots
+serve. Below that, eviction deletes caches still in use and builds start
+cold; `status` and `top` flag the budget as too small. Fewer, larger slots
+win. Builds of a few crates need 12–15 GiB per slot. Full-workspace `test`
+plus `clippy --all-targets` need about 30 GiB.
 
 ## Tests
 
@@ -240,7 +242,7 @@ command = "bash -lc 'buildd serve'"   # login shell: same tools as a terminal
 ![buildd top: three slots running workspace tests and Clippy, two builds queued, recent events (older screenshot)](assets/top.svg)
 
 ```text
-header    slots · jobs in use · expected memory / memory_gib · free disk / floor
+header    slots · build disk / disk_gib · jobs in use · expected memory / memory_gib · free disk / floor
 speed     last hour (median / p90): wait 4.3 s / 29 s · checks 18 s / 23 s ×8 · ...
 slots     each running build: phase (compiling, testing, copying), jobs held
 queue     expected duration, and why it waits (memory, or a busy warm slot)
@@ -284,7 +286,7 @@ parallelism away from the daemon (`--target-dir`, `--manifest-path`,
 
 ```text
 config.toml          slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
-                     slot_limit_gib = 20, min_free_gib = 15,
+                     disk_gib = 20 × slots, min_free_gib = 15,
                      memory_gib = <physical> - 6, [[remote]] hosts
 sock                 the daemon's socket
 daemon.log           output of a daemon a client started

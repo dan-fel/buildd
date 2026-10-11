@@ -743,28 +743,29 @@ fn a_build_nobody_waits_for_is_stopped_with_everything_it_started() {
 }
 
 #[test]
-fn below_the_disk_floor_idle_slots_give_up_what_is_not_in_use() {
+fn below_the_disk_floor_idle_slots_give_up_what_builds_used_longest_ago() {
     // No volume has this much free: every build ends below the floor.
     let daemon = Daemon::configured("slots = 1\njobs = 4\nmin_free_gib = 1000000\n");
     let repository = crate_repository(None);
     let built = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&built).success(), "{built:#?}");
-    wait_until("the idle slot gave up what it could", || {
+    wait_until("the measured slot gave up everything", || {
         daemon.activity().events.iter().any(|event| {
             matches!(
-                event.kind,
-                // Everything was used minutes ago: nothing goes.
-                EventKind::Reclaimed {
-                    freed: 0,
-                    units: 0,
-                    ..
-                }
+                &event.kind,
+                // Everything was used a moment ago, and goes all the same.
+                EventKind::Evicted { shortage, units: 1.., in_use: 1.., .. }
+                    if shortage.under_floor > 0
             )
         })
     });
+    wait_until("the slot is idle again", || {
+        daemon.status().slots[0].chore.is_none()
+    });
     let status = daemon.status();
     assert!(status.free_disk.is_some_and(|free| free < status.min_free));
-    // The slot is handed back and builds again.
+    assert!(status.undersized);
+    // The slot builds again, from scratch.
     let again = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&again).success(), "{again:#?}");
 }
@@ -788,19 +789,27 @@ fn requests_outside_a_worktree_or_taking_over_the_slot_are_rejected() {
 }
 
 #[test]
-fn a_slot_over_its_disk_limit_is_pruned_once_it_is_quiet() {
+fn slots_over_the_disk_budget_give_up_what_they_hold_once_measured() {
     // About 10 kB, less than any build leaves behind.
-    let daemon =
-        Daemon::configured("slots = 1\njobs = 4\nslot_limit_gib = 0.00001\nmin_free_gib = 0\n");
+    let daemon = Daemon::configured("slots = 1\njobs = 4\ndisk_gib = 0.00001\nmin_free_gib = 0\n");
     let repository = crate_repository(None);
     let messages = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&messages).success(), "{messages:#?}");
-    wait_until("the slot is measured", || {
-        let slot = &daemon.status().slots[0];
-        !slot.maintaining && slot.size.is_some()
+    wait_until("the slot gave up its compiled units", || {
+        daemon.activity().events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::Evicted { shortage, units: 1.., .. } if shortage.over_budget > 0
+            )
+        })
     });
-    let size = daemon.status().slots[0].size.expect("measured above");
-    assert!(size <= 10_738, "{size}");
+    wait_until("the slot is idle again", || {
+        daemon.status().slots[0].chore.is_none()
+    });
+    let status = daemon.status();
+    // Directories and Cargo's own files stay.
+    assert!(status.disk_used < 100_000, "{status:?}");
+    assert_eq!(status.slots[0].size, Some(status.disk_used));
     let again = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&again).success(), "{again:#?}");
 }

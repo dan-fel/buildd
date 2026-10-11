@@ -31,11 +31,13 @@ use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
     Activity, BuildReport, BuildRequest, EventKind, Failures, Message, Mirror, Outcome,
-    RemoteActivity, Request, RevisionRequest, Status, Usage,
+    RemoteActivity, Request, RevisionRequest, Shortage, Status, Usage,
 };
 use crate::remote;
-use crate::scheduler::{Effect, IdleSlot, JobId, Scheduler, SlotKey, Start, Submission, WaiterId};
-use crate::slot::{self, Pruning, SlotDirectory, slot_name};
+use crate::scheduler::{
+    Effect, JobId, Measurement, Removal, Scheduler, SlotKey, Start, Submission, WaiterId,
+};
+use crate::slot::{self, Inventory, SlotDirectory, slot_name};
 use crate::snapshot::{self, Source};
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
@@ -106,23 +108,18 @@ enum Event {
         usage: Option<Usage>,
         report: BuildReport,
     },
-    /// Idle slots gave up what builds used longest ago to free the `needed`
-    /// bytes free disk lacked below the floor; each did what its result says.
-    Reclaimed {
-        needed: u64,
-        results: Vec<(SlotKey, String, slot::Reclaimed)>,
+    /// Idle slots removed what the scheduler chose for them to give up;
+    /// each did as its result says.
+    Evicted {
+        results: Vec<(SlotKey, Result<(), String>)>,
     },
-    /// Slot `key` of `repository` was kept within its disk limit by
-    /// `pruning`, removing compiled units `evicted` (None when that failed),
-    /// and its checkout's `workspace` was read.
-    Maintained {
+    /// Slot `key` of `repository` was measured: its target holds
+    /// `inventory`, and its checkout's `workspace` was read.
+    Measured {
         key: SlotKey,
         repository: PathBuf,
-        pruning: Option<Pruning>,
-        evicted: Vec<String>,
+        inventory: Result<Inventory, String>,
         workspace: Option<Workspace>,
-        /// Crates its target holds in several variants, when counted.
-        duplicated: Option<usize>,
     },
 }
 
@@ -150,10 +147,10 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .map_err(|error| format!("could not listen on {}: {error}", socket.display()))?;
     let budget = Budget::new(config.jobs, config.test_jobs, &home.join("tmp"))?;
     log!(
-        "listening on {} with {} slots of {} and {} jobs",
+        "listening on {} with {} slots, {} of build disk and {} jobs",
         socket.display(),
         config.slots,
-        gib(config.slot_limit),
+        gib(config.disk),
         config.jobs
     );
 
@@ -180,8 +177,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         waiters: HashMap::new(),
         runs: HashMap::new(),
         log: ActivityLog::new(SystemTime::now(), EventFile::new(home)),
-        reclaiming: false,
-        below_floor: false,
+        disk_short: false,
         draining: false,
     }
     .drive(&received)
@@ -189,8 +185,8 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
 
 /// Takes back the slots an earlier daemon left in `home`: their checkouts,
 /// targets and records stay warm across restarts. Slots beyond the
-/// configured count, left from a larger configuration, are removed so build
-/// disk stays within `slots` times the limit.
+/// configured count, left from a larger configuration, are removed: no
+/// build would use them again.
 fn restore_slots(
     home: &Path,
     config: &Config,
@@ -715,11 +711,9 @@ struct Daemon {
     waiters: HashMap<WaiterId, Sender<Message>>,
     runs: HashMap<JobId, Arc<Run>>,
     log: ActivityLog,
-    /// Idle slots are freeing disk below the floor.
-    reclaiming: bool,
-    /// Free disk was below the floor when last looked at, and nothing more
-    /// could be done then.
-    below_floor: bool,
+    /// Build disk was over its budget or free disk under its floor when last
+    /// looked at, and no idle slot had anything left to give up.
+    disk_short: bool,
     /// It takes no new builds.
     draining: bool,
 }
@@ -727,11 +721,11 @@ struct Daemon {
 impl Daemon {
     fn drive(mut self, received: &Receiver<Event>) -> ! {
         loop {
-            let event = match self.scheduler.next_maintenance() {
+            let event = match self.scheduler.next_measurement() {
                 Some(due) => match received.recv_deadline(due) {
                     Ok(event) => event,
                     Err(RecvTimeoutError::Timeout) => {
-                        for effect in self.scheduler.maintenance_due(Instant::now()) {
+                        for effect in self.scheduler.measurement_due(Instant::now()) {
                             self.apply(effect);
                         }
                         continue;
@@ -825,83 +819,30 @@ impl Daemon {
                     for effect in effects {
                         self.apply(effect);
                     }
-                    self.keep_disk_free();
+                    self.keep_disk();
                     Vec::new()
                 }
-                Event::Reclaimed { needed, results } => self.reclaimed(needed, results),
-                Event::Maintained {
+                Event::Evicted { results } => self.scheduler.evicted(results),
+                Event::Measured {
                     key,
                     repository,
-                    pruning,
-                    evicted,
+                    inventory,
                     workspace,
-                    duplicated,
                 } => {
                     if let Some(workspace) = workspace {
                         self.scheduler.distance_mut().learn(repository, workspace);
                     }
-                    let report =
-                        duplicated.and_then(|crates| self.scheduler.duplicated(key, crates));
-                    let mut effects = self.scheduler.maintained(key, pruning, &evicted);
-                    effects.extend(report);
-                    effects
+                    for effect in self.scheduler.measured(key, inventory) {
+                        self.apply(effect);
+                    }
+                    self.keep_disk();
+                    Vec::new()
                 }
             };
             for effect in effects {
                 self.apply(effect);
             }
         }
-    }
-
-    /// Hands each reclaimed slot back to the scheduler and reports what
-    /// freeing disk did.
-    fn reclaimed(
-        &mut self,
-        needed: u64,
-        results: Vec<(SlotKey, String, slot::Reclaimed)>,
-    ) -> Vec<Effect> {
-        self.reclaiming = false;
-        let floor = self.config.min_free;
-        let (mut caches, mut units, mut freed) = (0, 0, 0);
-        let mut effects = Vec::new();
-        for (key, name, result) in results {
-            let (pruning, evicted) = match result {
-                Ok((pruning, evicted)) => (Some(pruning), evicted),
-                Err(error) => {
-                    log!("slot {name} could not free disk: {error}");
-                    (None, Vec::new())
-                }
-            };
-            if let Some(slot::Pruning::Evicted {
-                before,
-                after,
-                caches: gone_caches,
-                units: gone_units,
-                ..
-            }) = pruning
-            {
-                caches += gone_caches;
-                units += gone_units;
-                freed += before.saturating_sub(after);
-            }
-            effects.extend(self.scheduler.reclaimed(key, pruning, &evicted));
-        }
-        log!(
-            "disk: {} short of the floor of {}: idle slots gave up {caches} caches and \
-             {units} compiled units, {}",
-            gib(needed),
-            gib(floor),
-            gib(freed)
-        );
-        self.below_floor = freed < needed;
-        effects.push(Effect::Report(EventKind::Reclaimed {
-            needed,
-            freed,
-            floor,
-            caches,
-            units,
-        }));
-        effects
     }
 
     fn status(&self) -> Status {
@@ -914,9 +855,11 @@ impl Daemon {
             jobs,
             idle_jobs,
             capacity: self.config.slots,
-            slot_limit: self.config.slot_limit,
+            disk_budget: self.config.disk,
+            disk_used: self.scheduler.disk_used(),
             free_disk: slot::free_disk(&self.home).ok(),
             min_free: self.config.min_free,
+            undersized: self.scheduler.undersized(),
             memory,
             memory_in_use,
             draining: self.draining,
@@ -927,7 +870,12 @@ impl Daemon {
 
     fn apply(&mut self, effect: Effect) {
         match effect {
-            Effect::Report(kind) => self.log.record(SystemTime::now(), kind),
+            Effect::Report(kind) => {
+                if let EventKind::Evicted { .. } = &kind {
+                    log_eviction(&kind, self.config.disk, self.config.min_free);
+                }
+                self.log.record(SystemTime::now(), kind);
+            }
             Effect::Persist {
                 repository,
                 slot,
@@ -937,7 +885,7 @@ impl Daemon {
                 if let Err(error) = directory.write_record(&record) {
                     log!("{error}");
                     // A full disk is the likely reason.
-                    self.keep_disk_free();
+                    self.keep_disk();
                 }
             }
             Effect::Send { waiter, message } => {
@@ -987,23 +935,20 @@ impl Daemon {
                     });
                 }
             }
-            Effect::Maintain(IdleSlot {
+            Effect::Measure(Measurement {
                 key,
                 repository,
                 slot,
-                used,
             }) => {
                 let directory = SlotDirectory::new(&self.home, &repository, slot);
                 let name = slot_name(&repository, slot);
-                let limit = self.config.slot_limit;
                 let events = self.events.clone();
                 let spawned = std::thread::Builder::new()
-                    .name("buildd-maintain".into())
+                    .name("buildd-measure".into())
                     .spawn(move || {
-                        let (pruning, evicted) = maintain(&directory, &name, limit, &used);
-                        let duplicated = slot::duplicated_crates(&directory.target())
-                            .inspect_err(|error| log!("slot {name}: {error}"))
-                            .ok();
+                        let inventory = directory.inventory().inspect_err(|error| {
+                            log!("slot {name} could not be measured: {error}");
+                        });
                         // Knowing the packages lets slot choice weigh changes
                         // by what Cargo compiles again.
                         let workspace =
@@ -1011,60 +956,52 @@ impl Daemon {
                                 log!("slot {name}: {error}");
                                 None
                             });
-                        let _ = events.send(Event::Maintained {
+                        let _ = events.send(Event::Measured {
                             key,
                             repository,
-                            pruning,
-                            evicted,
+                            inventory,
                             workspace,
-                            duplicated,
                         });
                     });
                 if let Err(error) = spawned {
-                    log!("could not start maintaining a slot: {error}");
-                    let _ = self.events.send(Event::Maintained {
+                    let error = format!("could not start measuring a slot: {error}");
+                    log!("{error}");
+                    let _ = self.events.send(Event::Measured {
                         key,
                         repository: PathBuf::new(),
-                        pruning: None,
-                        evicted: Vec::new(),
+                        inventory: Err(error),
                         workspace: None,
-                        duplicated: None,
                     });
                 }
             }
-            Effect::Reclaim { slots, needed } => {
-                let home = self.home.clone();
+            Effect::Evict(removals) => {
+                let keys = removals
+                    .iter()
+                    .map(|removal| removal.key)
+                    .collect::<Vec<_>>();
                 let events = self.events.clone();
-                let keys = slots.iter().map(|slot| slot.key).collect::<Vec<_>>();
                 let spawned = std::thread::Builder::new()
-                    .name("buildd-reclaim".into())
+                    .name("buildd-evict".into())
                     .spawn(move || {
-                        let directories = slots
-                            .iter()
-                            .map(|idle| {
-                                let directory =
-                                    SlotDirectory::new(&home, &idle.repository, idle.slot);
-                                (directory, idle.used.clone())
+                        let results = removals
+                            .into_iter()
+                            .map(|Removal { key, name, paths }| {
+                                let removed = slot::remove(&paths);
+                                if let Err(error) = &removed {
+                                    log!("slot {name} could not give up what it was to: {error}");
+                                }
+                                (key, removed)
                             })
-                            .collect::<Vec<_>>();
-                        let results = slot::reclaim(&directories, needed);
-                        let _ = events.send(Event::Reclaimed {
-                            needed,
-                            results: slots
-                                .into_iter()
-                                .map(|idle| (idle.key, slot_name(&idle.repository, idle.slot)))
-                                .zip(results)
-                                .map(|((key, name), result)| (key, name, result))
-                                .collect(),
-                        });
+                            .collect();
+                        let _ = events.send(Event::Evicted { results });
                     });
                 if let Err(error) = spawned {
-                    log!("could not start freeing disk: {error}");
+                    log!("could not start evicting: {error}");
                     let results = keys
                         .into_iter()
-                        .map(|key| (key, String::new(), Err(error.to_string())))
+                        .map(|key| (key, Err(error.to_string())))
                         .collect();
-                    let _ = self.events.send(Event::Reclaimed { needed, results });
+                    let _ = self.events.send(Event::Evicted { results });
                 }
             }
             Effect::Cancel { job } => {
@@ -1075,46 +1012,88 @@ impl Daemon {
         }
     }
 
-    /// Below the floor of free disk, hands the idle slots out to give up
-    /// what builds used longest ago; one reclaim at a time.
-    fn keep_disk_free(&mut self) {
-        let floor = self.config.min_free;
-        if self.reclaiming || floor == 0 {
-            return;
-        }
-        let free = match slot::free_disk(&self.home) {
-            Ok(free) => free,
+    /// Keeps the slots' targets within their budget and free disk above its
+    /// floor: idle slots give up what builds used longest ago, one eviction
+    /// at a time. A shortage nothing idle can cover waits for the next look,
+    /// after a build or a measurement.
+    fn keep_disk(&mut self) {
+        let under_floor = match slot::free_disk(&self.home) {
+            Ok(free) => self.config.min_free.saturating_sub(free),
             Err(error) => {
                 log!("{error}");
-                return;
+                0
             }
         };
-        if free >= floor {
-            if self.below_floor {
-                log!(
-                    "disk: {} free again, above the floor of {}",
-                    gib(free),
-                    gib(floor)
-                );
-                self.below_floor = false;
+        let shortage = Shortage {
+            over_budget: self.scheduler.disk_used().saturating_sub(self.config.disk),
+            under_floor,
+        };
+        if shortage.needed() == 0 {
+            if self.disk_short {
+                log!("disk: back within the budget and above the floor");
+                self.disk_short = false;
             }
             return;
         }
-        match self.scheduler.reclaim(floor - free) {
-            Some(effect) => {
-                self.reclaiming = true;
-                self.apply(effect);
-            }
-            None if !self.below_floor => {
+        match self.scheduler.evict(shortage) {
+            Some(effect) => self.apply(effect),
+            // Its end is the next look.
+            None if self.scheduler.evicting() => {}
+            None if !self.disk_short => {
                 log!(
-                    "disk: {} free, below the floor of {}, and every slot is busy",
-                    gib(free),
-                    gib(floor)
+                    "disk: {} over the budget and {} under the floor, and no idle \
+                     slot has anything to give up",
+                    gib(shortage.over_budget),
+                    gib(shortage.under_floor)
                 );
-                self.below_floor = true;
+                self.disk_short = true;
             }
             None => {}
         }
+    }
+}
+
+/// Writes what an eviction did to the daemon's log.
+fn log_eviction(kind: &EventKind, budget: u64, floor: u64) {
+    let EventKind::Evicted {
+        shortage,
+        freed,
+        caches,
+        units,
+        test_files,
+        in_use,
+        slots,
+    } = kind
+    else {
+        panic!("only evictions are logged as evictions");
+    };
+    let why = match (shortage.over_budget, shortage.under_floor) {
+        (0, under) => format!("{} under the floor of {}", gib(under), gib(floor)),
+        (over, 0) => format!("{} over the budget of {}", gib(over), gib(budget)),
+        (over, under) => format!(
+            "{} over the budget of {} and {} under the floor of {}",
+            gib(over),
+            gib(budget),
+            gib(under),
+            gib(floor)
+        ),
+    };
+    log!(
+        "disk: {why}: {} gave up {caches} incremental caches, {units} compiled units \
+         and {test_files} test files ({in_use} in use), {}",
+        slots.join(", "),
+        gib(*freed)
+    );
+    if *in_use > 0 {
+        let remedy = if shortage.over_budget > 0 {
+            "raise disk_gib or lower slots"
+        } else {
+            "free disk on the volume or lower min_free_gib"
+        };
+        log!(
+            "disk: builds lost caches and units they used in the last ten minutes, so \
+             they compile from scratch: {remedy}"
+        );
     }
 }
 
@@ -1191,51 +1170,6 @@ fn kill_leftovers(group: Pid) {
         // a signal cannot reach.
         Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => {}
         Err(error) => log!("could not kill process group {group:?}: {error}"),
-    }
-}
-
-/// Keeps slot `directory` within `limit`, knowing when builds last `used`
-/// each compiled unit: what that did when it worked, and the units it removed.
-fn maintain(
-    directory: &SlotDirectory,
-    name: &str,
-    limit: u64,
-    used: &HashMap<String, u64>,
-) -> (Option<Pruning>, Vec<String>) {
-    match directory.enforce_limit(limit, used) {
-        Ok((pruning, evicted)) => {
-            match pruning {
-                Pruning::Within { .. } => {}
-                Pruning::Evicted {
-                    before,
-                    after,
-                    caches,
-                    units,
-                    in_use,
-                } => log!(
-                    "slot {name} used {}: removed {caches} incremental caches and \
-                     {units} compiled units ({in_use} in use), {} left",
-                    gib(before),
-                    gib(after)
-                ),
-                Pruning::Cleared { before } => log!(
-                    "slot {name} used {} with nothing left to remove: cleared its target",
-                    gib(before)
-                ),
-            }
-            if pruning.undersized() {
-                log!(
-                    "slot {name}'s limit of {} is below what its builds use, so \
-                     they compile from scratch; raise slot_limit_gib or lower slots",
-                    gib(limit)
-                );
-            }
-            (Some(pruning), evicted)
-        }
-        Err(error) => {
-            log!("slot {name} could not be kept within its limit: {error}");
-            (None, Vec::new())
-        }
     }
 }
 

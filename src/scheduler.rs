@@ -16,8 +16,8 @@
 //!   their revision.
 //! - **Cancellation.** A running build nobody waits for any more is
 //!   cancelled; a queued one is dropped.
-//! - **Slots.** At most `capacity` slots are busy: running a build, or being
-//!   kept within their disk limit. A build takes the idle slot of its
+//! - **Slots.** At most `capacity` slots are busy: running a build, being
+//!   measured or giving up disk. A build takes the idle slot of its
 //!   repository where Cargo has the least to do: the fewest compiled units
 //!   the build needs and the slot lacks, plus the distance between the
 //!   slot's tree and the build's. A build needs what the latest build of its
@@ -34,11 +34,15 @@
 //!   It gets a new slot only when every slot of its repository runs a build,
 //!   so slot directories are created only when builds of a repository run
 //!   concurrently.
-//! - **Maintenance.** A slot is kept within its disk limit once it has been
-//!   idle for [`MAINTENANCE_QUIET`], so the measurement does not delay the
-//!   next build of a session that runs several in a row, and right after a
-//!   build once [`MAINTENANCE_DUE`] builds went unmeasured, so the limit
-//!   holds under constant load.
+//! - **Measurement.** A slot's target is measured once the slot has been
+//!   idle for [`MEASURE_QUIET`], so the measurement does not delay the next
+//!   build of a session that runs several in a row, and right after a build
+//!   once [`MEASURE_DUE`] builds went unmeasured, so disk stays known under
+//!   constant load. What an idle slot's target holds stays true until its
+//!   next build.
+//! - **Eviction.** When the slots' targets are over their budget, or free
+//!   disk is under its floor, idle slots give up what builds used longest
+//!   ago, across all of them, from what their measurements found.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -47,17 +51,20 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cargo::{Compilation, Operation};
 use crate::passed::PassedBinary;
 use crate::protocol::{
-    BuildReport, EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild, RunningBuild,
-    SlotStatus, Usage,
+    BuildReport, Chore, EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild,
+    RunningBuild, Shortage, SlotStatus, Usage,
 };
-use crate::slot::{CompilationRun, Pruning, SlotRecord, slot_name};
+use crate::slot::{CompilationRun, Evictable, Inventory, Kind, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
 
-/// How long a slot stays idle before it is kept within its disk limit.
-pub(crate) const MAINTENANCE_QUIET: Duration = Duration::from_secs(2);
-/// After this many unmeasured builds a slot is kept within its limit right
-/// after its build, idle or not.
-pub(crate) const MAINTENANCE_DUE: u32 = 8;
+/// How long a slot stays idle before its target is measured.
+pub(crate) const MEASURE_QUIET: Duration = Duration::from_secs(2);
+/// After this many unmeasured builds a slot is measured right after its
+/// build, idle or not.
+pub(crate) const MEASURE_DUE: u32 = 8;
+/// What builds used this recently is in use: evicting it means the budget
+/// or free disk is below what builds use.
+const IN_USE: Duration = Duration::from_secs(10 * 60);
 /// A build that compiled at least this many units tells what one costs.
 const UNIT_COST_SAMPLE: u64 = 5;
 
@@ -112,14 +119,10 @@ pub(crate) enum Effect {
     Cancel {
         job: JobId,
     },
-    /// Keep the slot within its disk limit.
-    Maintain(IdleSlot),
-    /// Free `needed` bytes of disk from these slots, what builds used
-    /// longest ago first.
-    Reclaim {
-        slots: Vec<IdleSlot>,
-        needed: u64,
-    },
+    /// Measure the slot's target.
+    Measure(Measurement),
+    /// Remove what idle slots give up.
+    Evict(Vec<Removal>),
     /// Something happened, for people watching.
     Report(EventKind),
     /// Slot `slot` of `repository` has a new record to keep on disk.
@@ -130,15 +133,22 @@ pub(crate) enum Effect {
     },
 }
 
-/// Slot `slot` of `repository`, idle and handed out to free disk, with when
-/// builds last `used` each of its compiled units. It is busy until the
-/// scheduler hears it was [`Scheduler::maintained`].
+/// Idle slot `slot` of `repository`, whose target is to be measured. It is
+/// busy until the scheduler hears it was [`Scheduler::measured`].
 #[derive(Debug, PartialEq)]
-pub(crate) struct IdleSlot {
+pub(crate) struct Measurement {
     pub(crate) key: SlotKey,
     pub(crate) repository: PathBuf,
     pub(crate) slot: usize,
-    pub(crate) used: HashMap<String, u64>,
+}
+
+/// What idle slot `key`, named `name`, gives up: `paths` in its target. It
+/// is busy until the scheduler hears it was [`Scheduler::evicted`].
+#[derive(Debug, PartialEq)]
+pub(crate) struct Removal {
+    pub(crate) key: SlotKey,
+    pub(crate) name: String,
+    pub(crate) paths: Vec<PathBuf>,
 }
 
 /// A build to start in slot `slot` of `repository`.
@@ -229,16 +239,17 @@ struct Slot {
     worktree: Option<PathBuf>,
     /// When it last started a build, on the scheduler's clock.
     used: u64,
-    /// Its target is being kept within its disk limit.
-    maintaining: bool,
+    /// What it does while no build runs in it.
+    chore: Option<Chore>,
     /// Builds since its target was last measured.
     unmeasured: u32,
     /// When its latest build ended.
     idle_since: Instant,
-    /// Its target's disk usage when last measured.
+    /// Its target's disk usage when last measured, less what it gave up
+    /// since.
     size: Option<u64>,
-    /// Its last maintenance took caches in use: its limit is too small.
-    undersized: bool,
+    /// What its target holds, from its measurement since its latest build.
+    inventory: Option<Inventory>,
     /// How its latest build since the daemon started ended.
     last: Option<LastBuild>,
     /// Crates its target holds in several variants, when last counted.
@@ -254,7 +265,18 @@ struct Slot {
 
 impl Slot {
     fn busy(&self) -> bool {
-        self.job.is_some() || self.maintaining
+        self.job.is_some() || self.chore.is_some()
+    }
+
+    /// When builds last used `item` of its target, as far as is known.
+    fn last_use(&self, item: &Evictable) -> SystemTime {
+        let recorded = match &item.kind {
+            Kind::Unit(unit) => self.units.get(unit),
+            Kind::Cache | Kind::TestFiles => None,
+        };
+        recorded.map_or(item.written, |seconds| {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(*seconds)
+        })
     }
 
     /// Its build of `compilation` used `units`: everything the compilation
@@ -327,6 +349,13 @@ impl Slot {
     }
 }
 
+/// An eviction under way: the shortage it covers, and the items of each
+/// slot's inventory it removes, by slot index.
+struct Eviction {
+    shortage: Shortage,
+    chosen: Vec<(usize, Vec<usize>)>,
+}
+
 pub(crate) struct Scheduler<D> {
     capacity: usize,
     /// Memory running builds may use together, by their expected peaks.
@@ -342,6 +371,10 @@ pub(crate) struct Scheduler<D> {
     /// Per repository, the wall time compiling one unit took lately, in
     /// milliseconds: a moving average over builds that compiled enough.
     unit_ms: HashMap<PathBuf, u64>,
+    /// The eviction under way.
+    evicting: Option<Eviction>,
+    /// The latest eviction took what builds used in the last ten minutes.
+    undersized: bool,
 }
 
 impl Job {
@@ -426,6 +459,8 @@ impl<D: Distance> Scheduler<D> {
             waiting: HashMap::new(),
             slots: Vec::new(),
             unit_ms: HashMap::new(),
+            evicting: None,
+            undersized: false,
         }
     }
 
@@ -457,11 +492,11 @@ impl<D: Distance> Scheduler<D> {
             revision,
             worktree: record.worktree,
             used: 0,
-            maintaining: false,
+            chore: None,
             unmeasured: 1,
             idle_since: Instant::now(),
             size: None,
-            undersized: false,
+            inventory: None,
             last: None,
             duplicated: None,
             passed: record.passed,
@@ -817,8 +852,8 @@ impl<D: Distance> Scheduler<D> {
             report,
         })];
         effects.push(persist);
-        if entry.unmeasured >= MAINTENANCE_DUE {
-            effects.push(self.maintain(slot));
+        if entry.unmeasured >= MEASURE_DUE {
+            effects.push(self.measure(slot));
         }
         for waiter in job.waiters {
             self.waiting.remove(&waiter.id);
@@ -837,158 +872,247 @@ impl<D: Distance> Scheduler<D> {
         effects
     }
 
-    fn maintain(&mut self, index: usize) -> Effect {
-        Effect::Maintain(self.hand_out(index))
-    }
-
-    /// Marks idle slot `index` busy while it frees disk.
-    fn hand_out(&mut self, index: usize) -> IdleSlot {
+    /// Marks idle slot `index` busy while its target is measured.
+    fn measure(&mut self, index: usize) -> Effect {
         let slot = &mut self.slots[index];
-        assert!(!slot.busy(), "only an idle slot is handed out");
-        slot.maintaining = true;
-        IdleSlot {
+        assert!(!slot.busy(), "only an idle slot is measured");
+        slot.chore = Some(Chore::Measuring);
+        Effect::Measure(Measurement {
             key: SlotKey(index),
             repository: slot.repository.clone(),
             slot: slot.index,
-            used: slot.units.clone(),
-        }
-    }
-
-    /// Hands out every idle slot to free `needed` bytes of disk; None when
-    /// every slot is busy. Each is [`Self::maintained`] afterwards.
-    pub(crate) fn reclaim(&mut self, needed: u64) -> Option<Effect> {
-        let idle = (0..self.slots.len())
-            .filter(|index| !self.slots[*index].busy())
-            .collect::<Vec<_>>();
-        if idle.is_empty() {
-            return None;
-        }
-        let slots = idle.into_iter().map(|index| self.hand_out(index)).collect();
-        Some(Effect::Reclaim { slots, needed })
-    }
-
-    /// Slot `key`'s target holds `crates` crates in several variants; a
-    /// rise is reported.
-    pub(crate) fn duplicated(&mut self, key: SlotKey, crates: usize) -> Option<Effect> {
-        let slot = &mut self.slots[key.0];
-        let rose = crates > slot.duplicated.unwrap_or(0);
-        slot.duplicated = Some(crates);
-        rose.then(|| {
-            Effect::Report(EventKind::Duplicated {
-                slot: slot_name(&slot.repository, slot.index),
-                crates,
-            })
         })
     }
 
-    /// When the next idle slot is due for maintenance, if one will be.
-    pub(crate) fn next_maintenance(&self) -> Option<Instant> {
+    /// When the next idle slot is due for measurement, if one will be.
+    pub(crate) fn next_measurement(&self) -> Option<Instant> {
         self.slots
             .iter()
             .filter(|slot| !slot.busy() && slot.unmeasured > 0)
-            .map(|slot| slot.idle_since + MAINTENANCE_QUIET)
+            .map(|slot| slot.idle_since + MEASURE_QUIET)
             .min()
     }
 
-    /// Maintains the slots that have been idle for [`MAINTENANCE_QUIET`] by
+    /// Measures the slots that have been idle for [`MEASURE_QUIET`] by
     /// `now`.
-    pub(crate) fn maintenance_due(&mut self, now: Instant) -> Vec<Effect> {
+    pub(crate) fn measurement_due(&mut self, now: Instant) -> Vec<Effect> {
         let due = self
             .slots
             .iter()
             .enumerate()
             .filter(|(_, slot)| {
-                !slot.busy() && slot.unmeasured > 0 && slot.idle_since + MAINTENANCE_QUIET <= now
+                !slot.busy() && slot.unmeasured > 0 && slot.idle_since + MEASURE_QUIET <= now
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        due.into_iter().map(|index| self.maintain(index)).collect()
+        due.into_iter().map(|index| self.measure(index)).collect()
     }
 
-    /// Slot `key` was kept within its disk limit by `pruning`, which removed
-    /// compiled units `evicted`; None when that failed.
-    pub(crate) fn maintained(
+    /// Slot `key`'s target holds `inventory`, or could not be measured. Its
+    /// record of units builds used keeps only the units still there.
+    pub(crate) fn measured(
         &mut self,
         key: SlotKey,
-        pruning: Option<Pruning>,
-        evicted: &[String],
-    ) -> Vec<Effect> {
-        self.handed_back(key, pruning, evicted, true)
-    }
-
-    /// Slot `key` gave up what builds used longest ago to free disk, as
-    /// `pruning` says, removing compiled units `evicted`. Its own limit was
-    /// not looked at, so it stays due for maintenance.
-    pub(crate) fn reclaimed(
-        &mut self,
-        key: SlotKey,
-        pruning: Option<Pruning>,
-        evicted: &[String],
-    ) -> Vec<Effect> {
-        self.handed_back(key, pruning, evicted, false)
-    }
-
-    /// A slot handed out to free disk is back; its limit was kept when
-    /// `limit_kept`.
-    fn handed_back(
-        &mut self,
-        key: SlotKey,
-        pruning: Option<Pruning>,
-        evicted: &[String],
-        limit_kept: bool,
+        inventory: Result<Inventory, String>,
     ) -> Vec<Effect> {
         let slot = &mut self.slots[key.0];
-        assert!(slot.maintaining, "only a slot handed out comes back");
-        slot.maintaining = false;
-        if limit_kept {
-            slot.unmeasured = 0;
-        } else {
-            slot.unmeasured = slot.unmeasured.max(1);
-        }
-        slot.size = pruning.map(Pruning::size);
-        slot.undersized = pruning.is_some_and(Pruning::undersized);
+        assert_eq!(
+            slot.chore,
+            Some(Chore::Measuring),
+            "only a slot being measured is measured"
+        );
+        slot.chore = None;
+        slot.unmeasured = 0;
         let mut effects = Vec::new();
-        for unit in evicted {
-            slot.units.remove(unit);
+        match inventory {
+            Ok(inventory) => {
+                let present = inventory
+                    .items
+                    .iter()
+                    .filter_map(|item| match &item.kind {
+                        Kind::Unit(unit) => Some(unit.as_str()),
+                        Kind::Cache | Kind::TestFiles => None,
+                    })
+                    .collect::<HashSet<_>>();
+                let recorded = slot.units.len();
+                slot.units.retain(|unit, _| present.contains(unit.as_str()));
+                if slot.units.len() != recorded {
+                    effects.push(slot.persist());
+                }
+                let crates = inventory.duplicated_crates();
+                if crates > slot.duplicated.unwrap_or(0) {
+                    effects.push(Effect::Report(EventKind::Duplicated {
+                        slot: slot_name(&slot.repository, slot.index),
+                        crates,
+                    }));
+                }
+                slot.duplicated = Some(crates);
+                slot.size = Some(inventory.total);
+                slot.inventory = Some(inventory);
+            }
+            Err(_) => {
+                slot.size = None;
+                slot.inventory = None;
+            }
         }
-        // What compilations need stays known: it holds for every slot.
-        if let Some(Pruning::Cleared { .. }) = pruning {
-            slot.units.clear();
-        }
-        if !evicted.is_empty() || matches!(pruning, Some(Pruning::Cleared { .. })) {
-            effects.push(slot.persist());
-        }
-        let name = slot_name(&slot.repository, slot.index);
-        let report = match pruning {
-            None | Some(Pruning::Within { .. }) => None,
-            Some(Pruning::Evicted {
-                before,
-                after,
-                caches,
-                units,
-                in_use,
-            }) => Some(EventKind::Pruned {
-                slot: name,
-                before,
-                after,
-                caches,
-                units,
-                in_use,
-                cleared: false,
-            }),
-            Some(Pruning::Cleared { before }) => Some(EventKind::Pruned {
-                slot: name,
-                before,
-                after: 0,
-                caches: 0,
-                units: 0,
-                in_use: 0,
-                cleared: true,
-            }),
-        };
-        effects.extend(report.map(Effect::Report));
         effects.extend(self.start_ready());
         effects
+    }
+
+    /// What the slots' targets hold together, as last measured.
+    pub(crate) fn disk_used(&self) -> u64 {
+        self.slots.iter().filter_map(|slot| slot.size).sum()
+    }
+
+    /// Whether an eviction is under way.
+    pub(crate) fn evicting(&self) -> bool {
+        self.evicting.is_some()
+    }
+
+    /// Chooses what idle slots give up to cover `shortage`: what builds used
+    /// longest ago first, across every measured idle slot. None while an
+    /// eviction is under way, or when no idle slot has anything to give up.
+    /// The slots it chooses from are busy until [`Self::evicted`].
+    pub(crate) fn evict(&mut self, shortage: Shortage) -> Option<Effect> {
+        let needed = shortage.needed();
+        assert!(needed > 0, "an eviction covers a shortage");
+        if self.evicting.is_some() {
+            return None;
+        }
+        let mut candidates = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| !slot.busy())
+            .filter_map(|(index, slot)| Some((index, slot, slot.inventory.as_ref()?)))
+            .flat_map(|(index, slot, inventory)| {
+                inventory
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(move |(item, evictable)| (slot.last_use(evictable), index, item))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        let mut freed = 0;
+        let mut chosen = BTreeMap::<usize, Vec<usize>>::new();
+        for (_, index, item) in candidates {
+            if freed >= needed {
+                break;
+            }
+            let inventory = self.slots[index].inventory.as_ref().expect("listed above");
+            freed += inventory.items[item].freeable;
+            chosen.entry(index).or_default().push(item);
+        }
+        if chosen.is_empty() {
+            return None;
+        }
+        let removals = chosen
+            .iter()
+            .map(|(index, items)| {
+                let slot = &mut self.slots[*index];
+                slot.chore = Some(Chore::Evicting);
+                let inventory = slot.inventory.as_ref().expect("listed above");
+                Removal {
+                    key: SlotKey(*index),
+                    name: slot_name(&slot.repository, slot.index),
+                    paths: items
+                        .iter()
+                        .flat_map(|item| inventory.items[*item].paths.iter().cloned())
+                        .collect(),
+                }
+            })
+            .collect();
+        self.evicting = Some(Eviction {
+            shortage,
+            chosen: chosen.into_iter().collect(),
+        });
+        Some(Effect::Evict(removals))
+    }
+
+    /// The slots of the eviction under way gave up what it chose, or failed
+    /// to as `results` say. A slot that failed is measured again.
+    pub(crate) fn evicted(&mut self, results: Vec<(SlotKey, Result<(), String>)>) -> Vec<Effect> {
+        let Eviction { shortage, chosen } = self.evicting.take().expect("an eviction is under way");
+        assert_eq!(
+            results.len(),
+            chosen.len(),
+            "every slot of an eviction ends"
+        );
+        let recent = SystemTime::now() - IN_USE;
+        let (mut freed, mut caches, mut units, mut test_files, mut in_use) = (0, 0, 0, 0, 0);
+        let mut names = Vec::new();
+        let mut effects = Vec::new();
+        for (key, result) in results {
+            let (_, items) = chosen
+                .iter()
+                .find(|(index, _)| *index == key.0)
+                .expect("a slot of the eviction");
+            let slot = &mut self.slots[key.0];
+            assert_eq!(
+                slot.chore,
+                Some(Chore::Evicting),
+                "only a slot evicting is done evicting"
+            );
+            slot.chore = None;
+            let inventory = slot
+                .inventory
+                .take()
+                .expect("an evicting slot was measured");
+            if result.is_err() {
+                // What is left is unknown until it is measured again.
+                slot.unmeasured = slot.unmeasured.max(1);
+                continue;
+            }
+            let (gone, kept) = inventory
+                .items
+                .into_iter()
+                .enumerate()
+                .partition::<Vec<_>, _>(|(index, _)| items.contains(index));
+            let mut released = 0;
+            let mut forgotten = false;
+            for (_, item) in gone {
+                released += item.freeable;
+                in_use += usize::from(slot.last_use(&item) > recent);
+                match item.kind {
+                    Kind::Cache => caches += 1,
+                    Kind::Unit(unit) => {
+                        units += 1;
+                        forgotten |= slot.units.remove(&unit).is_some();
+                    }
+                    Kind::TestFiles => test_files += 1,
+                }
+            }
+            freed += released;
+            let total = inventory.total.saturating_sub(released);
+            slot.size = Some(total);
+            slot.inventory = Some(Inventory {
+                items: kept.into_iter().map(|(_, item)| item).collect(),
+                total,
+            });
+            if forgotten {
+                effects.push(slot.persist());
+            }
+            names.push(slot_name(&slot.repository, slot.index));
+        }
+        self.undersized = in_use > 0;
+        effects.push(Effect::Report(EventKind::Evicted {
+            shortage,
+            freed,
+            caches,
+            units,
+            test_files,
+            in_use,
+            slots: names,
+        }));
+        effects.extend(self.start_ready());
+        effects
+    }
+
+    /// Whether the latest eviction took what builds used in the last ten
+    /// minutes.
+    pub(crate) fn undersized(&self) -> bool {
+        self.undersized
     }
 
     /// Starts queued builds, next first, while slots are free. A build that
@@ -1050,6 +1174,8 @@ impl<D: Distance> Scheduler<D> {
             let first = self.built_worktrees.insert(job.waiters[0].worktree.clone());
             let entry = &mut self.slots[slot];
             entry.job = Some(id);
+            // Its build changes what its target holds.
+            entry.inventory = None;
             entry.revision = job.revision.clone();
             entry.worktree = Some(job.waiters[0].worktree.clone());
             entry.used = self.clock;
@@ -1232,8 +1358,8 @@ impl<D: Distance> Scheduler<D> {
                 .iter()
                 .filter(|slot| slot.repository == repository)
         };
-        // A slot being maintained is free again soon, and warm.
-        if own().any(|slot| slot.maintaining) || own().count() >= self.capacity {
+        // A slot being measured or evicting is free again soon, and warm.
+        if own().any(|slot| slot.chore.is_some()) || own().count() >= self.capacity {
             return Placement::Wait;
         }
         // Restored slots can leave gaps: take the lowest free index.
@@ -1247,11 +1373,11 @@ impl<D: Distance> Scheduler<D> {
             revision,
             worktree: Some(job.waiters[0].worktree.clone()),
             used: 0,
-            maintaining: false,
+            chore: None,
             unmeasured: 0,
             idle_since: Instant::now(),
             size: None,
-            undersized: false,
+            inventory: None,
             last: None,
             duplicated: None,
             passed: Vec::new(),
@@ -1338,8 +1464,7 @@ impl<D: Distance> Scheduler<D> {
                 name: slot_name(&slot.repository, slot.index),
                 worktree: slot.worktree.clone(),
                 size: slot.size,
-                maintaining: slot.maintaining,
-                undersized: slot.undersized,
+                chore: slot.chore,
                 build: slot.job.map(|id| {
                     let tokens = tokens(id);
                     let job = &self.jobs[&id];
@@ -1477,6 +1602,7 @@ fn millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::cargo::Command;
+    use crate::slot::{Evictable, Inventory, Kind};
 
     /// Distances from a table; trees not in it are equal or 10 apart.
     #[derive(Default)]
@@ -1621,14 +1747,76 @@ mod tests {
             .collect()
     }
 
-    fn maintains(effects: &[Effect]) -> Vec<usize> {
+    fn measures(effects: &[Effect]) -> Vec<usize> {
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Maintain(IdleSlot { slot, .. }) => Some(*slot),
+                Effect::Measure(Measurement { slot, .. }) => Some(*slot),
                 _ => None,
             })
             .collect()
+    }
+
+    /// A target holding compiled `units` of `bytes` each, written long ago.
+    fn inventory(units: &[String], bytes: u64) -> Inventory {
+        Inventory {
+            items: units
+                .iter()
+                .map(|unit| Evictable {
+                    paths: vec![PathBuf::from(format!("/target/{unit}"))],
+                    kind: Kind::Unit(unit.clone()),
+                    written: SystemTime::UNIX_EPOCH,
+                    freeable: bytes,
+                })
+                .collect(),
+            total: bytes * units.len() as u64,
+        }
+    }
+
+    /// Measures every idle slot, each holding what its record says it used,
+    /// `bytes` per unit.
+    fn measure_all(scheduler: &mut Scheduler<Table>, bytes: u64) {
+        let due = scheduler.measurement_due(Instant::now() + MEASURE_QUIET);
+        for index in measures(&due) {
+            let key = SlotKey(
+                scheduler
+                    .slots
+                    .iter()
+                    .position(|slot| slot.index == index)
+                    .unwrap(),
+            );
+            let mut held = scheduler.slots[key.0]
+                .units
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            held.sort();
+            scheduler.measured(key, Ok(inventory(&held, bytes)));
+        }
+    }
+
+    fn removed(effect: &Effect) -> Vec<(usize, Vec<String>)> {
+        let Effect::Evict(removals) = effect else {
+            panic!("{effect:?}");
+        };
+        removals
+            .iter()
+            .map(|removal| {
+                let names = removal
+                    .paths
+                    .iter()
+                    .map(|path| path.strip_prefix("/target").unwrap().display().to_string())
+                    .collect();
+                (removal.key.0, names)
+            })
+            .collect()
+    }
+
+    fn over_budget(bytes: u64) -> Shortage {
+        Shortage {
+            over_budget: bytes,
+            under_floor: 0,
+        }
     }
 
     fn sent(effects: &[Effect], waiter: u64) -> Vec<&Message> {
@@ -1913,19 +2101,19 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_slot_is_maintained_after_a_quiet_period_and_waited_for_meanwhile() {
+    fn an_idle_slot_is_measured_after_a_quiet_period_and_waited_for_meanwhile() {
         let mut scheduler = scheduler(2);
         let first = submit(&mut scheduler, 1, "/a", "a1");
         let [(job, 0, _)] = starts(&first)[..] else {
             panic!("{first:?}");
         };
         let ended = Instant::now();
-        assert!(maintains(&scheduler.exited(job, &ok(), None, BuildReport::default())).is_empty());
-        let due = scheduler.next_maintenance().expect("the slot is due");
-        assert!(due >= ended + MAINTENANCE_QUIET);
-        assert!(scheduler.maintenance_due(ended).is_empty());
-        assert_eq!(maintains(&scheduler.maintenance_due(due)), [0]);
-        assert_eq!(scheduler.next_maintenance(), None);
+        assert!(measures(&scheduler.exited(job, &ok(), None, BuildReport::default())).is_empty());
+        let due = scheduler.next_measurement().expect("the slot is due");
+        assert!(due >= ended + MEASURE_QUIET);
+        assert!(scheduler.measurement_due(ended).is_empty());
+        assert_eq!(measures(&scheduler.measurement_due(due)), [0]);
+        assert_eq!(scheduler.next_measurement(), None);
 
         let waiting = submit(&mut scheduler, 2, "/a", "a2");
         assert!(starts(&waiting).is_empty(), "no second, cold slot");
@@ -1945,26 +2133,27 @@ mod tests {
         });
         assert_eq!(starts(&other).len(), 1);
         let (slots, queue) = scheduler.status(|_| 0);
-        assert!(slots[0].maintaining && slots[0].build.is_none());
+        assert!(slots[0].chore == Some(Chore::Measuring) && slots[0].build.is_none());
         assert_eq!(queue.len(), 1);
-        let ready = scheduler.maintained(SlotKey(0), Some(Pruning::Within { size: 5 }), &[]);
+        let ready = scheduler.measured(SlotKey(0), Ok(inventory(&units("a", 1), 5)));
         assert!(
             matches!(starts(&ready)[..], [(_, 0, ref tree)] if tree == "a2"),
             "the waiting build takes its warm slot"
         );
         assert_eq!(scheduler.status(|_| 0).0[0].size, Some(5));
+        assert_eq!(scheduler.disk_used(), 5);
     }
 
     #[test]
-    fn a_slot_busy_without_pause_is_maintained_after_enough_builds() {
+    fn a_slot_busy_without_pause_is_measured_after_enough_builds() {
         let mut scheduler = scheduler(1);
-        for build in 1..MAINTENANCE_DUE {
+        for build in 1..MEASURE_DUE {
             let effects = submit(&mut scheduler, u64::from(build), "/a", &format!("a{build}"));
             let [(job, ..)] = starts(&effects)[..] else {
                 panic!("{effects:?}");
             };
             assert!(
-                maintains(&scheduler.exited(job, &ok(), None, BuildReport::default())).is_empty()
+                measures(&scheduler.exited(job, &ok(), None, BuildReport::default())).is_empty()
             );
         }
         let last = submit(&mut scheduler, 99, "/a", "last");
@@ -1972,7 +2161,7 @@ mod tests {
             panic!("{last:?}");
         };
         assert_eq!(
-            maintains(&scheduler.exited(job, &ok(), None, BuildReport::default())),
+            measures(&scheduler.exited(job, &ok(), None, BuildReport::default())),
             [0]
         );
     }
@@ -2163,32 +2352,132 @@ mod tests {
     fn evicted_units_count_as_missing() {
         let mut scheduler = checked_and_tested();
         scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
-        let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
-        assert_eq!(maintains(&maintain), [0, 1]);
-        let pruning = Pruning::Evicted {
-            before: 2,
-            after: 1,
-            caches: 0,
-            units: 12,
-            in_use: 0,
+        measure_all(&mut scheduler, 10);
+        // Both slots' units were used in the same second: slot 0's go first.
+        let eviction = scheduler.evict(over_budget(120)).unwrap();
+        let [(0, gone)] = &removed(&eviction)[..] else {
+            panic!("{eviction:?}");
         };
-        scheduler.maintained(SlotKey(0), Some(pruning), &units("c", 12));
-        scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }), &[]);
+        assert_eq!(gone.len(), 12);
+        scheduler.evicted(vec![(SlotKey(0), Ok(()))]);
         // Both slots lack what `check` needs; slot 1 is closer.
         assert_eq!(run(&mut scheduler, 3, "/c", "c1"), 1);
     }
 
     #[test]
-    fn a_cleared_slot_forgets_its_units_but_not_what_compilations_need() {
+    fn an_eviction_takes_what_builds_used_longest_ago_across_idle_slots() {
         let mut scheduler = checked_and_tested();
-        let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
-        assert_eq!(maintains(&maintain), [0, 1]);
-        scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 9 }), &[]);
-        scheduler.maintained(SlotKey(1), Some(Pruning::Within { size: 1 }), &[]);
-        assert!(scheduler.slots[0].units.is_empty());
-        assert!(scheduler.status(|_| 0).0[0].undersized);
-        assert_eq!(scheduler.slots[0].compilations.len(), 1);
+        measure_all(&mut scheduler, 10);
+        let now = super::now();
+        // Slot 1's first test unit was used an hour ago; slot 0 holds a unit
+        // no build was seen using, written a day ago.
+        let first_test = units("t", 1).remove(0);
+        scheduler.slots[1]
+            .units
+            .insert(first_test.clone(), now - 3600);
+        let inventory = scheduler.slots[0].inventory.as_mut().unwrap();
+        inventory.items.push(Evictable {
+            paths: vec!["/target/debug/stale".into()],
+            kind: Kind::Unit("debug/5555555555555555".into()),
+            written: SystemTime::now() - Duration::from_secs(24 * 3600),
+            freeable: 10,
+        });
+        inventory.total += 10;
+        let eviction = scheduler.evict(over_budget(15)).unwrap();
+        assert_eq!(
+            removed(&eviction),
+            [
+                (0, vec!["debug/stale".to_owned()]),
+                (1, vec![first_test.clone()])
+            ]
+        );
+        let (slots, _) = scheduler.status(|_| 0);
+        assert!(slots.iter().all(|slot| slot.chore == Some(Chore::Evicting)));
+        assert_eq!(
+            scheduler.evict(over_budget(1)),
+            None,
+            "one eviction at a time"
+        );
+        assert!(scheduler.evicting());
+
+        let done = scheduler.evicted(vec![(SlotKey(0), Ok(())), (SlotKey(1), Ok(()))]);
+        assert!(matches!(
+            reports(&done)[..],
+            [EventKind::Evicted {
+                freed: 20,
+                units: 2,
+                in_use: 0,
+                ..
+            }]
+        ));
+        assert!(!scheduler.undersized());
+        // What compilations need stays known: it holds for every slot.
+        assert_eq!(scheduler.slots[1].compilations.len(), 1);
+        assert!(!scheduler.slots[1].units.contains_key(&first_test));
+        assert_eq!(scheduler.slots[1].units.len(), 11);
+        assert_eq!(scheduler.disk_used(), 250 - 20);
+        assert_eq!(
+            scheduler.slots[1].inventory.as_ref().unwrap().items.len(),
+            11
+        );
+    }
+
+    #[test]
+    fn an_eviction_skips_busy_and_unmeasured_slots_and_reports_taking_what_is_in_use() {
+        let mut scheduler = checked_and_tested();
+        measure_all(&mut scheduler, 10);
+        let busy = submit(&mut scheduler, 3, "/c", "c1");
+        let [(_, 0, _)] = starts(&busy)[..] else {
+            panic!("{busy:?}");
+        };
+        // Slot 0 builds; slot 1's units were all used a moment ago.
+        let eviction = scheduler.evict(over_budget(1_000)).unwrap();
+        let [(1, gone)] = &removed(&eviction)[..] else {
+            panic!("{eviction:?}");
+        };
+        assert_eq!(gone.len(), 12, "everything slot 1 has, still short");
+        let waiting = submit(&mut scheduler, 4, "/d", "d1");
+        assert!(starts(&waiting).is_empty(), "the evicting slot is busy");
+        let done = scheduler.evicted(vec![(SlotKey(1), Ok(()))]);
+        assert!(
+            reports(&done)
+                .iter()
+                .any(|report| matches!(report, EventKind::Evicted { in_use: 12, .. })),
+            "{done:?}"
+        );
+        assert!(scheduler.undersized());
+        assert_eq!(starts(&done).len(), 1, "{done:?}");
+        // Slot 1 builds now, slot 0 is unmeasured: nothing is left to evict.
+        assert_eq!(scheduler.evict(over_budget(1)), None);
+        assert!(!scheduler.evicting());
+    }
+
+    #[test]
+    fn a_slot_that_failed_to_evict_is_measured_again() {
+        let mut scheduler = checked_and_tested();
+        measure_all(&mut scheduler, 10);
+        scheduler.evict(over_budget(10)).unwrap();
+        let done = scheduler.evicted(vec![(SlotKey(0), Err("busy device".into()))]);
+        assert!(matches!(
+            reports(&done)[..],
+            [EventKind::Evicted { freed: 0, .. }]
+        ));
+        let due = scheduler.measurement_due(Instant::now() + MEASURE_QUIET);
+        assert_eq!(measures(&due), [0]);
+    }
+
+    #[test]
+    fn a_measurement_keeps_only_the_recorded_units_its_target_still_holds() {
+        let mut scheduler = checked_and_tested();
+        let due = scheduler.measurement_due(Instant::now() + MEASURE_QUIET);
+        assert_eq!(measures(&due), [0, 1]);
+        let kept = units("c", 3);
+        let done = scheduler.measured(SlotKey(0), Ok(inventory(&kept, 1)));
+        assert!(matches!(persisted(&done)[..], [(0, record)] if record.units.len() == 3));
+        scheduler.measured(SlotKey(1), Err("unreadable".into()));
+        assert_eq!(scheduler.slots[1].size, None);
         assert_eq!(scheduler.slots[1].units.len(), 12);
+        assert_eq!(scheduler.disk_used(), 3);
     }
 
     #[test]
@@ -2392,11 +2681,12 @@ mod tests {
         assert_eq!(run.compilation, Compilation::new(Path::new(""), &check()));
         assert_eq!(run.units.len(), 3);
         assert_eq!(record.units.len(), 3);
-        // A cleared target forgets its units, and that is persisted too.
-        scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
-        let cleared = scheduler.maintained(SlotKey(0), Some(Pruning::Cleared { before: 1 }), &[]);
+        // Evicted units are forgotten, and that is persisted too.
+        measure_all(&mut scheduler, 1);
+        scheduler.evict(over_budget(3)).unwrap();
+        let evicted = scheduler.evicted(vec![(SlotKey(0), Ok(()))]);
         assert!(matches!(
-            persisted(&cleared)[..],
+            persisted(&evicted)[..],
             [(0, record)] if record.units.is_empty() && record.compilations.len() == 1
         ));
     }
@@ -2446,27 +2736,7 @@ mod tests {
     }
 
     #[test]
-    fn reclaiming_disk_hands_out_every_idle_slot_and_starts_waiting_builds_after() {
-        let mut scheduler = checked_and_tested();
-        let busy = submit(&mut scheduler, 3, "/c", "c1");
-        assert_eq!(starts(&busy).len(), 1);
-        let Some(Effect::Reclaim { slots, needed: 7 }) = scheduler.reclaim(7) else {
-            panic!("one slot is idle");
-        };
-        let [IdleSlot { key, .. }] = &slots[..] else {
-            panic!("{slots:?}");
-        };
-        assert_eq!(scheduler.reclaim(7), None, "no slot is idle any more");
-        let waiting = submit(&mut scheduler, 4, "/d", "d1");
-        assert!(starts(&waiting).is_empty());
-        let done = scheduler.reclaimed(*key, Some(Pruning::Within { size: 1 }), &[]);
-        assert_eq!(starts(&done).len(), 1, "{done:?}");
-        // Its limit still has to be kept after that build.
-        assert!(scheduler.slots[key.0].unmeasured > 0);
-    }
-
-    #[test]
-    fn units_builds_use_are_recorded_handed_to_maintenance_and_forgotten_when_evicted() {
+    fn units_builds_use_are_recorded_and_forgotten_when_evicted() {
         let mut scheduler = scheduler(1);
         let first = submit(&mut scheduler, 1, "/work/a", "a1");
         let [(job, ..)] = starts(&first)[..] else {
@@ -2482,27 +2752,17 @@ mod tests {
             record.units.keys().collect::<Vec<_>>(),
             ["debug/aaaaaaaaaaaaaaaa", "debug/bbbbbbbbbbbbbbbb"]
         );
-        let maintain = scheduler.maintenance_due(Instant::now() + MAINTENANCE_QUIET);
-        let [Effect::Maintain(IdleSlot { used, .. })] = &maintain[..] else {
-            panic!("{maintain:?}");
-        };
-        assert_eq!(used.len(), 2);
-        let pruning = Pruning::Evicted {
-            before: 2,
-            after: 1,
-            caches: 0,
-            units: 1,
-            in_use: 0,
-        };
-        let done = scheduler.maintained(
-            SlotKey(0),
-            Some(pruning),
-            &["debug/aaaaaaaaaaaaaaaa".into()],
+        measure_all(&mut scheduler, 1);
+        let eviction = scheduler.evict(over_budget(1)).unwrap();
+        assert_eq!(
+            removed(&eviction),
+            [(0, vec!["debug/aaaaaaaaaaaaaaaa".to_owned()])]
         );
+        let done = scheduler.evicted(vec![(SlotKey(0), Ok(()))]);
         assert!(matches!(persisted(&done)[..], [(0, record)] if record.units.len() == 1));
         assert!(matches!(
             reports(&done)[..],
-            [EventKind::Pruned { units: 1, .. }]
+            [EventKind::Evicted { units: 1, .. }]
         ));
     }
 }

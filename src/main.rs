@@ -8,7 +8,7 @@ use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use buildd::cargo::{Command, Operation};
-use buildd::protocol::{BuildRequest, Failures, Message, Outcome, Status};
+use buildd::protocol::{BuildRequest, Chore, Failures, Message, Outcome, Status};
 use buildd::{client, config};
 use serde::Deserialize;
 
@@ -414,9 +414,11 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         jobs,
         idle_jobs,
         capacity,
-        slot_limit,
+        disk_budget,
+        disk_used,
         free_disk,
         min_free,
+        undersized,
         memory,
         memory_in_use,
         slots,
@@ -431,9 +433,15 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         },
     );
     println!(
-        "{capacity} slots of {}, jobs: {idle_jobs} of {jobs} idle, memory: {} of {}, \
-         disk: {disk} (floor {}){}",
-        gib(slot_limit),
+        "{capacity} slots, build disk: {} of {}{}, jobs: {idle_jobs} of {jobs} idle, \
+         memory: {} of {}, disk: {disk} (floor {}){}",
+        gib(disk_used),
+        gib(disk_budget),
+        if undersized {
+            " (below what builds use)"
+        } else {
+            ""
+        },
         gib(memory_in_use),
         gib(memory),
         gib(min_free),
@@ -447,14 +455,9 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         let worktree = slot.worktree.map_or_else(String::new, |worktree| {
             format!(" for {}", worktree.display())
         });
-        let size = slot.size.map_or_else(String::new, |size| {
-            let warning = if slot.undersized {
-                ", limit below what its builds use"
-            } else {
-                ""
-            };
-            format!(" [{}{warning}]", gib(size))
-        });
+        let size = slot
+            .size
+            .map_or_else(String::new, |size| format!(" [{}]", gib(size)));
         match slot.build {
             Some(build) => println!(
                 "slot {}{size}: {} {} for {} ({}, compiled {} reused {}{})",
@@ -467,8 +470,14 @@ fn status(home: &Path) -> Result<ExitCode, String> {
                 build.fresh,
                 if build.cancelled { ", cancelled" } else { "" },
             ),
-            None if slot.maintaining => println!("slot {}{size}: pruning{worktree}", slot.name),
-            None => println!("slot {}{size}: idle{worktree}", slot.name),
+            None => {
+                let doing = match slot.chore {
+                    Some(Chore::Measuring) => "measuring",
+                    Some(Chore::Evicting) => "evicting",
+                    None => "idle",
+                };
+                println!("slot {}{size}: {doing}{worktree}", slot.name);
+            }
         }
     }
     for (position, build) in queue.iter().enumerate() {

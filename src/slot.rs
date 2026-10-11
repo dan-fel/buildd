@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +19,6 @@ use crate::cargo::Compilation;
 use crate::git;
 use crate::log::log;
 use crate::snapshot::Revision;
-
-/// An incremental cache compiled this recently belongs to builds in use:
-/// removing it makes their next compilation start from scratch.
-const IN_USE: Duration = Duration::from_secs(10 * 60);
 
 /// What a slot keeps on disk that its checkout and target do not tell: the
 /// worktree it last built for, what its builds of each compilation used, and
@@ -210,204 +206,102 @@ impl SlotDirectory {
         Ok(())
     }
 
-    /// Keeps the slot's target within `limit` bytes of disk by removing what
-    /// builds used longest ago first: incremental caches and compiled units.
-    /// `used` says when a build last used each unit, by [`unit_key`]; a unit
-    /// no build was seen using is aged by when it was written. Removing a
-    /// unit only makes Cargo compile it again when a build needs it; the
-    /// whole target goes only when nothing else is left to remove.
-    ///
-    /// Returns what it did and the units it removed. Only call this while
-    /// no build runs in the slot.
-    pub(crate) fn enforce_limit(
-        &self,
-        limit: u64,
-        used: &HashMap<String, u64>,
-    ) -> Result<(Pruning, Vec<String>), String> {
+    /// What the slot's target holds: everything eviction may remove, with
+    /// what removing each frees, and the disk it takes in all. Only call
+    /// this while no build runs in the slot.
+    pub(crate) fn inventory(&self) -> Result<Inventory, String> {
         let target = self.target();
         if !target.exists() {
-            return Ok((Pruning::Within { size: 0 }, Vec::new()));
+            return Ok(Inventory::default());
         }
-        let items = evictables(&target, used)?;
+        let mut items = evictables(&target)?;
         let usage = disk_usage(&target, &items)?;
-        if usage.total <= limit {
-            return Ok((Pruning::Within { size: usage.total }, Vec::new()));
+        for (item, freeable) in items.iter_mut().zip(usage.freeable) {
+            item.freeable = freeable;
         }
-        let mut order = (0..items.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&index| items[index].used);
-        // Space a removal frees for certain: files hard-linked from outside
-        // the item (object files kept for debug info, uplifted binaries) stay
-        // on disk.
-        let mut estimate = usage.total;
-        let (mut caches, mut in_use) = (0, 0);
-        let mut units = Vec::new();
-        let recent = SystemTime::now() - IN_USE;
-        for index in order {
-            if estimate <= limit {
-                break;
-            }
-            let item = &items[index];
-            for path in &item.paths {
-                remove_path(path)?;
-            }
-            estimate = estimate.saturating_sub(usage.freeable[index]);
-            match &item.unit {
-                Some(unit) => units.push(unit.clone()),
-                None => caches += 1,
-            }
-            if item.used > recent {
-                in_use += 1;
-            }
-        }
-        let after = disk_usage(&target, &[])?.total;
-        if after <= limit {
-            let pruning = Pruning::Evicted {
-                before: usage.total,
-                after,
-                caches,
-                units: units.len(),
-                in_use,
-            };
-            return Ok((pruning, units));
-        }
-        remove_tree(&target)?;
-        Ok((
-            Pruning::Cleared {
-                before: usage.total,
-            },
-            units,
-        ))
+        Ok(Inventory {
+            items,
+            total: usage.total,
+        })
     }
 }
 
-/// What a slot gave up to bring free disk back to the floor: how it was
-/// kept, and the compiled units it lost; or why it could not be.
-pub(crate) type Reclaimed = Result<(Pruning, Vec<String>), String>;
-
-/// Frees `needed` bytes of disk from `slots`, each with when builds last
-/// used its compiled units: what builds used longest ago goes first, across
-/// all of them, and nothing a build used in the last ten minutes. Returns
-/// what it did in each slot, in order. Only call this while no build runs
-/// in any of them.
-pub(crate) fn reclaim(
-    slots: &[(SlotDirectory, HashMap<String, u64>)],
-    needed: u64,
-) -> Vec<Reclaimed> {
-    let prepared = slots
-        .iter()
-        .map(|(slot, used)| {
-            let target = slot.target();
-            if !target.exists() {
-                let nothing = DiskUsage {
-                    total: 0,
-                    freeable: Vec::new(),
-                };
-                return Ok((Vec::new(), nothing));
-            }
-            let items = evictables(&target, used)?;
-            let usage = disk_usage(&target, &items)?;
-            Ok((items, usage))
-        })
-        .collect::<Vec<Result<_, String>>>();
-    let recent = SystemTime::now() - IN_USE;
-    let mut candidates = prepared
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, prepared)| prepared.as_ref().ok().map(|(items, _)| (slot, items)))
-        .flat_map(|(slot, items)| {
-            items
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| item.used <= recent)
-                .map(move |(index, item)| (item.used, slot, index))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_unstable();
-    let mut freed = 0;
-    let mut removed = vec![(0, Vec::new(), None); slots.len()];
-    for (_, slot, index) in candidates {
-        if freed >= needed {
-            break;
-        }
-        let Ok((items, usage)) = &prepared[slot] else {
-            unreachable!("only prepared slots have candidates");
-        };
-        let (caches, units, error) = &mut removed[slot];
-        if error.is_some() {
-            continue;
-        }
-        let item = &items[index];
-        if let Err(failed) = item.paths.iter().try_for_each(|path| remove_path(path)) {
-            *error = Some(failed);
-            continue;
-        }
-        freed += usage.freeable[index];
-        match &item.unit {
-            Some(unit) => units.push(unit.clone()),
-            None => *caches += 1,
-        }
-    }
-    prepared
-        .into_iter()
-        .zip(removed)
-        .zip(slots)
-        .map(|((prepared, (caches, units, error)), (slot, _))| {
-            let (_, usage) = prepared?;
-            if let Some(error) = error {
-                return Err(error);
-            }
-            if caches == 0 && units.is_empty() {
-                return Ok((Pruning::Within { size: usage.total }, units));
-            }
-            let after = disk_usage(&slot.target(), &[])?.total;
-            let pruning = Pruning::Evicted {
-                before: usage.total,
-                after,
-                caches,
-                units: units.len(),
-                in_use: 0,
-            };
-            Ok((pruning, units))
-        })
-        .collect()
+/// What a slot's target holds: everything eviction may remove, and the disk
+/// the target takes in all, every file counted once however many hard links
+/// it has. It stays true while no build runs in the slot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Inventory {
+    pub(crate) items: Vec<Evictable>,
+    pub(crate) total: u64,
 }
 
-/// How many crates have their library compiled in more than one variant in
-/// a profile of `target`: what builds selecting different features leave
-/// behind, besides crates the lockfile holds in two versions.
+impl Inventory {
+    /// How many crates have their library compiled in more than one variant
+    /// in a profile: what builds selecting different features leave behind,
+    /// besides crates the lockfile holds in two versions.
+    pub(crate) fn duplicated_crates(&self) -> usize {
+        let mut variants = BTreeMap::<(&str, &str), usize>::new();
+        for item in &self.items {
+            let Kind::Unit(key) = &item.kind else {
+                continue;
+            };
+            let (profile, _) = key.rsplit_once('/').expect("a unit key names its profile");
+            let library = item.paths.iter().find_map(|path| {
+                let in_deps = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|parent| parent == "deps");
+                let (name, _) = path
+                    .file_name()?
+                    .to_str()?
+                    .strip_prefix("lib")?
+                    .strip_suffix(".rlib")?
+                    .rsplit_once('-')?;
+                in_deps.then_some(name)
+            });
+            if let Some(name) = library {
+                *variants.entry((profile, name)).or_default() += 1;
+            }
+        }
+        variants.values().filter(|count| **count > 1).count()
+    }
+}
+
+/// Something eviction may remove from a target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Evictable {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) kind: Kind,
+    /// When it was last written: how long ago builds used it, unless they
+    /// are known to have used it later.
+    pub(crate) written: SystemTime,
+    /// What removing it frees for certain: its directories and the files
+    /// with no hard link outside it. Object files kept for debug info and
+    /// uplifted binaries are such links.
+    pub(crate) freeable: u64,
+}
+
+/// What an [`Evictable`] is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Kind {
+    /// One compilation unit's incremental cache: removing it makes the
+    /// unit's next compilation start from scratch.
+    Cache,
+    /// One compiled unit's files, by [`unit_key`]: a build that needs the
+    /// unit compiles it again.
+    Unit(String),
+    /// A directory or file a test left in the target's `tmp` directory
+    /// (`CARGO_TARGET_TMPDIR`), whose content tests manage themselves.
+    TestFiles,
+}
+
+/// Removes `paths`, files or directories with everything under them; one
+/// already gone counts as removed.
 ///
 /// # Errors
-/// When the target cannot be read.
-pub(crate) fn duplicated_crates(target: &Path) -> Result<usize, String> {
-    if !target.exists() {
-        return Ok(0);
-    }
-    let mut duplicated = 0;
-    for (profile, _) in profile_directories(target)? {
-        let deps = profile.join("deps");
-        if !deps.is_dir() {
-            continue;
-        }
-        let mut variants = BTreeMap::<String, usize>::new();
-        for path in read_directory(&deps)? {
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let Some(stem) = name
-                .strip_prefix("lib")
-                .and_then(|name| name.strip_suffix(".rlib"))
-            else {
-                continue;
-            };
-            if let Some((crate_name, hash)) = stem.rsplit_once('-')
-                && unit_hash(name).is_some_and(|unit| unit == hash)
-            {
-                *variants.entry(crate_name.to_owned()).or_default() += 1;
-            }
-        }
-        duplicated += variants.values().filter(|count| **count > 1).count();
-    }
-    Ok(duplicated)
+/// When one cannot be removed; the ones before it are gone.
+pub(crate) fn remove(paths: &[PathBuf]) -> Result<(), String> {
+    paths.iter().try_for_each(|path| remove_path(path))
 }
 
 /// The disk space free for unprivileged use on the volume holding `path`.
@@ -418,43 +312,6 @@ pub(crate) fn free_disk(path: &Path) -> Result<u64, String> {
     let stat = rustix::fs::statvfs(path)
         .map_err(|error| format!("could not query free disk at {}: {error}", path.display()))?;
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
-}
-
-/// What keeping a slot within its limit did.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Pruning {
-    /// The target was within the limit.
-    Within { size: u64 },
-    /// `caches` incremental caches and `units` compiled units went, `in_use`
-    /// of them used within the last ten minutes.
-    Evicted {
-        before: u64,
-        after: u64,
-        caches: usize,
-        units: usize,
-        in_use: usize,
-    },
-    /// Nothing was left to remove; the target went.
-    Cleared { before: u64 },
-}
-
-impl Pruning {
-    /// The target's size afterwards.
-    pub(crate) fn size(self) -> u64 {
-        match self {
-            Self::Within { size } | Self::Evicted { after: size, .. } => size,
-            Self::Cleared { .. } => 0,
-        }
-    }
-
-    /// Whether the limit is below what the slot's builds use: keeping to it
-    /// took items in use, or the whole target.
-    pub(crate) fn undersized(self) -> bool {
-        matches!(
-            self,
-            Self::Evicted { in_use: 1.., .. } | Self::Cleared { .. }
-        )
-    }
 }
 
 /// The directories of a profile whose entries are named with the hash of the
@@ -489,15 +346,8 @@ fn unit_hash(name: &str) -> Option<&str> {
     (hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hash)
 }
 
-/// Something keeping a slot within its limit may remove: one compilation
-/// unit's incremental cache, or one compiled unit's files.
-struct Evictable {
-    paths: Vec<PathBuf>,
-    /// The compiled unit's key; None for an incremental cache.
-    unit: Option<String>,
-    /// When a build last used it, as far as is known.
-    used: SystemTime,
-}
+/// The directory of a target where tests keep files (`CARGO_TARGET_TMPDIR`).
+const TEST_FILES: &str = "tmp";
 
 /// The profile directories under `target`, for the host and each target
 /// triple: `<target>/[<triple>/]<profile>`, each with the target-relative
@@ -514,7 +364,9 @@ fn profile_directories(target: &Path) -> Result<Vec<(PathBuf, String)>, String> 
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_owned);
-        let Some(name) = name else { continue };
+        let Some(name) = name.filter(|name| name != TEST_FILES) else {
+            continue;
+        };
         if is_profile(&entry) {
             profiles.push((entry, name));
         } else if entry.is_dir() {
@@ -531,8 +383,9 @@ fn profile_directories(target: &Path) -> Result<Vec<(PathBuf, String)>, String> 
     Ok(profiles)
 }
 
-/// Everything under `target` keeping to a limit may remove.
-fn evictables(target: &Path, used: &HashMap<String, u64>) -> Result<Vec<Evictable>, String> {
+/// Everything under `target` eviction may remove; what each frees is
+/// filled in later.
+fn evictables(target: &Path) -> Result<Vec<Evictable>, String> {
     let modified = |path: &Path| {
         std::fs::symlink_metadata(path)
             .and_then(|metadata| metadata.modified())
@@ -545,11 +398,11 @@ fn evictables(target: &Path, used: &HashMap<String, u64>) -> Result<Vec<Evictabl
             // rustc replaces a cache's session directory on every
             // incremental compilation of its unit.
             for path in read_directory(&incremental)? {
-                let used = modified(&path)?;
                 items.push(Evictable {
+                    written: modified(&path)?,
                     paths: vec![path],
-                    unit: None,
-                    used,
+                    kind: Kind::Cache,
+                    freeable: 0,
                 });
             }
         }
@@ -576,13 +429,22 @@ fn evictables(target: &Path, used: &HashMap<String, u64>) -> Result<Vec<Evictabl
             }
         }
         for (key, (paths, written)) in units {
-            let used = used.get(&key).map_or(written, |seconds| {
-                SystemTime::UNIX_EPOCH + Duration::from_secs(*seconds)
-            });
             items.push(Evictable {
                 paths,
-                unit: Some(key),
-                used,
+                kind: Kind::Unit(key),
+                written,
+                freeable: 0,
+            });
+        }
+    }
+    let test_files = target.join(TEST_FILES);
+    if test_files.is_dir() {
+        for path in read_directory(&test_files)? {
+            items.push(Evictable {
+                written: modified(&path)?,
+                paths: vec![path],
+                kind: Kind::TestFiles,
+                freeable: 0,
             });
         }
     }
@@ -604,31 +466,31 @@ struct Inode {
     links: u64,
     seen: u64,
     /// The item holding every link seen so far, if one does.
-    cache: Option<usize>,
+    item: Option<usize>,
 }
 
 /// The disk space under `path`, not following symbolic links. rustc's
 /// incremental sessions and Cargo's artifacts are hard links, so each file
 /// counts once.
-fn disk_usage(path: &Path, caches: &[Evictable]) -> Result<DiskUsage, String> {
+fn disk_usage(path: &Path, items: &[Evictable]) -> Result<DiskUsage, String> {
     fn walk(
         path: &Path,
-        cache: Option<usize>,
-        caches: &HashMap<&Path, usize>,
+        item: Option<usize>,
+        items: &HashMap<&Path, usize>,
         inodes: &mut HashMap<(u64, u64), Inode>,
         usage: &mut DiskUsage,
     ) -> Result<(), String> {
-        let cache = caches.get(path).copied().or(cache);
+        let item = items.get(path).copied().or(item);
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let bytes = metadata.blocks() * 512;
         if metadata.is_dir() {
             usage.total += bytes;
-            if let Some(cache) = cache {
-                usage.freeable[cache] += bytes;
+            if let Some(item) = item {
+                usage.freeable[item] += bytes;
             }
             for child in read_directory(path)? {
-                walk(&child, cache, caches, inodes, usage)?;
+                walk(&child, item, items, inodes, usage)?;
             }
             return Ok(());
         }
@@ -640,16 +502,16 @@ fn disk_usage(path: &Path, caches: &[Evictable]) -> Result<DiskUsage, String> {
                     bytes,
                     links: metadata.nlink(),
                     seen: 0,
-                    cache,
+                    item,
                 }
             });
         inode.seen += 1;
-        if inode.cache != cache {
-            inode.cache = None;
+        if inode.item != item {
+            inode.item = None;
         }
         Ok(())
     }
-    let index = caches
+    let index = items
         .iter()
         .enumerate()
         .flat_map(|(index, item)| item.paths.iter().map(move |path| (path.as_path(), index)))
@@ -657,26 +519,28 @@ fn disk_usage(path: &Path, caches: &[Evictable]) -> Result<DiskUsage, String> {
     let mut inodes = HashMap::new();
     let mut usage = DiskUsage {
         total: 0,
-        freeable: vec![0; caches.len()],
+        freeable: vec![0; items.len()],
     };
     walk(path, None, &index, &mut inodes, &mut usage)?;
     for inode in inodes.values() {
-        if let Some(cache) = inode.cache
+        if let Some(item) = inode.item
             && inode.seen == inode.links
         {
-            usage.freeable[cache] += inode.bytes;
+            usage.freeable[item] += inode.bytes;
         }
     }
     Ok(usage)
 }
 
-/// Removes a file, or a directory with everything under it.
+/// Removes a file, or a directory with everything under it; one already
+/// gone counts as removed.
 fn remove_path(path: &Path) -> Result<(), String> {
-    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
-        remove_tree(path)
-    } else {
-        std::fs::remove_file(path)
-            .map_err(|error| format!("could not remove {}: {error}", path.display()))
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => remove_tree(path),
+        Ok(_) => std::fs::remove_file(path)
+            .map_err(|error| format!("could not remove {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
     }
 }
 
@@ -748,14 +612,6 @@ mod tests {
     use super::*;
     use crate::snapshot::resolve;
     use crate::snapshot::tests::{TempDir, git, repository};
-
-    impl SlotDirectory {
-        /// Keeps to `limit` with no record of use: units age by their files.
-        fn enforce_limit_now(&self, limit: u64) -> Result<Pruning, String> {
-            self.enforce_limit(limit, &HashMap::new())
-                .map(|(pruning, _)| pruning)
-        }
-    }
 
     fn modified(path: &Path) -> SystemTime {
         std::fs::metadata(path).unwrap().modified().unwrap()
@@ -834,8 +690,9 @@ mod tests {
     #[test]
     fn crates_compiled_in_several_variants_are_counted_per_profile() {
         let home = TempDir::new();
-        let target = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0).target();
-        assert_eq!(duplicated_crates(&target), Ok(0));
+        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+        let target = slot.target();
+        assert_eq!(slot.inventory().unwrap().duplicated_crates(), 0);
         for name in [
             "debug/deps/libserde-0123456789abcdef.rlib",
             "debug/deps/libserde-fedcba9876543210.rlib",
@@ -845,137 +702,130 @@ mod tests {
         ] {
             file(&target.join(name), 10);
         }
-        assert_eq!(duplicated_crates(&target), Ok(1));
+        assert_eq!(slot.inventory().unwrap().duplicated_crates(), 1);
+    }
+
+    /// The inventory's items by what they are, with the file names of their
+    /// paths, in a stable order.
+    fn listed(inventory: &Inventory) -> Vec<(String, Vec<String>)> {
+        let mut items = inventory
+            .items
+            .iter()
+            .map(|item| {
+                let kind = match &item.kind {
+                    Kind::Cache => "cache".to_owned(),
+                    Kind::Unit(key) => format!("unit {key}"),
+                    Kind::TestFiles => "test files".to_owned(),
+                };
+                let mut names = item
+                    .paths
+                    .iter()
+                    .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                names.sort();
+                (kind, names)
+            })
+            .collect::<Vec<_>>();
+        items.sort();
+        items
     }
 
     #[test]
-    fn reclaiming_takes_what_builds_used_longest_ago_across_slots_but_nothing_in_use() {
-        let home = TempDir::new();
-        let slots = [0, 1].map(|index| SlotDirectory::new(&home.0, Path::new("/repo/.git"), index));
-        // Slot 0 holds an old and a recent cache, slot 1 a middle-aged one.
-        let cache = |slot: &SlotDirectory, name: &str, age: u64| {
-            let path = slot.target().join(format!("debug/incremental/{name}"));
-            file(&path.join("s-1/query.bin"), 200_000);
-            set_modified(&path, age);
-            path
-        };
-        let old = cache(&slots[0], "old", 3600);
-        let recent = cache(&slots[0], "recent", 10);
-        let middle = cache(&slots[1], "middle", 1800);
-        let with_use = slots.map(|slot| (slot, HashMap::new()));
-
-        // About one cache's worth: the oldest goes.
-        let results = reclaim(&with_use, 150_000);
-        assert!(!old.exists() && middle.exists() && recent.exists());
-        assert!(matches!(
-            results[0],
-            Ok((Pruning::Evicted { caches: 1, .. }, _))
-        ));
-        assert!(matches!(results[1], Ok((Pruning::Within { .. }, _))));
-        // Far more than there is: everything but what is in use goes.
-        let results = reclaim(&with_use, u64::MAX);
-        assert!(!middle.exists() && recent.exists());
-        assert!(matches!(
-            results[1],
-            Ok((
-                Pruning::Evicted {
-                    caches: 1,
-                    in_use: 0,
-                    ..
-                },
-                _
-            ))
-        ));
-        assert!(free_disk(&home.0).unwrap() > 0);
-    }
-
-    #[test]
-    fn a_target_over_its_limit_loses_the_least_recently_compiled_caches_first() {
+    fn an_inventory_lists_caches_units_and_test_files_of_every_profile() {
         let home = TempDir::new();
         let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+        assert_eq!(slot.inventory(), Ok(Inventory::default()));
         let target = slot.target();
-        assert_eq!(slot.enforce_limit_now(0), Ok(Pruning::Within { size: 0 }));
-        file(&target.join("debug/deps/libbig.rlib"), 400_000);
-        for (unit, age) in [("old-1", 300), ("mid-2", 200), ("new-3", 100)] {
-            file(
-                &target.join(format!("debug/incremental/{unit}/s-1/query.bin")),
-                200_000,
-            );
-            set_modified(&target.join(format!("debug/incremental/{unit}")), age);
+        for name in [
+            "debug/incremental/app-1abc/s-1/query.bin",
+            "debug/deps/libapp-0123456789abcdef.rlib",
+            "debug/deps/libapp-0123456789abcdef.rmeta",
+            "debug/.fingerprint/app-0123456789abcdef/lib-app",
+            "debug/build/app-fedcba9876543210/out/generated.rs",
+            "debug/examples/demo-1111111111111111",
+            "debug/examples/demo-1111111111111111.demo.1a2b-cgu.0.rcgu.o",
+            "debug/examples/demo",
+            "debug/app",
+            "aarch64-apple-darwin/release/incremental/x-2def/s-1/q.bin",
+            "tmp/fixture-4242/data.json",
+            "CACHEDIR.TAG",
+        ] {
+            file(&target.join(name), 1000);
         }
-        file(
-            &target.join("aarch64-apple-darwin/debug/incremental/cross-4/s-1/q.bin"),
-            200_000,
+        set_modified(&target.join("debug/incremental/app-1abc"), 3600);
+        let inventory = slot.inventory().unwrap();
+        assert_eq!(
+            listed(&inventory),
+            [
+                ("cache".to_owned(), vec!["app-1abc".to_owned()]),
+                ("cache".to_owned(), vec!["x-2def".to_owned()]),
+                ("test files".to_owned(), vec!["fixture-4242".to_owned()]),
+                (
+                    "unit debug/0123456789abcdef".to_owned(),
+                    vec![
+                        "app-0123456789abcdef".to_owned(),
+                        "libapp-0123456789abcdef.rlib".to_owned(),
+                        "libapp-0123456789abcdef.rmeta".to_owned(),
+                    ]
+                ),
+                (
+                    "unit debug/1111111111111111".to_owned(),
+                    vec![
+                        "demo-1111111111111111".to_owned(),
+                        "demo-1111111111111111.demo.1a2b-cgu.0.rcgu.o".to_owned(),
+                    ]
+                ),
+                (
+                    "unit debug/fedcba9876543210".to_owned(),
+                    vec!["app-fedcba9876543210".to_owned()]
+                ),
+            ]
         );
-        set_modified(
-            &target.join("aarch64-apple-darwin/debug/incremental/cross-4"),
-            400,
-        );
-
-        let size = disk_usage(&target, &[]).unwrap().total;
-        assert_eq!(slot.enforce_limit_now(size), Ok(Pruning::Within { size }));
-        // Two caches of about 200 kB must go: the cross-compiled one and old-1.
-        let Pruning::Evicted {
-            caches: 2,
-            units: 0,
-            after,
-            ..
-        } = slot.enforce_limit_now(size - 300_000).unwrap()
-        else {
-            panic!("two caches go");
-        };
-        assert!(after <= size - 300_000);
-        assert!(
-            !target
-                .join("aarch64-apple-darwin/debug/incremental/cross-4")
-                .exists()
-        );
-        assert!(!target.join("debug/incremental/old-1").exists());
-        assert!(target.join("debug/incremental/mid-2").exists());
-        assert!(target.join("debug/deps/libbig.rlib").exists());
-
-        assert!(matches!(
-            slot.enforce_limit_now(100_000),
-            Ok(Pruning::Cleared { .. })
-        ));
-        assert!(!target.exists());
+        assert_eq!(inventory.total, disk_usage(&target, &[]).unwrap().total);
+        let cache = inventory
+            .items
+            .iter()
+            .find(|item| item.paths[0].ends_with("app-1abc"))
+            .unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(cache.written <= SystemTime::now() - hour + std::time::Duration::from_secs(5));
+        assert!(cache.freeable >= 1000);
     }
 
     #[test]
-    fn a_cache_whose_files_are_linked_elsewhere_frees_less_and_more_caches_go() {
+    fn an_item_frees_only_the_files_with_no_link_outside_it() {
         let home = TempDir::new();
         let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
         let target = slot.target();
-        // The oldest cache's object file is also linked into deps, as rustc
-        // does for debug info: removing that cache frees almost nothing.
-        file(&target.join("debug/incremental/old-1/s-1/cgu.o"), 400_000);
+        // The cache's object file is also linked into deps, as rustc does
+        // for debug info: removing the cache alone frees only its query file.
+        file(
+            &target.join("debug/incremental/app-1abc/s-1/cgu.o"),
+            400_000,
+        );
+        file(
+            &target.join("debug/incremental/app-1abc/s-1/query.bin"),
+            100_000,
+        );
         std::fs::create_dir_all(target.join("debug/deps")).unwrap();
         std::fs::hard_link(
-            target.join("debug/incremental/old-1/s-1/cgu.o"),
-            target.join("debug/deps/cgu.o"),
+            target.join("debug/incremental/app-1abc/s-1/cgu.o"),
+            target.join("debug/deps/app-0123456789abcdef.cgu.o"),
         )
         .unwrap();
-        file(
-            &target.join("debug/incremental/new-2/s-1/query.bin"),
-            200_000,
-        );
-        set_modified(&target.join("debug/incremental/old-1"), 200);
-        set_modified(&target.join("debug/incremental/new-2"), 100);
-        let size = disk_usage(&target, &[]).unwrap().total;
-
-        let limit = size - 150_000;
-        let Pruning::Evicted {
-            caches: 2,
-            units: 0,
-            after,
-            ..
-        } = slot.enforce_limit_now(limit).unwrap()
-        else {
-            panic!("both caches go");
+        let inventory = slot.inventory().unwrap();
+        let freeable = |name: &str| {
+            inventory
+                .items
+                .iter()
+                .find(|item| item.paths.iter().any(|path| path.ends_with(name)))
+                .unwrap()
+                .freeable
         };
-        assert!(after <= limit, "{after} > {limit}");
-        assert_eq!(after, disk_usage(&target, &[]).unwrap().total);
-        assert!(target.join("debug/deps/cgu.o").exists());
+        let cache = freeable("app-1abc");
+        assert!((100_000..400_000).contains(&cache), "{cache}");
+        assert!(freeable("app-0123456789abcdef.cgu.o") < 100_000);
+        assert!(inventory.total >= 500_000 && inventory.total < 900_000);
     }
 
     #[test]
@@ -1027,131 +877,35 @@ mod tests {
     }
 
     #[test]
-    fn stale_compiled_units_go_before_used_ones_and_their_keys_are_returned() {
-        let home = TempDir::new();
-        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
-        let target = slot.target();
-        let unit = |name: &str, hash: &str, bytes: usize| {
-            file(
-                &target.join(format!("debug/deps/lib{name}-{hash}.rlib")),
-                bytes,
-            );
-            file(
-                &target.join(format!("debug/.fingerprint/{name}-{hash}/lib-{name}")),
-                100,
-            );
-        };
-        unit("used", "1111111111111111", 200_000);
-        unit("stale", "2222222222222222", 200_000);
-        // Never seen used: aged by its files, written long ago.
-        unit("unrecorded", "3333333333333333", 200_000);
-        for written in [
-            "debug/deps/libunrecorded-3333333333333333.rlib",
-            "debug/.fingerprint/unrecorded-3333333333333333",
-        ] {
-            set_modified(&target.join(written), 30 * 24 * 3600);
-        }
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let used = HashMap::from([
-            ("debug/1111111111111111".to_owned(), now),
-            ("debug/2222222222222222".to_owned(), now - 7 * 24 * 3600),
-        ]);
-        let size = disk_usage(&target, &[]).unwrap().total;
-
-        let (pruning, evicted) = slot.enforce_limit(size - 300_000, &used).unwrap();
-        assert!(
-            matches!(
-                pruning,
-                Pruning::Evicted {
-                    caches: 0,
-                    units: 2,
-                    in_use: 0,
-                    ..
-                }
-            ),
-            "{pruning:?}"
-        );
-        assert_eq!(
-            evicted,
-            ["debug/3333333333333333", "debug/2222222222222222"]
-        );
-        assert!(
-            target
-                .join("debug/deps/libused-1111111111111111.rlib")
-                .exists()
-        );
-        assert!(
-            target
-                .join("debug/.fingerprint/used-1111111111111111")
-                .exists()
-        );
-        assert!(
-            !target
-                .join("debug/.fingerprint/stale-2222222222222222")
-                .exists()
-        );
-        assert!(
-            !target
-                .join("debug/deps/libunrecorded-3333333333333333.rlib")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn an_examples_executable_and_objects_go_with_its_unit() {
-        let home = TempDir::new();
-        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
-        let target = slot.target();
-        let example = |hash: &str, age: u64| {
-            for name in [
-                format!("debug/examples/demo-{hash}"),
-                format!("debug/examples/demo-{hash}.d"),
-                format!("debug/examples/demo-{hash}.demo.1a2b3c-cgu.0.rcgu.o"),
-                format!("debug/.fingerprint/app-{hash}/example-demo"),
-            ] {
-                file(&target.join(&name), 100_000);
-                set_modified(&target.join(&name), age);
-            }
-            set_modified(&target.join(format!("debug/.fingerprint/app-{hash}")), age);
-        };
-        example("1111111111111111", 7200);
-        example("2222222222222222", 60);
-        let size = disk_usage(&target, &[]).unwrap().total;
-
-        let (pruning, evicted) = slot.enforce_limit(size - 250_000, &HashMap::new()).unwrap();
-        assert!(
-            matches!(pruning, Pruning::Evicted { units: 1, .. }),
-            "{pruning:?}"
-        );
-        assert_eq!(evicted, ["debug/1111111111111111"]);
-        let left = std::fs::read_dir(target.join("debug/examples"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .filter(|name| name.contains("1111111111111111"))
-            .collect::<Vec<_>>();
-        assert!(left.is_empty(), "{left:?}");
-        assert!(target.join("debug/examples/demo-2222222222222222").exists());
-    }
-
-    #[test]
-    fn a_target_with_read_only_directories_is_still_cleared() {
+    fn removing_an_items_paths_takes_read_only_directories_too() {
         let home = TempDir::new();
         let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
         let target = slot.target();
         let locked = target.join("tmp/test-data/runtime");
         file(&locked.join("bin/tool"), 1000);
-        file(&target.join("debug/deps/libbig.rlib"), 100_000);
+        file(
+            &target.join("debug/deps/libbig-0123456789abcdef.rlib"),
+            1000,
+        );
         for directory in [locked.join("bin"), locked.clone()] {
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
-        assert!(matches!(
-            slot.enforce_limit_now(1000),
-            Ok(Pruning::Cleared { .. })
-        ));
-        assert!(!target.exists());
+        let paths = slot
+            .inventory()
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|item| item.paths)
+            .collect::<Vec<_>>();
+        remove(&paths).unwrap();
+        assert!(!target.join("tmp/test-data").exists());
+        assert!(
+            !target
+                .join("debug/deps/libbig-0123456789abcdef.rlib")
+                .exists()
+        );
+        // Paths already gone count as removed.
+        remove(&paths).unwrap();
     }
 
     #[test]

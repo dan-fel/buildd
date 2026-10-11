@@ -177,10 +177,7 @@ impl ActivityLog {
             }
             EventKind::Dropped { .. } => totals.dropped += 1,
             EventKind::Cancelled { .. } => totals.cancelled += 1,
-            EventKind::Pruned { .. }
-            | EventKind::Reclaimed { .. }
-            | EventKind::Held { .. }
-            | EventKind::Duplicated { .. } => {}
+            EventKind::Evicted { .. } | EventKind::Held { .. } | EventKind::Duplicated { .. } => {}
         }
         let event = Event {
             at_ms: epoch_millis(at),
@@ -446,9 +443,11 @@ mod tests {
             jobs: 1,
             idle_jobs: 1,
             capacity: 1,
-            slot_limit: 1,
+            disk_budget: 1,
+            disk_used: 0,
             free_disk: None,
             min_free: 0,
+            undersized: false,
             memory: 1,
             memory_in_use: 0,
             slots: Vec::new(),

@@ -257,8 +257,12 @@ pub struct Status {
     pub idle_jobs: usize,
     /// Builds that run at once, and slots per repository.
     pub capacity: usize,
-    /// Disk a slot's target may keep between builds, in bytes.
-    pub slot_limit: u64,
+    /// Disk the targets of all slots may keep together, in bytes, and what
+    /// they kept when last measured.
+    #[serde(default)]
+    pub disk_budget: u64,
+    #[serde(default)]
+    pub disk_used: u64,
     /// Disk free on the volume holding the slots, in bytes, when it could be
     /// read, and the floor below which idle slots give up what builds used
     /// longest ago.
@@ -266,6 +270,11 @@ pub struct Status {
     pub free_disk: Option<u64>,
     #[serde(default)]
     pub min_free: u64,
+    /// The latest eviction took caches or compiled units builds used in the
+    /// last ten minutes: the budget or free disk is below what builds use,
+    /// so they compile from scratch.
+    #[serde(default)]
+    pub undersized: bool,
     /// Memory running builds may use together, in bytes, and what the
     /// running builds are expected to use at their peaks.
     #[serde(default)]
@@ -288,11 +297,9 @@ pub struct SlotStatus {
     pub worktree: Option<PathBuf>,
     /// Disk its target used after its last build, in bytes, when measured.
     pub size: Option<u64>,
-    /// Its target is being kept within its disk limit after a build.
-    pub maintaining: bool,
-    /// Keeping to the limit last took caches its builds were using: the
-    /// limit is below what they need, and they compile from scratch.
-    pub undersized: bool,
+    /// What it does while no build runs in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chore: Option<Chore>,
     pub build: Option<RunningBuild>,
     /// Crates its target holds in more than one variant, when counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,6 +307,16 @@ pub struct SlotStatus {
     /// How its latest build ended, since the daemon started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<LastBuild>,
+}
+
+/// What an idle slot is busy with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Chore {
+    /// Its target is read: what it holds and what removing each part frees.
+    Measuring,
+    /// It gives up what builds used longest ago.
+    Evicting,
 }
 
 /// A slot's latest finished build.
@@ -535,31 +552,38 @@ pub enum EventKind {
         operation: Operation,
         revision: Revision,
     },
-    /// Free disk was `needed` bytes below the `floor`; idle slots gave up
-    /// `caches` incremental caches and `units` compiled units that builds
-    /// used longest ago, freeing `freed` bytes.
-    Reclaimed {
-        needed: u64,
-        freed: u64,
-        floor: u64,
-        caches: usize,
-        units: usize,
-    },
     /// More crates than before are compiled in several variants in `slot`:
     /// builds there select different features.
     Duplicated { slot: String, crates: usize },
-    /// A slot was kept within its limit: `caches` incremental caches and
-    /// `units` compiled units went, `in_use` of them used in the last ten
-    /// minutes, or the whole target when `cleared`.
-    Pruned {
-        slot: String,
-        before: u64,
-        after: u64,
+    /// Idle `slots` gave up what builds used longest ago to cover
+    /// `shortage`: `caches` incremental caches, `units` compiled units and
+    /// `test_files` directories tests left, `in_use` of them used in the last
+    /// ten minutes, freeing at least `freed` bytes.
+    Evicted {
+        shortage: Shortage,
+        freed: u64,
         caches: usize,
         units: usize,
+        test_files: usize,
         in_use: usize,
-        cleared: bool,
+        slots: Vec<String>,
     },
+}
+
+/// How far build disk is from its limits, in bytes: the slots' targets
+/// over their budget, and free disk under its floor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Shortage {
+    pub over_budget: u64,
+    pub under_floor: u64,
+}
+
+impl Shortage {
+    /// What eviction must free to meet both limits.
+    #[must_use]
+    pub fn needed(self) -> u64 {
+        self.over_budget.max(self.under_floor)
+    }
 }
 
 /// What a Cargo run and the compilers it started used.

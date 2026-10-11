@@ -6,7 +6,8 @@
 use std::time::{Duration, SystemTime};
 
 use buildd::protocol::{
-    Activity, EventKind, Outcome, Percentiles, Phase, RemoteActivity, SlotStatus, Speed,
+    Activity, Chore, EventKind, Outcome, Percentiles, Phase, RemoteActivity, Shortage, SlotStatus,
+    Speed,
 };
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -82,7 +83,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
     .areas(frame.area());
 
     let measured = status.slots.iter().filter_map(|slot| slot.size);
-    let disk = measured.clone().sum::<u64>();
+    let disk = status.disk_used;
     let in_use = status.jobs - status.idle_jobs;
     let uptime = ago(activity.started_at_ms, now);
     let free = match status.free_disk {
@@ -92,13 +93,23 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         Some(free) => Span::from(format!(" · {} free", gib(free))),
         None => Span::from(" · free disk unknown").red(),
     };
+    let disk_line = Span::from(format!(
+        "disk {:.1}/{}",
+        gib_number(disk),
+        gib(status.disk_budget)
+    ));
+    let disk_line = if status.undersized {
+        Span::from(format!("{disk_line}, budget below what builds use")).red()
+    } else {
+        disk_line
+    };
     frame.render_widget(
         Line::from(vec![
             Span::from(" buildd ").bold().reversed(),
+            Span::from(format!("  up {uptime} · {} slots · ", status.capacity)),
+            disk_line,
             Span::from(format!(
-                "  up {uptime} · {} slots × {} · jobs {in_use}/{} · memory {:.1}/{}",
-                status.capacity,
-                gib(status.slot_limit),
+                " · jobs {in_use}/{} · memory {:.1}/{}",
                 status.jobs,
                 gib_number(status.memory_in_use),
                 gib(status.memory),
@@ -116,7 +127,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         status
             .slots
             .iter()
-            .flat_map(|slot| slot_lines(slot, status.slot_limit))
+            .flat_map(|slot| slot_lines(slot, status.disk_budget))
             .collect()
     };
     frame.render_widget(
@@ -358,7 +369,7 @@ fn remote_lines(remote: &RemoteActivity) -> Vec<Line<'static>> {
                         seconds(build.elapsed_ms)
                     )
                 }
-                None if slot.maintaining => format!("{index}  pruning"),
+                None if slot.chore.is_some() => format!("{index}  {}", chore(slot.chore)),
                 None => {
                     idle.push(*index);
                     continue;
@@ -423,12 +434,22 @@ fn split_slot(name: &str) -> (String, &str) {
     (parts.join("-"), index)
 }
 
-/// A slot's two lines: its disk and what it does, then for whom.
-fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
+/// What an idle slot does, in a word.
+fn chore(chore: Option<Chore>) -> &'static str {
+    match chore {
+        Some(Chore::Measuring) => "measuring",
+        Some(Chore::Evicting) => "evicting",
+        None => "idle",
+    }
+}
+
+/// A slot's two lines: its disk, its share of the `budget` all slots
+/// share, and what it does, then for whom.
+fn slot_lines(slot: &SlotStatus, budget: u64) -> [Line<'static>; 2] {
     let bar = slot.size.map_or_else(
         || format!("[{}] unmeasured", "·".repeat(BAR)),
         |size| {
-            let filled = usize::try_from(size.saturating_mul(BAR as u64) / limit.max(1))
+            let filled = usize::try_from(size.saturating_mul(BAR as u64) / budget.max(1))
                 .expect("a bar fits usize")
                 .min(BAR);
             format!(
@@ -439,14 +460,9 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
             )
         },
     );
-    let bar_style = if slot.undersized {
-        Style::new().fg(Color::Red)
-    } else {
-        Style::new().fg(Color::Cyan)
-    };
     let mut first = vec![
         Span::from(format!("{:<26} ", short_slot(&slot.name))).bold(),
-        Span::styled(bar, bar_style),
+        Span::styled(bar, Style::new().fg(Color::Cyan)),
         Span::from("  "),
     ];
     let second = match &slot.build {
@@ -485,10 +501,9 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
             ])
         }
         None => {
-            first.push(if slot.maintaining {
-                Span::from("pruning").blue()
-            } else {
-                Span::from("idle").dark_gray()
+            first.push(match slot.chore {
+                Some(_) => Span::from(chore(slot.chore)).blue(),
+                None => Span::from(chore(slot.chore)).dark_gray(),
             });
             let last = slot
                 .worktree
@@ -504,9 +519,6 @@ fn slot_lines(slot: &SlotStatus, limit: u64) -> [Line<'static>; 2] {
                 line.push(
                     Span::from(format!("  {}", took(build.build_ms, build.test_ms))).dark_gray(),
                 );
-            }
-            if slot.undersized {
-                line.push(Span::from("  limit below what its builds use").red());
             }
             if let Some(crates) = slot.duplicated.filter(|crates| *crates > 0) {
                 line.push(Span::from(format!("  {crates} duplicated crates")).yellow());
@@ -652,66 +664,49 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             ),
             Style::new().fg(Color::Yellow),
         ),
-        EventKind::Reclaimed {
-            needed,
+        EventKind::Evicted {
+            shortage,
             freed,
-            floor,
             caches,
             units,
-        } => (
-            format!(
-                "disk {} short of the floor of {}: idle slots gave up {caches} caches, \
-                 {units} compiled units, {}",
-                gib(*needed),
-                gib(*floor),
-                gib(*freed)
-            ),
-            if freed < needed {
-                Style::new().fg(Color::Red)
-            } else {
-                Style::new().fg(Color::Blue)
-            },
-        ),
-        EventKind::Pruned {
-            slot,
-            before,
-            after,
-            caches,
-            units,
+            test_files,
             in_use,
-            cleared,
+            slots,
         } => {
-            let slot = short_slot(slot);
-            if *cleared {
-                (
-                    format!(
-                        "{slot} cleared its target at {}: limit below what its builds use",
-                        gib(*before)
-                    ),
-                    Style::new().fg(Color::Red),
-                )
-            } else if *in_use > 0 {
-                (
-                    format!(
-                        "{slot} pruned {} → {}: {caches} caches, {units} compiled units, \
-                         {in_use} in use: limit too small",
-                        gib(*before),
-                        gib(*after)
-                    ),
-                    Style::new().fg(Color::Red),
-                )
+            let slots = slots
+                .iter()
+                .map(|slot| short_slot(slot))
+                .collect::<Vec<_>>();
+            let in_use = if *in_use > 0 {
+                format!(", {in_use} in use: budget below what builds use")
             } else {
-                (
-                    format!(
-                        "{slot} pruned {} → {}: {caches} old caches, {units} stale compiled units",
-                        gib(*before),
-                        gib(*after)
-                    ),
-                    Style::new().fg(Color::Blue),
-                )
-            }
+                String::new()
+            };
+            (
+                format!(
+                    "{} gave up {units} units, {caches} caches, {test_files} test files: {} \
+                     for {}{in_use}",
+                    slots.join(", "),
+                    gib(*freed),
+                    shortage_text(*shortage),
+                ),
+                if in_use.is_empty() {
+                    Style::new().fg(Color::Blue)
+                } else {
+                    Style::new().fg(Color::Red)
+                },
+            )
         }
     })
+}
+
+/// What an eviction covered, briefly.
+fn shortage_text(shortage: Shortage) -> String {
+    match (shortage.over_budget, shortage.under_floor) {
+        (0, under) => format!("{} under the floor", gib(under)),
+        (over, 0) => format!("{} over budget", gib(over)),
+        (over, under) => format!("{} over budget, {} under the floor", gib(over), gib(under)),
+    }
 }
 
 /// A build's wall time, split into compiling and testing for a test build.
@@ -812,9 +807,11 @@ mod tests {
                 jobs: 12,
                 idle_jobs: 6,
                 capacity: 2,
-                slot_limit: 20 << 30,
+                disk_budget: 40 << 30,
+                disk_used: 24 << 30,
                 free_disk: Some(10 << 30),
                 min_free: 15 << 30,
+                undersized: false,
                 memory: 18 << 30,
                 memory_in_use: 14 << 30,
                 draining: false,
@@ -823,8 +820,7 @@ mod tests {
                         name: "app-c716/0".into(),
                         worktree: Some("/work/agent-1".into()),
                         size: Some(14 << 30),
-                        maintaining: false,
-                        undersized: false,
+                        chore: None,
                         build: Some(RunningBuild {
                             revision: tree("7f3a9c0d1e2f"),
                             operation: check("app-ui"),
@@ -843,8 +839,7 @@ mod tests {
                         name: "app-c716/1".into(),
                         worktree: Some("/work/agent-2".into()),
                         size: Some(10 << 30),
-                        maintaining: false,
-                        undersized: true,
+                        chore: None,
                         build: None,
                         last: Some(LastBuild {
                             operation: Operation {
@@ -943,6 +938,21 @@ mod tests {
                     },
                 },
                 Event {
+                    at_ms: at(4),
+                    kind: EventKind::Evicted {
+                        shortage: Shortage {
+                            over_budget: 3 << 29,
+                            under_floor: 0,
+                        },
+                        freed: 2 << 30,
+                        caches: 4,
+                        units: 31,
+                        test_files: 1,
+                        in_use: 0,
+                        slots: vec!["app-c71684b27238d845/1".into()],
+                    },
+                },
+                Event {
                     at_ms: at(2),
                     kind: EventKind::Requested {
                         who: "agent-7".into(),
@@ -975,10 +985,11 @@ mod tests {
         let now = SystemTime::now();
         let text = screen(&Ok(sample(now)), now);
         for expected in [
-            "up 1h0m · 2 slots × 20.0 GiB · jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free, below the floor",
+            "up 1h0m · 2 slots · disk 24.0/40.0 GiB · jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free, below the floor",
             "check -p app-ui @ 7f3a9c0d1e",
             "for agent-1, agent-7  shared by 2  testing · 4 jobs · compiled 3 · reused 412",
-            "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  limit below what its builds use  12 duplicated crates",
+            "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  12 duplicated crates",
+            "app-c716/1 gave up 31 units, 4 caches, 1 test files: 2.0 GiB for 1.5 GiB over budget",
             "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s · ~40.0 s · for app-c716/0 (~30.0 s, cold ~300.0 s)",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",
