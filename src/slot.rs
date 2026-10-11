@@ -231,12 +231,14 @@ impl SlotDirectory {
         }
         let mut items = evictables(&target)?;
         let usage = disk_usage(&target, &items)?;
-        for (item, freeable) in items.iter_mut().zip(usage.freeable) {
+        for ((item, freeable), bytes) in items.iter_mut().zip(usage.freeable).zip(usage.bytes) {
             item.freeable = freeable;
+            item.bytes = bytes;
         }
         Ok(Inventory {
             items,
             total: usage.total,
+            shared: usage.shared,
         })
     }
 }
@@ -248,9 +250,64 @@ impl SlotDirectory {
 pub(crate) struct Inventory {
     pub(crate) items: Vec<Evictable>,
     pub(crate) total: u64,
+    /// Files whose target links span multiple evictable items.
+    pub(crate) shared: Vec<SharedFile>,
 }
 
 impl Inventory {
+    /// Forget removed items and update the remaining inventory without
+    /// walking the target again. Returns the items and bytes freed on disk;
+    /// dropping the last target link also reduces `total` when an external
+    /// link keeps the file's blocks allocated.
+    pub(crate) fn remove(&mut self, chosen: &[usize]) -> (Vec<Evictable>, u64) {
+        let chosen = chosen.iter().copied().collect::<BTreeSet<_>>();
+        let mut indices = vec![None; self.items.len()];
+        let (mut gone, mut kept) = (Vec::new(), Vec::new());
+        let (mut bytes, mut freed) = (0, 0);
+        for (index, item) in std::mem::take(&mut self.items).into_iter().enumerate() {
+            if chosen.contains(&index) {
+                bytes += item.bytes;
+                freed += item.freeable;
+                gone.push(item);
+            } else {
+                indices[index] = Some(kept.len());
+                kept.push(item);
+            }
+        }
+        assert_eq!(gone.len(), chosen.len(), "only present items are removed");
+        self.shared.retain_mut(|file| {
+            file.owners = file
+                .owners
+                .iter()
+                .filter_map(|index| indices[*index])
+                .collect();
+            match file.owners.len() {
+                0 => {
+                    bytes += file.bytes;
+                    if !file.external {
+                        freed += file.bytes;
+                    }
+                    false
+                }
+                1 => {
+                    let item = &mut kept[file.owners[0]];
+                    item.bytes += file.bytes;
+                    if !file.external {
+                        item.freeable += file.bytes;
+                    }
+                    false
+                }
+                _ => true,
+            }
+        });
+        self.items = kept;
+        self.total = self
+            .total
+            .checked_sub(bytes)
+            .expect("removal is part of the target");
+        (gone, freed)
+    }
+
     /// How many crates have their library compiled in more than one variant
     /// in a profile: what builds selecting different features leave behind,
     /// besides crates the lockfile holds in two versions.
@@ -294,6 +351,19 @@ pub(crate) struct Evictable {
     /// with no hard link outside it. Object files kept for debug info and
     /// uplifted binaries are such links.
     pub(crate) freeable: u64,
+    /// Blocks whose last link inside the target belongs to this item,
+    /// including files whose external links prevent freeing their blocks.
+    /// Shared files count here only once this is their last target owner.
+    pub(crate) bytes: u64,
+}
+
+/// One file's blocks shared by several evictable items. They leave the
+/// target when every owner goes, and are freed unless linked outside it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SharedFile {
+    pub(crate) bytes: u64,
+    pub(crate) owners: Vec<usize>,
+    pub(crate) external: bool,
 }
 
 /// What an [`Evictable`] is.
@@ -438,6 +508,7 @@ fn evictables(target: &Path) -> Result<Vec<Evictable>, String> {
                     paths: vec![path],
                     kind: Kind::Cache,
                     freeable: 0,
+                    bytes: 0,
                 });
             }
         }
@@ -469,6 +540,7 @@ fn evictables(target: &Path) -> Result<Vec<Evictable>, String> {
                 kind: Kind::Unit(key),
                 written,
                 freeable: 0,
+                bytes: 0,
             });
         }
     }
@@ -480,6 +552,7 @@ fn evictables(target: &Path) -> Result<Vec<Evictable>, String> {
                 paths: vec![path],
                 kind: Kind::TestFiles,
                 freeable: 0,
+                bytes: 0,
             });
         }
     }
@@ -493,6 +566,8 @@ struct DiskUsage {
     /// For each item asked about, what removing it frees: its directories
     /// and the files with no hard link outside it.
     freeable: Vec<u64>,
+    bytes: Vec<u64>,
+    shared: Vec<SharedFile>,
 }
 
 /// One file's blocks and where its hard links were found.
@@ -500,8 +575,8 @@ struct Inode {
     bytes: u64,
     links: u64,
     seen: u64,
-    /// The item holding every link seen so far, if one does.
-    item: Option<usize>,
+    /// The items holding its target links; None for a non-evictable link.
+    owners: BTreeSet<Option<usize>>,
 }
 
 /// The disk space under `path`, not following symbolic links. rustc's
@@ -523,9 +598,18 @@ fn disk_usage(path: &Path, items: &[Evictable]) -> Result<DiskUsage, String> {
             usage.total += bytes;
             if let Some(item) = item {
                 usage.freeable[item] += bytes;
+                usage.bytes[item] += bytes;
             }
             for child in read_directory(path)? {
                 walk(&child, item, items, inodes, usage)?;
+            }
+            return Ok(());
+        }
+        if metadata.nlink() == 1 {
+            usage.total += bytes;
+            if let Some(item) = item {
+                usage.bytes[item] += bytes;
+                usage.freeable[item] += bytes;
             }
             return Ok(());
         }
@@ -537,13 +621,11 @@ fn disk_usage(path: &Path, items: &[Evictable]) -> Result<DiskUsage, String> {
                     bytes,
                     links: metadata.nlink(),
                     seen: 0,
-                    item,
+                    owners: BTreeSet::new(),
                 }
             });
         inode.seen += 1;
-        if inode.item != item {
-            inode.item = None;
-        }
+        inode.owners.insert(item);
         Ok(())
     }
     let index = items
@@ -555,13 +637,34 @@ fn disk_usage(path: &Path, items: &[Evictable]) -> Result<DiskUsage, String> {
     let mut usage = DiskUsage {
         total: 0,
         freeable: vec![0; items.len()],
+        bytes: vec![0; items.len()],
+        shared: Vec::new(),
     };
     walk(path, None, &index, &mut inodes, &mut usage)?;
     for inode in inodes.values() {
-        if let Some(item) = inode.item
-            && inode.seen == inode.links
-        {
-            usage.freeable[item] += inode.bytes;
+        // A non-evictable target link keeps the file regardless of which
+        // items go. External links prevent freeing blocks, but not removing
+        // them from this target's footprint.
+        if inode.owners.contains(&None) {
+            continue;
+        }
+        let owners = inode
+            .owners
+            .iter()
+            .map(|owner| owner.expect("all owned"))
+            .collect::<Vec<_>>();
+        assert!(!owners.is_empty(), "a file has a target link");
+        if let [item] = owners[..] {
+            usage.bytes[item] += inode.bytes;
+            if inode.seen == inode.links {
+                usage.freeable[item] += inode.bytes;
+            }
+        } else {
+            usage.shared.push(SharedFile {
+                bytes: inode.bytes,
+                owners,
+                external: inode.seen < inode.links,
+            });
         }
     }
     Ok(usage)
@@ -861,6 +964,64 @@ mod tests {
         assert!((100_000..400_000).contains(&cache), "{cache}");
         assert!(freeable("app-0123456789abcdef.cgu.o") < 100_000);
         assert!(inventory.total >= 500_000 && inventory.total < 900_000);
+    }
+
+    #[test]
+    fn removing_linked_items_updates_the_footprint_and_the_last_owners_reclaimable_bytes() {
+        for external in [false, true] {
+            let home = TempDir::new();
+            let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+            let target = slot.target();
+            let first = target.join("debug/incremental/a/file");
+            file(&first, 400_000);
+            let blocks = std::fs::metadata(&first).unwrap().blocks() * 512;
+            for cache in ["b", "c"] {
+                let path = target.join(format!("debug/incremental/{cache}/file"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::hard_link(&first, path).unwrap();
+            }
+            if external {
+                std::fs::hard_link(&first, home.0.join("outside")).unwrap();
+            }
+            let mut inventory = slot.inventory().unwrap();
+            assert_eq!(inventory.shared.len(), 1);
+            assert_eq!(inventory.shared[0].owners.len(), 3);
+            let mut freed = 0;
+            for remaining in (0..3).rev() {
+                remove(&inventory.items[0].paths).unwrap();
+                freed += inventory.remove(&[0]).1;
+                assert_eq!(inventory.items.len(), remaining);
+                assert_eq!(inventory.total, disk_usage(&target, &[]).unwrap().total);
+                if remaining == 1 {
+                    assert!(
+                        inventory.shared.is_empty(),
+                        "the last owner holds the blocks"
+                    );
+                    assert!(inventory.items[0].bytes >= blocks);
+                    assert_eq!(inventory.items[0].freeable >= blocks, !external);
+                }
+            }
+            assert_eq!(freed >= blocks, !external);
+            assert_eq!(home.0.join("outside").exists(), external);
+        }
+    }
+
+    #[test]
+    fn an_uplifted_binary_keeps_its_blocks_when_its_unit_is_removed() {
+        let home = TempDir::new();
+        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+        let target = slot.target();
+        let artifact = target.join("debug/examples/demo-1111111111111111");
+        file(&artifact, 400_000);
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::hard_link(&artifact, target.join("debug/examples/demo")).unwrap();
+        let mut inventory = slot.inventory().unwrap();
+        assert_eq!(inventory.items.len(), 1);
+        assert_eq!(inventory.items[0].bytes, 0);
+        remove(&inventory.items[0].paths).unwrap();
+        assert_eq!(inventory.remove(&[0]).1, 0);
+        assert_eq!(inventory.total, disk_usage(&target, &[]).unwrap().total);
+        assert!(target.join("debug/examples/demo").exists());
     }
 
     #[test]

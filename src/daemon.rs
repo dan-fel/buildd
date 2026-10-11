@@ -897,7 +897,13 @@ impl Daemon {
                     self.keep_disk();
                     Vec::new()
                 }
-                Event::Evicted { results } => self.scheduler.evicted(results),
+                Event::Evicted { results } => {
+                    for effect in self.scheduler.evicted(results) {
+                        self.apply(effect);
+                    }
+                    self.keep_disk();
+                    Vec::new()
+                }
                 Event::Measured {
                     key,
                     repository,

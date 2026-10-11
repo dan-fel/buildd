@@ -1169,14 +1169,45 @@ impl<D: Distance> Scheduler<D> {
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable();
-        let mut freed = 0;
+        // Each shared file contributes only after its last chosen owner.
+        let mut linked = HashMap::<(usize, usize), Vec<usize>>::new();
+        let mut remaining = HashMap::new();
+        for (index, slot) in self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| !slot.busy())
+        {
+            let Some(inventory) = &slot.inventory else {
+                continue;
+            };
+            for (file, shared) in inventory.shared.iter().enumerate() {
+                remaining.insert((index, file), shared.owners.len());
+                for owner in &shared.owners {
+                    linked.entry((index, *owner)).or_default().push(file);
+                }
+            }
+        }
+        let (mut bytes, mut freed) = (0, 0);
         let mut chosen = BTreeMap::<usize, Vec<usize>>::new();
         for (_, index, item) in candidates {
-            if freed >= needed {
+            if bytes >= shortage.over_budget && freed >= shortage.under_floor {
                 break;
             }
             let inventory = self.slots[index].inventory.as_ref().expect("listed above");
+            bytes += inventory.items[item].bytes;
             freed += inventory.items[item].freeable;
+            for file in linked.get(&(index, item)).into_iter().flatten() {
+                let owners = remaining.get_mut(&(index, *file)).expect("listed above");
+                *owners -= 1;
+                if *owners == 0 {
+                    let shared = &inventory.shared[*file];
+                    bytes += shared.bytes;
+                    if !shared.external {
+                        freed += shared.bytes;
+                    }
+                }
+            }
             chosen.entry(index).or_default().push(item);
         }
         if chosen.is_empty() {
@@ -1231,7 +1262,7 @@ impl<D: Distance> Scheduler<D> {
                 "only a slot evicting is done evicting"
             );
             slot.chore = None;
-            let inventory = slot
+            let mut inventory = slot
                 .inventory
                 .take()
                 .expect("an evicting slot was measured");
@@ -1240,15 +1271,9 @@ impl<D: Distance> Scheduler<D> {
                 slot.unmeasured = slot.unmeasured.max(1);
                 continue;
             }
-            let (gone, kept) = inventory
-                .items
-                .into_iter()
-                .enumerate()
-                .partition::<Vec<_>, _>(|(index, _)| items.contains(index));
-            let mut released = 0;
+            let (gone, released) = inventory.remove(items);
             let mut forgotten = false;
-            for (_, item) in gone {
-                released += item.freeable;
+            for item in gone {
                 in_use += usize::from(slot.last_use(&item).0 > recent);
                 match item.kind {
                     Kind::Cache => caches += 1,
@@ -1260,12 +1285,9 @@ impl<D: Distance> Scheduler<D> {
                 }
             }
             freed += released;
-            let total = inventory.total.saturating_sub(released);
-            slot.size = Some(total);
-            slot.inventory = Some(Inventory {
-                items: kept.into_iter().map(|(_, item)| item).collect(),
-                total,
-            });
+            slot.size = Some(inventory.total);
+            slot.duplicated = Some(inventory.duplicated_crates());
+            slot.inventory = Some(inventory);
             if forgotten {
                 effects.push(slot.persist());
             }
@@ -2049,9 +2071,11 @@ mod tests {
                     kind: Kind::Unit(unit.clone()),
                     written: SystemTime::UNIX_EPOCH,
                     freeable: bytes,
+                    bytes,
                 })
                 .collect(),
             total: bytes * units.len() as u64,
+            shared: Vec::new(),
         }
     }
 
@@ -2730,6 +2754,7 @@ mod tests {
             kind: Kind::Unit("debug/5555555555555555".into()),
             written: SystemTime::now() - Duration::from_secs(24 * 3600),
             freeable: 10,
+            bytes: 10,
         });
         inventory.total += 10;
         let eviction = scheduler.evict(over_budget(15)).unwrap();
@@ -2769,6 +2794,47 @@ mod tests {
             scheduler.slots[1].inventory.as_ref().unwrap().items.len(),
             11
         );
+    }
+
+    #[test]
+    fn eviction_counts_shared_blocks_once_and_distinguishes_external_links_from_target_usage() {
+        for external in [false, true] {
+            let mut scheduler = scheduler(1);
+            run(&mut scheduler, 1, "/a", "a1");
+            let measured = scheduler.measurement_due(Instant::now() + MEASURE_QUIET);
+            let [Effect::Measure(measurement)] = &measured[..] else {
+                panic!("measurement")
+            };
+            let units = units("a", 3);
+            let mut inventory = inventory(&units, 10);
+            inventory.total += 100;
+            inventory.shared.push(crate::slot::SharedFile {
+                bytes: 100,
+                owners: vec![0, 1],
+                external,
+            });
+            scheduler.measured(measurement.key, Ok(inventory));
+            let shortage = Shortage {
+                over_budget: 100,
+                under_floor: if external { 20 } else { 110 },
+            };
+            let eviction = scheduler.evict(shortage).unwrap();
+            assert_eq!(removed(&eviction), [(0, units[..2].to_vec())]);
+            let done = scheduler.evicted(vec![(SlotKey(0), Ok(()))]);
+            assert_eq!(
+                scheduler.disk_used(),
+                10,
+                "shared blocks have left the target"
+            );
+            let [EventKind::Evicted { freed, .. }] = reports(&done)[..] else {
+                panic!("evicted")
+            };
+            assert_eq!(*freed, if external { 20 } else { 120 });
+            assert_eq!(
+                scheduler.slots[0].inventory.as_ref().unwrap().items.len(),
+                1
+            );
+        }
     }
 
     #[test]
