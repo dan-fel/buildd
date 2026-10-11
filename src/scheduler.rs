@@ -67,8 +67,8 @@ pub(crate) const MEASURE_DUE: u32 = 8;
 /// or free disk is below what builds use.
 const IN_USE: Duration = Duration::from_secs(10 * 60);
 /// How many compilations a slot remembers what their latest build used,
-/// the most recently run ones: agents run many one-off selections, and a
-/// slot's record is written after every build.
+/// the most recently run ones: many one-off selections can grow the record
+/// written after every build.
 const KEPT_COMPILATIONS: usize = 256;
 /// How much an earlier build weighs in [`CompileCost`] each time a new one
 /// is added: about the last hundred count.
@@ -265,7 +265,8 @@ struct Slot {
     duplicated: Option<usize>,
     /// The test binaries that passed in it.
     passed: Vec<PassedBinary>,
-    /// What its latest build of each compilation used.
+    /// What its latest build of each compilation used, least recently run
+    /// first. This order breaks ties in the recorded wall-clock times.
     compilations: Vec<CompilationRun>,
     /// When a build last used each compiled unit.
     units: HashMap<String, LastUse>,
@@ -317,10 +318,11 @@ impl Slot {
         let at = now();
         match self
             .compilations
-            .iter_mut()
-            .find(|run| run.compilation == compilation)
+            .iter()
+            .position(|run| run.compilation == compilation)
         {
-            Some(run) => {
+            Some(index) => {
+                let mut run = self.compilations.remove(index);
                 if succeeded {
                     run.units.clear();
                     run.build_ms = Some(build_ms);
@@ -330,6 +332,7 @@ impl Slot {
                 }
                 run.units.extend(units);
                 run.at = at;
+                self.compilations.push(run);
             }
             None => self.compilations.push(CompilationRun {
                 compilation,
@@ -340,30 +343,17 @@ impl Slot {
             }),
         }
         while self.compilations.len() > KEPT_COMPILATIONS {
-            let oldest = (0..self.compilations.len())
-                .min_by_key(|index| self.compilations[*index].at)
-                .expect("more than none are kept");
-            self.compilations.remove(oldest);
+            self.compilations.remove(0);
         }
     }
 
     fn persist(&self) -> Effect {
-        let mut compilations = self.compilations.clone();
-        compilations.sort_by(|a, b| {
-            let (a, b) = (&a.compilation, &b.compilation);
-            (&a.prefix, a.command, &a.args, &a.rustflags).cmp(&(
-                &b.prefix,
-                b.command,
-                &b.args,
-                &b.rustflags,
-            ))
-        });
         Effect::Persist {
             repository: self.repository.clone(),
             slot: self.index,
             record: SlotRecord {
                 worktree: self.worktree.clone(),
-                compilations,
+                compilations: self.compilations.clone(),
                 units: self
                     .units
                     .iter()
@@ -573,6 +563,8 @@ impl<D: Distance> Scheduler<D> {
                 .any(|slot| slot.repository == repository && slot.index == index),
             "a slot is restored once"
         );
+        let mut compilations = record.compilations;
+        compilations.drain(..compilations.len().saturating_sub(KEPT_COMPILATIONS));
         self.slots.push(Slot {
             repository,
             index,
@@ -589,7 +581,7 @@ impl<D: Distance> Scheduler<D> {
             last: None,
             duplicated: None,
             passed: record.passed,
-            compilations: record.compilations,
+            compilations,
             units: record.units.into_iter().collect(),
         });
     }
@@ -2976,6 +2968,79 @@ mod tests {
                 .iter()
                 .any(|run| run.compilation.args == ["-p", "crate-0"]),
             "the first, run longest ago, is forgotten"
+        );
+    }
+
+    #[test]
+    fn compilation_recency_survives_timestamp_ties_and_restart() {
+        let mut scheduler = scheduler(1);
+        run(&mut scheduler, 1, "/a", "a1");
+        let slot = &mut scheduler.slots[0];
+        let compilation = |number: usize| {
+            let mut operation = check();
+            operation.args = vec!["-p".into(), format!("crate-{number}")];
+            Compilation::new(Path::new(""), &operation)
+        };
+        for number in 0..KEPT_COMPILATIONS {
+            slot.ran(compilation(number), units("a", 1), true, 1, None);
+        }
+        slot.ran(compilation(0), units("a", 1), true, 1, None);
+        // Force every timestamp to tie; execution order is still known.
+        let at = now();
+        for run in &mut slot.compilations {
+            run.at = at;
+        }
+        let Effect::Persist { record, .. } = slot.persist() else {
+            panic!("persist")
+        };
+        let mut restarted = super::Scheduler::new(1, u64::MAX, Table::default());
+        restarted.restore("/repo/.git".into(), 0, revision("a1"), record);
+        let slot = &mut restarted.slots[0];
+        slot.ran(compilation(KEPT_COMPILATIONS), units("a", 1), true, 1, None);
+        assert_eq!(slot.compilations.len(), KEPT_COMPILATIONS);
+        assert!(
+            slot.compilations
+                .iter()
+                .any(|run| run.compilation == compilation(0))
+        );
+        assert!(
+            !slot
+                .compilations
+                .iter()
+                .any(|run| run.compilation == compilation(1))
+        );
+        assert_eq!(
+            slot.compilations.last().unwrap().compilation,
+            compilation(KEPT_COMPILATIONS)
+        );
+        // Loading an oversized record also obeys the bound.
+        let Effect::Persist { mut record, .. } = slot.persist() else {
+            panic!("persist")
+        };
+        // Wall-clock rollback cannot make the last run the oldest.
+        record.compilations.last_mut().unwrap().at = 0;
+        record.compilations.insert(
+            0,
+            CompilationRun {
+                compilation: compilation(1),
+                at: 0,
+                units: units("a", 1).into_iter().collect(),
+                build_ms: Some(1),
+                peak_memory: None,
+            },
+        );
+        let mut restored = super::Scheduler::new(1, u64::MAX, Table::default());
+        restored.restore("/repo/.git".into(), 0, revision("a1"), record);
+        assert_eq!(restored.slots[0].compilations.len(), KEPT_COMPILATIONS);
+        assert_eq!(
+            restored.slots[0].compilations.last().unwrap().compilation,
+            compilation(KEPT_COMPILATIONS)
+        );
+        assert!(
+            !restored.slots[0]
+                .compilations
+                .iter()
+                .any(|run| run.compilation == compilation(1))
         );
     }
 

@@ -27,6 +27,8 @@ use crate::snapshot::Revision;
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SlotRecord {
     pub(crate) worktree: Option<PathBuf>,
+    /// Latest runs, least recently run first; execution order survives
+    /// tied or adjusted wall-clock timestamps.
     #[serde(default)]
     pub(crate) compilations: Vec<CompilationRun>,
     /// When a build last used each compiled unit, by [`unit_key`].
