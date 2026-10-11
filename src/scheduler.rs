@@ -55,7 +55,7 @@ use crate::protocol::{
     BuildReport, Chore, EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild,
     RunningBuild, Shortage, SlotStatus, Usage,
 };
-use crate::slot::{CompilationRun, Evictable, Inventory, Kind, SlotRecord, slot_name};
+use crate::slot::{CompilationRun, Evictable, Inventory, Kind, LastUse, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
 
 /// How long a slot stays idle before its target is measured.
@@ -204,8 +204,9 @@ struct Job {
     /// Crates Cargo compiled so far, and crates it found up to date.
     compiled: u64,
     fresh: u64,
-    /// The compiled units it used so far.
-    units: HashSet<String>,
+    /// The compiled units it used so far, each with its place in the order
+    /// Cargo reported them.
+    units: HashMap<String, usize>,
     /// It waits for a busy slot although another is idle, and why.
     hold: Option<Hold>,
     /// It waits for memory: what it is expected to need at its peak.
@@ -260,9 +261,8 @@ struct Slot {
     passed: Vec<PassedBinary>,
     /// What its latest build of each compilation used.
     compilations: Vec<CompilationRun>,
-    /// When a build last used each compiled unit, in seconds since the Unix
-    /// epoch.
-    units: HashMap<String, u64>,
+    /// When a build last used each compiled unit.
+    units: HashMap<String, LastUse>,
 }
 
 impl Slot {
@@ -270,14 +270,19 @@ impl Slot {
         self.job.is_some() || self.chore.is_some()
     }
 
-    /// When builds last used `item` of its target, as far as is known.
-    fn last_use(&self, item: &Evictable) -> SystemTime {
+    /// When builds last used `item` of its target, as far as is known, and
+    /// among the units one build used last, how many it reported after it:
+    /// the order eviction goes in.
+    fn last_use(&self, item: &Evictable) -> (SystemTime, u32) {
         let recorded = match &item.kind {
             Kind::Unit(unit) => self.units.get(unit),
             Kind::Cache | Kind::TestFiles => None,
         };
-        recorded.map_or(item.written, |seconds| {
-            SystemTime::UNIX_EPOCH + Duration::from_secs(*seconds)
+        recorded.map_or((item.written, 0), |used| {
+            (
+                SystemTime::UNIX_EPOCH + Duration::from_secs(used.at),
+                used.after,
+            )
         })
     }
 
@@ -287,7 +292,7 @@ impl Slot {
     fn ran(
         &mut self,
         compilation: Compilation,
-        units: HashSet<String>,
+        units: Vec<String>,
         succeeded: bool,
         build_ms: u64,
         peak_memory: Option<u64>,
@@ -659,7 +664,7 @@ impl<D: Distance> Scheduler<D> {
                     output: Vec::new(),
                     compiled: 0,
                     fresh: 0,
-                    units: HashSet::new(),
+                    units: HashMap::new(),
                     hold: None,
                     memory_needed: None,
                     skipped: 0,
@@ -836,8 +841,14 @@ impl<D: Distance> Scheduler<D> {
         let State::Running { slot, .. } = job.state else {
             panic!("only running jobs use units");
         };
-        job.units.insert(unit.clone());
-        self.slots[slot].units.insert(unit, now());
+        let place = job.units.len();
+        job.units.entry(unit.clone()).or_insert(place);
+        // Held from now on, for builds weighing a wait for this slot; its
+        // use is stamped when the build ends.
+        self.slots[slot].units.entry(unit).or_insert(LastUse {
+            at: now(),
+            after: 0,
+        });
     }
 
     /// Running job `id` ended with `outcome`, having used `usage` when Cargo
@@ -864,13 +875,21 @@ impl<D: Distance> Scheduler<D> {
             .map(|compiled_at| millis(compiled_at.elapsed()));
         let compilation = Compilation::of(&job);
         let entry = &mut self.slots[slot];
+        // Every unit the build used ends its use now, in the order Cargo
+        // reported them.
+        let at = now();
+        let reported = job.units.len();
+        for (unit, place) in &job.units {
+            let after = u32::try_from(reported - 1 - place).expect("a build uses few units");
+            entry.units.insert(unit.clone(), LastUse { at, after });
+        }
         // Cargo ran to its end, also when the job's own crates did not
         // compile; a cancelled or killed build tells less.
         let build_ms = millis(started.elapsed());
         if let Outcome::Exited { code } = outcome {
             entry.ran(
                 compilation,
-                std::mem::take(&mut job.units),
+                std::mem::take(&mut job.units).into_keys().collect(),
                 *code == 0,
                 build_ms,
                 usage.map(|usage| usage.peak_memory),
@@ -1139,7 +1158,7 @@ impl<D: Distance> Scheduler<D> {
             let mut forgotten = false;
             for (_, item) in gone {
                 released += item.freeable;
-                in_use += usize::from(slot.last_use(&item) > recent);
+                in_use += usize::from(slot.last_use(&item).0 > recent);
                 match item.kind {
                     Kind::Cache => caches += 1,
                     Kind::Unit(unit) => {
@@ -2463,7 +2482,10 @@ mod tests {
         let mut scheduler = checked_and_tested();
         scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
         measure_all(&mut scheduler, 10);
-        // Both slots' units were used in the same second: slot 0's go first.
+        // The check in slot 0 ended a minute before the test in slot 1.
+        for used in scheduler.slots[0].units.values_mut() {
+            used.at -= 60;
+        }
         let eviction = scheduler.evict(over_budget(120)).unwrap();
         let [(0, gone)] = &removed(&eviction)[..] else {
             panic!("{eviction:?}");
@@ -2482,9 +2504,13 @@ mod tests {
         // Slot 1's first test unit was used an hour ago; slot 0 holds a unit
         // no build was seen using, written a day ago.
         let first_test = units("t", 1).remove(0);
-        scheduler.slots[1]
-            .units
-            .insert(first_test.clone(), now - 3600);
+        scheduler.slots[1].units.insert(
+            first_test.clone(),
+            LastUse {
+                at: now - 3600,
+                after: 0,
+            },
+        );
         let inventory = scheduler.slots[0].inventory.as_mut().unwrap();
         inventory.items.push(Evictable {
             paths: vec!["/target/debug/stale".into()],
@@ -2530,6 +2556,31 @@ mod tests {
             scheduler.slots[1].inventory.as_ref().unwrap().items.len(),
             11
         );
+    }
+
+    #[test]
+    fn units_a_build_used_last_go_from_the_top_of_its_graph_down() {
+        let mut scheduler = scheduler(1);
+        let first = submit(&mut scheduler, 1, "/a", "a1");
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}");
+        };
+        // Cargo reports a unit after everything it depends on.
+        let [library, dependent, binary] =
+            ["1", "2", "3"].map(|digit| format!("debug/{}", digit.repeat(16)));
+        for unit in [&library, &dependent, &binary] {
+            scheduler.crate_built(job, true, Some(unit.clone()));
+        }
+        scheduler.crate_built(job, false, Some(library.clone()));
+        scheduler.exited(job, &ok(), None, BuildReport::default());
+        let at = scheduler.slots[0].units[&library].at;
+        assert_eq!(
+            [&library, &dependent, &binary].map(|unit| scheduler.slots[0].units[unit]),
+            [2, 1, 0].map(|after| LastUse { at, after })
+        );
+        measure_all(&mut scheduler, 10);
+        let eviction = scheduler.evict(over_budget(20)).unwrap();
+        assert_eq!(removed(&eviction), [(0, vec![binary, dependent])]);
     }
 
     #[test]
@@ -2813,7 +2864,10 @@ mod tests {
                 build_ms: None,
                 peak_memory: None,
             }],
-            units: units("c", 12).into_iter().map(|unit| (unit, 1)).collect(),
+            units: units("c", 12)
+                .into_iter()
+                .map(|unit| (unit, LastUse { at: 1, after: 0 }))
+                .collect(),
             passed: Vec::new(),
         };
         scheduler.restore(
@@ -2863,10 +2917,11 @@ mod tests {
             ["debug/aaaaaaaaaaaaaaaa", "debug/bbbbbbbbbbbbbbbb"]
         );
         measure_all(&mut scheduler, 1);
+        // Reported last, the build script's output goes first.
         let eviction = scheduler.evict(over_budget(1)).unwrap();
         assert_eq!(
             removed(&eviction),
-            [(0, vec!["debug/aaaaaaaaaaaaaaaa".to_owned()])]
+            [(0, vec!["debug/bbbbbbbbbbbbbbbb".to_owned()])]
         );
         let done = scheduler.evicted(vec![(SlotKey(0), Ok(()))]);
         assert!(matches!(persisted(&done)[..], [(0, record)] if record.units.len() == 1));

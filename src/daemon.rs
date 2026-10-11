@@ -37,7 +37,7 @@ use crate::remote;
 use crate::scheduler::{
     Effect, JobId, Measurement, Removal, Scheduler, SlotKey, Start, Submission, WaiterId,
 };
-use crate::slot::{self, Inventory, SlotDirectory, slot_name};
+use crate::slot::{self, Inventory, SlotDirectory, SlotRecord, slot_name};
 use crate::snapshot::{self, Source};
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
@@ -208,14 +208,14 @@ fn restore_slots(
             );
             continue;
         }
-        let restored = existing.directory.tree().and_then(|revision| {
-            existing
-                .directory
-                .read_record()
-                .map(|record| (revision, record))
-        });
-        match restored {
-            Ok((revision, record)) => {
+        match existing.directory.tree() {
+            Ok(revision) => {
+                // What builds learned in it is knowledge, not the slot: its
+                // checkout and target come back without it.
+                let record = existing.directory.read_record().unwrap_or_else(|error| {
+                    log!("slot {name}: {error}; restoring it without its record");
+                    SlotRecord::default()
+                });
                 log!(
                     "restored slot {name} with {} compilations",
                     record.compilations.len()

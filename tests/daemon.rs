@@ -63,6 +63,21 @@ impl Daemon {
         daemon
     }
 
+    /// Stops the daemon and starts another for the same home, which reads
+    /// its configuration again.
+    fn restart(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        self.process = Process::new(env!("CARGO_BIN_EXE_buildd"))
+            .arg("daemon")
+            .env("BUILDD_HOME", &self.home.0)
+            .spawn()
+            .unwrap();
+        wait_until("the restarted daemon listens", || {
+            client::connect(&self.home.0).is_ok()
+        });
+    }
+
     fn connect(&self) -> UnixStream {
         client::connect(&self.home.0).unwrap()
     }
@@ -829,17 +844,8 @@ fn a_restarted_daemon_keeps_its_slots_warm_and_drops_slots_beyond_its_count() {
         .path();
     std::fs::create_dir(project.join("1")).unwrap();
 
-    let _ = daemon.process.kill();
-    let _ = daemon.process.wait();
     std::fs::write(daemon.home.0.join("config.toml"), "slots = 1\njobs = 4\n").unwrap();
-    daemon.process = Process::new(env!("CARGO_BIN_EXE_buildd"))
-        .arg("daemon")
-        .env("BUILDD_HOME", &daemon.home.0)
-        .spawn()
-        .unwrap();
-    wait_until("the restarted daemon listens", || {
-        client::connect(&daemon.home.0).is_ok()
-    });
+    daemon.restart();
     assert!(!project.join("1").exists(), "slot 1 is beyond one slot");
     let slots = daemon.status().slots;
     assert_eq!(slots.len(), 1, "slot 0 is back before any build");
@@ -856,4 +862,36 @@ fn a_restarted_daemon_keeps_its_slots_warm_and_drops_slots_beyond_its_count() {
             _ => None,
         });
     assert_eq!(warm, Some(true));
+}
+
+#[test]
+fn a_slot_whose_record_cannot_be_read_comes_back_without_it() {
+    let mut daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    let first = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&first).success(), "{first:#?}");
+    let project = std::fs::read_dir(daemon.home.0.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(
+        project.join("0/record.json"),
+        "{ written by an older buildd",
+    )
+    .unwrap();
+
+    daemon.restart();
+    let slots = daemon.status().slots;
+    assert_eq!(slots.len(), 1, "{slots:?}");
+    assert_eq!(slots[0].worktree, None, "the record is gone");
+    let again = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&again).success(), "{again:#?}");
+    assert!(
+        again.iter().any(
+            |message| matches!(message, Message::Started { slot, .. } if slot.ends_with("/0"))
+        ),
+        "{again:#?}"
+    );
 }

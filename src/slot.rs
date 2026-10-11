@@ -29,13 +29,24 @@ pub(crate) struct SlotRecord {
     pub(crate) worktree: Option<PathBuf>,
     #[serde(default)]
     pub(crate) compilations: Vec<CompilationRun>,
-    /// When a build last used each compiled unit, by [`unit_key`], in
-    /// seconds since the Unix epoch.
+    /// When a build last used each compiled unit, by [`unit_key`].
     #[serde(default)]
-    pub(crate) units: BTreeMap<String, u64>,
+    pub(crate) units: BTreeMap<String, LastUse>,
     /// The test binaries that passed in it, as later runs may skip them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) passed: Vec<crate::passed::PassedBinary>,
+}
+
+/// When a build last used a compiled unit: when that build ended, in seconds
+/// since the Unix epoch, and how many of the units it used Cargo reported
+/// after this one. Cargo reports a unit after every unit it depends on, so
+/// among the units one build used last, those with fewer after them go
+/// first: removing a unit makes everything depending on it compile again,
+/// so it outlasts them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub(crate) struct LastUse {
+    pub(crate) at: u64,
+    pub(crate) after: u32,
 }
 
 /// The compiled units, by [`unit_key`], that a slot's latest build of
@@ -945,7 +956,11 @@ mod tests {
                 build_ms: Some(4200),
                 peak_memory: None,
             }],
-            units: [("debug/0123456789abcdef".to_owned(), 7)].into(),
+            units: [(
+                "debug/0123456789abcdef".to_owned(),
+                LastUse { at: 7, after: 0 },
+            )]
+            .into(),
             passed: Vec::new(),
         };
         slot.write_record(&record).unwrap();
