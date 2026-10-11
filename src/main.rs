@@ -80,7 +80,12 @@ fn main() -> ExitCode {
         Some(command) => build(&home, command, args.collect()),
         None if name == "daemon" => daemon(&home),
         None if name == "top" => {
-            top::run(|| client::activity(connect(&home)?)).map(|()| ExitCode::SUCCESS)
+            let remote_home = home.clone();
+            top::run(
+                || client::activity(connect(&home)?),
+                move || client::remotes(connect(&remote_home)?),
+            )
+            .map(|()| ExitCode::SUCCESS)
         }
         None if name == "drain" || name == "undrain" => {
             client::drain(connect(&home)?, name == "drain")?;

@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::config;
 use serde::de::DeserializeOwned;
 
-use crate::protocol::{Activity, BuildRequest, Failures, Message, Request, Status};
+use crate::protocol::{Activity, BuildRequest, Failures, Message, RemoteActivity, Request, Status};
 
 /// Connects to the daemon of `home`.
 ///
@@ -56,6 +56,14 @@ pub fn status(stream: UnixStream) -> Result<Status, String> {
 /// When the connection fails or the daemon breaks the protocol.
 pub fn activity(stream: UnixStream) -> Result<Activity, String> {
     ask(stream, &Request::Activity)
+}
+
+/// What each remote host's daemon does, or why it could not be asked.
+///
+/// # Errors
+/// When the connection fails or the daemon breaks the protocol.
+pub fn remotes(stream: UnixStream) -> Result<Vec<RemoteActivity>, String> {
+    ask(stream, &Request::Remotes)
 }
 
 /// The builds that failed in the last `hours`, on the remote host for `os`

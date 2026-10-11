@@ -5,7 +5,8 @@
 //! [`Message::Rejected`]. Closing the connection earlier withdraws the
 //! request; a build nobody waits for any more is cancelled. For
 //! [`Request::Status`] it answers with one [`Status`], for
-//! [`Request::Activity`] with one [`Activity`].
+//! [`Request::Activity`] with one [`Activity`], for [`Request::Remotes`]
+//! with a list of [`RemoteActivity`].
 
 use std::path::PathBuf;
 
@@ -35,6 +36,9 @@ pub enum Request {
     /// Describe the slots and the queue, what the daemon did since it
     /// started, and its recent events.
     Activity,
+    /// What each remote host's daemon does, asked in parallel: as slow as
+    /// the slowest host, so apart from [`Request::Activity`].
+    Remotes,
     /// Sum up the builds that failed in the last `hours`, from the event
     /// file: on the remote host for `os` when that is not this machine's.
     /// Answered with one [`Failures`].
@@ -405,9 +409,6 @@ pub struct Activity {
     /// How fast builds went lately.
     #[serde(default)]
     pub speed: Speed,
-    /// What each remote host's daemon does, or why it could not be asked.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remotes: Vec<RemoteActivity>,
 }
 
 /// How fast builds went over the last [`Speed::window_ms`]: queue waits, and

@@ -325,7 +325,8 @@ bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
 
 One JSON object per line over the Unix socket (`src/protocol.rs`): `build`
 streams a build, `status` describes slots and queue, `activity` adds what
-`top` shows, `failures` sums up what failed. Programs integrate through the library's `client` module.
+`top` shows, `remotes` asks the remote hosts' daemons, `failures` sums up
+what failed. Programs integrate through the library's `client` module.
 
 ## Not yet
 

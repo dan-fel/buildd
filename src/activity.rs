@@ -198,7 +198,6 @@ impl ActivityLog {
             totals: self.totals.clone(),
             events: self.events.iter().cloned().collect(),
             speed: self.speed(SystemTime::now()),
-            remotes: Vec::new(),
         }
     }
 

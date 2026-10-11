@@ -3,6 +3,7 @@
 //! It shows the slots and what they build for whom, the queue, what sharing
 //! saved since the daemon started, and its recent events.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use buildd::protocol::{
@@ -18,18 +19,45 @@ use ratatui::widgets::{Block, Paragraph};
 
 /// How often the view asks the daemon again.
 const REFRESH: Duration = Duration::from_millis(500);
+/// How long the view waits between asking what remote hosts do: each ask
+/// starts a login shell on each host, and waits for the slowest.
+const REMOTE_REFRESH: Duration = Duration::from_secs(2);
 /// Width of a slot's disk bar.
 const BAR: usize = 12;
 
-/// Shows what `fetch` returns until the user quits with q, Esc or Ctrl-C.
-pub(crate) fn run(mut fetch: impl FnMut() -> Result<Activity, String>) -> Result<(), String> {
+/// Shows what `fetch` returns, with what `fetch_remotes` last returned, until
+/// the user quits with q, Esc or Ctrl-C. Remote hosts are asked on a thread
+/// of their own, so a slow or unreachable host never holds up the view.
+pub(crate) fn run(
+    mut fetch: impl FnMut() -> Result<Activity, String>,
+    mut fetch_remotes: impl FnMut() -> Result<Vec<RemoteActivity>, String> + Send + 'static,
+) -> Result<(), String> {
+    let remotes = Arc::new(Mutex::new(Vec::new()));
+    let asked = Arc::clone(&remotes);
+    std::thread::Builder::new()
+        .name("buildd-top-remotes".into())
+        .spawn(move || {
+            loop {
+                // Without the daemon, the view says so; the hosts keep
+                // their last answer.
+                if let Ok(answer) = fetch_remotes() {
+                    *asked.lock().expect("no thread panics holding the remotes") = answer;
+                }
+                std::thread::sleep(REMOTE_REFRESH);
+            }
+        })
+        .map_err(|error| format!("could not ask remote hosts: {error}"))?;
     let mut terminal =
         ratatui::try_init().map_err(|error| format!("could not set up the terminal: {error}"))?;
     let result = (|| {
         loop {
             let activity = fetch();
+            let remotes = remotes
+                .lock()
+                .expect("no thread panics holding the remotes")
+                .clone();
             terminal
-                .draw(|frame| draw(frame, &activity, SystemTime::now()))
+                .draw(|frame| draw(frame, &activity, &remotes, SystemTime::now()))
                 .map_err(|error| format!("could not draw: {error}"))?;
             if event::poll(REFRESH).map_err(|error| format!("could not read keys: {error}"))?
                 && let Event::Key(key) =
@@ -47,8 +75,13 @@ pub(crate) fn run(mut fetch: impl FnMut() -> Result<Activity, String>) -> Result
     result
 }
 
-/// Draws `activity` as of `now`, or why there is none.
-pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, now: SystemTime) {
+/// Draws `activity` and what `remotes` do as of `now`, or why there is none.
+pub(crate) fn draw(
+    frame: &mut Frame<'_>,
+    activity: &Result<Activity, String>,
+    remotes: &[RemoteActivity],
+    now: SystemTime,
+) {
     let activity = match activity {
         Ok(activity) => activity,
         Err(error) => {
@@ -60,17 +93,22 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
     let status = &activity.status;
     let slot_rows = 2 * status.slots.len().max(1);
     let queue_rows = status.queue.len().clamp(1, 8);
-    let remote_lines = activity
-        .remotes
-        .iter()
-        .flat_map(remote_lines)
-        .collect::<Vec<_>>();
+    let remote_lines = remotes.iter().flat_map(remote_lines).collect::<Vec<_>>();
     let remote_rows = if remote_lines.is_empty() {
         0
     } else {
         remote_lines.len() + 2
     };
-    let [header, speed, slots, queue, remotes, totals, events, footer] = Layout::vertical([
+    let [
+        header,
+        speed,
+        slots,
+        queue,
+        remote_area,
+        totals,
+        events,
+        footer,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(rows(slot_rows + 2)),
@@ -175,7 +213,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
     if !remote_lines.is_empty() {
         frame.render_widget(
             Paragraph::new(remote_lines).block(Block::bordered().title(" remote hosts ")),
-            remotes,
+            remote_area,
         );
     }
 
@@ -236,7 +274,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, activity: &Result<Activity, String>, n
         .events
         .iter()
         .map(|event| (None, event))
-        .chain(activity.remotes.iter().flat_map(|remote| {
+        .chain(remotes.iter().flat_map(|remote| {
             remote.activity.iter().flat_map(|remote_activity| {
                 remote_activity
                     .events
@@ -900,11 +938,6 @@ mod tests {
                     },
                 }],
             },
-            remotes: vec![RemoteActivity {
-                name: "pc".into(),
-                os: "linux".into(),
-                activity: Err("ssh: connect to host pc port 22: Connection refused".into()),
-            }],
             events: vec![
                 Event {
                     at_ms: at(9),
@@ -966,9 +999,24 @@ mod tests {
         }
     }
 
-    fn screen(activity: &Result<Activity, String>, now: SystemTime) -> String {
+    /// One remote host, unreachable.
+    fn sample_remotes() -> Vec<RemoteActivity> {
+        vec![RemoteActivity {
+            name: "pc".into(),
+            os: "linux".into(),
+            activity: Err("ssh: connect to host pc port 22: Connection refused".into()),
+        }]
+    }
+
+    fn screen(
+        activity: &Result<Activity, String>,
+        remotes: &[RemoteActivity],
+        now: SystemTime,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
-        terminal.draw(|frame| draw(frame, activity, now)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, activity, remotes, now))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| {
@@ -983,7 +1031,7 @@ mod tests {
     #[test]
     fn the_view_shows_sharing_reuse_and_what_each_slot_does() {
         let now = SystemTime::now();
-        let text = screen(&Ok(sample(now)), now);
+        let text = screen(&Ok(sample(now)), &sample_remotes(), now);
         for expected in [
             "up 1h0m · 2 slots · disk 24.0/40.0 GiB · jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free, below the floor",
             "check -p app-ui @ 7f3a9c0d1e",
@@ -1013,9 +1061,8 @@ mod tests {
     #[test]
     fn a_remote_hosts_events_join_the_list_marked_with_its_name() {
         let now = SystemTime::now();
-        let mut local = sample(now);
+        let local = sample(now);
         let mut remote = sample(now);
-        remote.remotes.clear();
         remote
             .events
             .retain(|event| matches!(event.kind, EventKind::Finished { .. }));
@@ -1023,8 +1070,9 @@ mod tests {
             panic!("the sample has a finished build");
         };
         *slot = "linux-slot/0".into();
-        local.remotes[0].activity = Ok(Box::new(remote));
-        let text = screen(&Ok(local), now);
+        let mut remotes = sample_remotes();
+        remotes[0].activity = Ok(Box::new(remote));
+        let text = screen(&Ok(local), &remotes, now);
         let line = text
             .lines()
             .find(|line| line.contains("linux-slot/0 finished"))
@@ -1035,9 +1083,8 @@ mod tests {
     #[test]
     fn a_remote_host_lists_each_repositorys_busy_slots_and_folds_idle_ones() {
         let now = SystemTime::now();
-        let mut local = sample(now);
+        let local = sample(now);
         let mut remote = sample(now);
-        remote.remotes.clear();
         let busy = remote.status.slots[0].clone();
         let idle = SlotStatus {
             build: None,
@@ -1053,8 +1100,9 @@ mod tests {
             named(&idle, "app-c71684b27238d845-94eb9688803b5f5f/2"),
             named(&idle, "app-49ce9bdcdd686f74/0"),
         ];
-        local.remotes[0].activity = Ok(Box::new(remote));
-        let text = screen(&Ok(local), now);
+        let mut remotes = sample_remotes();
+        remotes[0].activity = Ok(Box::new(remote));
+        let text = screen(&Ok(local), &remotes, now);
         for expected in [
             "pc (linux)  jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free",
             "    app-c716  0  check -p app-ui @ 7f3a9c0d1e for agent-1, agent-7  testing 4.2 s",
@@ -1079,7 +1127,7 @@ mod tests {
 
     #[test]
     fn an_unreachable_daemon_is_shown_not_fatal() {
-        let text = screen(&Err("lost the daemon".into()), SystemTime::now());
+        let text = screen(&Err("lost the daemon".into()), &[], SystemTime::now());
         assert!(text.contains("buildd: lost the daemon"), "{text}");
     }
 }

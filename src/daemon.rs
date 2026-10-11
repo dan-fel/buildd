@@ -299,11 +299,13 @@ impl Connection {
             Ok(Request::Activity) => {
                 let (reply, activity) = crossbeam_channel::bounded(1);
                 if self.events.send(Event::Activity { reply }).is_ok()
-                    && let Ok(mut activity) = activity.recv()
+                    && let Ok(activity) = activity.recv()
                 {
-                    activity.remotes = self.remote_activity();
                     let _ = write_line(&mut stream, &activity);
                 }
+            }
+            Ok(Request::Remotes) => {
+                let _ = write_line(&mut stream, &self.remote_activity());
             }
             Ok(Request::Failures { hours, os }) => {
                 let failures = match os {
