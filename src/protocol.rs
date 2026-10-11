@@ -19,6 +19,11 @@ use crate::snapshot::Revision;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    /// Cache-owner operations. `host` is a configured remote name, not a path.
+    Cache {
+        host: Option<String>,
+        operation: crate::cache::Operation,
+    },
     /// Build the current content of the worktree holding `directory`.
     Build(BuildRequest),
     /// Build a tree another machine's daemon pushed into this daemon's
@@ -321,6 +326,8 @@ pub enum Chore {
     Measuring,
     /// It gives up what builds used longest ago.
     Evicting,
+    /// Its target is reserved for a cache inventory or approved cleanup.
+    Cache,
 }
 
 /// A slot's latest finished build.

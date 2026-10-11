@@ -52,6 +52,14 @@ const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 
 /// What the scheduler thread hears about.
 enum Event {
+    Cache {
+        operation: crate::cache::Operation,
+        reply: Sender<crate::cache::Response>,
+    },
+    CacheCompleted {
+        work: crate::cache::Work,
+        result: Result<bool, crate::cache::Refusal>,
+    },
     Submit {
         submission: Submission,
         messages: Sender<Message>,
@@ -155,6 +163,22 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     );
 
     let (events, received) = crossbeam_channel::unbounded();
+    let (cache_work, cache_received) = crossbeam_channel::bounded::<crate::cache::Work>(1);
+    let cache_events = events.clone();
+    std::thread::Builder::new()
+        .name("buildd-cache".into())
+        .spawn(move || {
+            while let Ok(work) = cache_received.recv() {
+                let (work, result) = work.run();
+                if cache_events
+                    .send(Event::CacheCompleted { work, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| format!("could not start the cache worker: {error}"))?;
     let accepting = Accepting {
         home: home.to_owned(),
         remotes: Arc::new(config.remotes.clone()),
@@ -170,6 +194,8 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     crate::prewarm::spawn(home, config.prewarm.clone());
     Daemon {
         home: home.to_owned(),
+        cache: crate::cache::Cache::new(home)?,
+        cache_work,
         config,
         budget,
         events,
@@ -280,10 +306,37 @@ impl Connection {
             }
         };
         let mut line = String::new();
-        if reader.read_line(&mut line).is_err() || line.is_empty() {
+        if (&mut reader).take(1_048_577).read_line(&mut line).is_err()
+            || line.len() > 1_048_576
+            || !line.ends_with('\n')
+        {
             return;
         }
         match serde_json::from_str::<Request>(&line) {
+            Ok(Request::Cache { host, operation }) => {
+                let response = if let Some(host) = host {
+                    self.remotes
+                        .iter()
+                        .find(|remote| remote.name == host)
+                        .ok_or_else(|| {
+                            crate::client::CacheError::Rejected(format!(
+                                "unknown cache host {host}"
+                            ))
+                        })
+                        .and_then(|remote| remote::cache(&self.home, remote, operation, &stream))
+                } else {
+                    let (reply, response) = crossbeam_channel::bounded(1);
+                    self.events
+                        .send(Event::Cache { operation, reply })
+                        .map_err(|_| crate::client::CacheError::Transport("daemon ended".into()))
+                        .and_then(|()| {
+                            response.recv().map_err(|_| {
+                                crate::client::CacheError::Transport("daemon ended".into())
+                            })
+                        })
+                };
+                let _ = write_line(&mut stream, &response);
+            }
             Err(error) => {
                 let reason = format!("not a request: {error}");
                 let _ = write_line(&mut stream, &Message::Rejected { reason });
@@ -705,6 +758,8 @@ fn write_line(stream: &mut UnixStream, value: &impl serde::Serialize) -> std::io
 }
 
 struct Daemon {
+    cache: crate::cache::Cache,
+    cache_work: Sender<crate::cache::Work>,
     home: PathBuf,
     config: Config,
     budget: Budget,
@@ -723,7 +778,14 @@ struct Daemon {
 impl Daemon {
     fn drive(mut self, received: &Receiver<Event>) -> ! {
         loop {
-            let event = match self.scheduler.next_measurement() {
+            self.cache.expire(Instant::now());
+            let due = self
+                .scheduler
+                .next_measurement()
+                .into_iter()
+                .chain(self.cache.next_expiry())
+                .min();
+            let event = match due {
                 Some(due) => match received.recv_deadline(due) {
                     Ok(event) => event,
                     Err(RecvTimeoutError::Timeout) => {
@@ -741,6 +803,17 @@ impl Daemon {
                     .expect("the daemon holds a sender of its own events"),
             };
             let effects = match event {
+                Event::Cache { operation, reply } => {
+                    let (response, effects) =
+                        self.cache
+                            .operate(&self.home, &mut self.scheduler, operation);
+                    let _ = reply.send(response);
+                    effects
+                }
+                Event::CacheCompleted { work, result } => {
+                    self.cache
+                        .completed(&self.home, &mut self.scheduler, work, result)
+                }
                 Event::Submit {
                     submission,
                     messages,
@@ -843,6 +916,11 @@ impl Daemon {
             };
             for effect in effects {
                 self.apply(effect);
+            }
+            if let Some(work) = self.cache.take_work() {
+                self.cache_work
+                    .try_send(work)
+                    .expect("one live cache worker owns its work");
             }
         }
     }

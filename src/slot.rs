@@ -123,6 +123,10 @@ impl SlotDirectory {
         )
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
     /// The slot's checkout.
     pub(crate) fn source(&self) -> PathBuf {
         self.0.join("src")
@@ -327,7 +331,7 @@ pub(crate) fn free_disk(path: &Path) -> Result<u64, String> {
 
 /// The directories of a profile whose entries are named with the hash of the
 /// compiled unit they belong to.
-const UNIT_DIRECTORIES: [&str; 4] = ["deps", ".fingerprint", "build", "examples"];
+pub(crate) const UNIT_DIRECTORIES: [&str; 4] = ["deps", ".fingerprint", "build", "examples"];
 
 /// The key of the compiled unit a file under `target` belongs to: its
 /// profile directory and the hash Cargo names all of the unit's files with,
@@ -342,11 +346,20 @@ pub(crate) fn unit_key(target: &Path, path: &Path) -> Option<String> {
         .components()
         .map(|part| part.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()?;
-    let at = parts
+    // Cargo's kind directory follows a profile, optionally preceded by a
+    // target triple. A custom profile itself may be named `build` or `deps`.
+    parts
         .iter()
-        .position(|part| UNIT_DIRECTORIES.contains(part))?;
-    let hash = unit_hash(parts.get(at + 1)?)?;
-    Some(format!("{}/{hash}", parts[..at].join("/")))
+        .enumerate()
+        .skip(1)
+        .take(2)
+        .find_map(|(at, part)| {
+            if !UNIT_DIRECTORIES.contains(part) {
+                return None;
+            }
+            let hash = unit_hash(parts.get(at + 1)?)?;
+            Some(format!("{}/{hash}", parts[..at].join("/")))
+        })
 }
 
 /// The 16-digit hash in a unit's file or directory name: after its last
@@ -363,11 +376,21 @@ const TEST_FILES: &str = "tmp";
 /// The profile directories under `target`, for the host and each target
 /// triple: `<target>/[<triple>/]<profile>`, each with the target-relative
 /// name used in unit keys.
+fn real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
 fn profile_directories(target: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    if !real_directory(target) {
+        return Err(format!(
+            "{} is not a real target directory",
+            target.display()
+        ));
+    }
     let is_profile = |path: &Path| {
         ["deps", ".fingerprint", "incremental"]
             .iter()
-            .any(|part| path.join(part).is_dir())
+            .any(|part| real_directory(&path.join(part)))
     };
     let mut profiles = Vec::new();
     for entry in read_directory(target)? {
@@ -378,11 +401,12 @@ fn profile_directories(target: &Path) -> Result<Vec<(PathBuf, String)>, String> 
         let Some(name) = name.filter(|name| name != TEST_FILES) else {
             continue;
         };
-        if is_profile(&entry) {
+        if real_directory(&entry) && is_profile(&entry) {
             profiles.push((entry, name));
-        } else if entry.is_dir() {
+        } else if real_directory(&entry) {
             for profile in read_directory(&entry)? {
-                if is_profile(&profile)
+                if real_directory(&profile)
+                    && is_profile(&profile)
                     && let Some(inner) = profile.file_name().and_then(|inner| inner.to_str())
                 {
                     let relative = format!("{name}/{inner}");
@@ -405,7 +429,7 @@ fn evictables(target: &Path) -> Result<Vec<Evictable>, String> {
     let mut items = Vec::new();
     for (profile, relative) in profile_directories(target)? {
         let incremental = profile.join("incremental");
-        if incremental.is_dir() {
+        if real_directory(&incremental) {
             // rustc replaces a cache's session directory on every
             // incremental compilation of its unit.
             for path in read_directory(&incremental)? {
@@ -420,7 +444,7 @@ fn evictables(target: &Path) -> Result<Vec<Evictable>, String> {
         let mut units = BTreeMap::<String, (Vec<PathBuf>, SystemTime)>::new();
         for kind in UNIT_DIRECTORIES {
             let directory = profile.join(kind);
-            if !directory.is_dir() {
+            if !real_directory(&directory) {
                 continue;
             }
             for path in read_directory(&directory)? {
@@ -449,7 +473,7 @@ fn evictables(target: &Path) -> Result<Vec<Evictable>, String> {
         }
     }
     let test_files = target.join(TEST_FILES);
-    if test_files.is_dir() {
+    if real_directory(&test_files) {
         for path in read_directory(&test_files)? {
             items.push(Evictable {
                 written: modified(&path)?,
@@ -868,6 +892,23 @@ mod tests {
                 Some("debug/0123456789abcdef"),
             ),
             ("debug/examples/demo", None),
+            (
+                "build/deps/libapp-0123456789abcdef.rlib",
+                Some("build/0123456789abcdef"),
+            ),
+            (
+                "deps/.fingerprint/app-0123456789abcdef",
+                Some("deps/0123456789abcdef"),
+            ),
+            (
+                "x86_64-unknown-linux-gnu/build/build/app-0123456789abcdef/out",
+                Some("x86_64-unknown-linux-gnu/build/0123456789abcdef"),
+            ),
+            ("deps/app-0123456789abcdef", None),
+            (
+                "debug/out/deps/app-0123456789abcdef",
+                Some("debug/out/0123456789abcdef"),
+            ),
             ("debug/app", None),
             ("debug/deps/libnohash.rlib", None),
             ("debug/deps/libshort-0123.rlib", None),

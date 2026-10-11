@@ -1,5 +1,557 @@
 //! The daemon end to end: a real daemon process, git repositories and Cargo.
 
+#[test]
+fn cache_capabilities_and_foreign_owner_round_trip() {
+    use buildd::cache::{Operation, Refusal, Response};
+    let daemon = Daemon::start(1);
+    let Response::Capabilities(capabilities) =
+        client::cache(daemon.connect(), None, Operation::Capabilities).unwrap()
+    else {
+        panic!("typed capabilities");
+    };
+    assert_eq!(capabilities.protocol, 2);
+    let mut owner = capabilities.owner;
+    let Response::Slots { slots, next, .. } = client::cache(
+        daemon.connect(),
+        None,
+        Operation::Slots {
+            owner: owner.clone(),
+            after: None,
+        },
+    )
+    .unwrap() else {
+        panic!("typed slot listing");
+    };
+    assert!(slots.is_empty());
+    assert!(next.is_none());
+    owner.host = "foreign".into();
+    assert_eq!(
+        client::cache(
+            daemon.connect(),
+            None,
+            Operation::Slots { owner, after: None }
+        )
+        .unwrap(),
+        Response::Refused {
+            reason: Refusal::ForeignOwner
+        }
+    );
+}
+
+mod cache_end_to_end {
+    use super::*;
+    use buildd::cache::{Inventory, Operation, Outcome, Preview, Refusal, Response};
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    // All artifact mutation and cleanup in these tests is under this daemon's
+    // temporary home. Its slot and source checkout are created by a real build.
+    fn fixture() -> (Daemon, TempDir, PathBuf) {
+        let daemon = Daemon::start(1);
+        let repository = crate_repository(None);
+        let built = daemon.build(&repository.0, Command::Check, &[]);
+        assert!(super::outcome(&built).success(), "{built:#?}");
+        let projects = std::fs::read_dir(daemon.home.0.join("slots"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(projects.len(), 1);
+        let target = projects[0].join("0/target");
+        for directory in [
+            "debug/deps",
+            "debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa",
+            "debug/incremental/approval-unselected",
+        ] {
+            std::fs::create_dir_all(target.join(directory)).unwrap();
+        }
+        for path in [
+            "debug/deps/pkg-aaaaaaaaaaaaaaaa",
+            "debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa/file",
+            "debug/incremental/approval-unselected/file",
+            "debug/approval-keep",
+        ] {
+            std::fs::write(target.join(path), [7_u8; 8192]).unwrap();
+        }
+        std::fs::write(daemon.home.0.join("approval-keep.log"), "keep").unwrap();
+        (daemon, repository, target)
+    }
+
+    fn operate(daemon: &Daemon, operation: Operation) -> Response {
+        let owner = match &operation {
+            Operation::Preview { owner, .. } | Operation::PreviewStatus { owner, .. } => {
+                Some(owner.clone())
+            }
+            _ => None,
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut response = client::cache(daemon.connect(), None, operation).unwrap();
+        loop {
+            assert!(
+                Instant::now() < until,
+                "cache owner work did not complete: {response:?}"
+            );
+            let next = match &response {
+                Response::Preparing { preparation } => Operation::PreviewStatus {
+                    owner: owner.clone().expect("preparation owner"),
+                    preparation: preparation.clone(),
+                },
+                Response::Receipt {
+                    preview,
+                    executing: true,
+                    ..
+                } => Operation::Receipt {
+                    preview: preview.clone(),
+                },
+                _ => return response,
+            };
+            response = client::cache(daemon.connect(), None, next).unwrap();
+        }
+    }
+
+    fn inventory(daemon: &Daemon) -> Inventory {
+        let Response::Capabilities(capabilities) = operate(daemon, Operation::Capabilities) else {
+            panic!("cache capabilities");
+        };
+        let Response::Slots {
+            slots, next: None, ..
+        } = operate(
+            daemon,
+            Operation::Slots {
+                owner: capabilities.owner.clone(),
+                after: None,
+            },
+        )
+        else {
+            panic!("fixture slot listing")
+        };
+        let Response::Inventory(mut inventory) = operate(
+            daemon,
+            Operation::Inventory {
+                owner: capabilities.owner,
+                slots: slots.into_iter().map(|slot| slot.id).collect(),
+            },
+        ) else {
+            panic!("cache inventory");
+        };
+        while inventory.items.is_empty() && inventory.next.is_some() && !inventory.complete {
+            let Response::Inventory(page) = operate(
+                daemon,
+                Operation::InventoryPage {
+                    owner: inventory.owner.clone(),
+                    inventory: inventory.revision.clone(),
+                    after: inventory.next.take().unwrap(),
+                },
+            ) else {
+                panic!("inventory progress")
+            };
+            inventory = page;
+        }
+        inventory
+    }
+
+    fn preview(daemon: &Daemon, inventory: &Inventory) -> Preview {
+        let item = inventory
+            .items
+            .iter()
+            .find(|item| item.unit.as_deref() == Some("debug/aaaaaaaaaaaaaaaa"))
+            .unwrap();
+        let Response::Preview(preview) = operate(
+            daemon,
+            Operation::Preview {
+                owner: inventory.owner.clone(),
+                inventory: inventory.revision.clone(),
+                items: vec![item.id.clone()],
+            },
+        ) else {
+            panic!("exact cleanup preview");
+        };
+        preview
+    }
+
+    #[test]
+    fn cache_cleanup_preview_is_inert_and_receipt_replay_is_exact() {
+        let (daemon, repository, target) = fixture();
+        let inventory = inventory(&daemon);
+        assert!(inventory.complete, "{inventory:?}");
+        let preview = preview(&daemon, &inventory);
+        let artifact = target.join("debug/deps/pkg-aaaaaaaaaaaaaaaa");
+        assert!(artifact.exists());
+        let pending = Response::Receipt {
+            preview: preview.clone(),
+            result: None,
+            executing: false,
+        };
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Receipt {
+                    preview: preview.clone()
+                }
+            ),
+            pending
+        );
+
+        let mut changed = preview.clone();
+        changed.items[0].reclaimable_bytes = Some(changed.items[0].reclaimable_bytes.unwrap() + 1);
+        assert_eq!(
+            operate(&daemon, Operation::Execute { preview: changed }),
+            Response::Refused {
+                reason: Refusal::PayloadChanged
+            }
+        );
+        assert!(artifact.exists());
+
+        let cancelled = self::preview(&daemon, &inventory);
+        let cancelled_receipt = Response::Receipt {
+            preview: cancelled.clone(),
+            result: Some(Outcome::Cancelled),
+            executing: false,
+        };
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Cancel {
+                    preview: cancelled.clone()
+                }
+            ),
+            cancelled_receipt
+        );
+        assert_eq!(
+            operate(&daemon, Operation::Execute { preview: cancelled }),
+            cancelled_receipt
+        );
+        assert!(artifact.exists());
+
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::ReleaseInventory {
+                    owner: inventory.owner.clone(),
+                    inventory: inventory.revision.clone(),
+                }
+            ),
+            Response::Released {
+                inventory: inventory.revision.clone()
+            }
+        );
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Receipt {
+                    preview: preview.clone()
+                }
+            ),
+            pending
+        );
+
+        let complete = Response::Receipt {
+            preview: preview.clone(),
+            result: Some(Outcome::Completed {
+                removed: vec![preview.items[0].id.clone()],
+            }),
+            executing: false,
+        };
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Execute {
+                    preview: preview.clone()
+                }
+            ),
+            complete
+        );
+        assert!(!artifact.exists());
+        assert!(
+            !target
+                .join("debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa")
+                .exists()
+        );
+        for path in [
+            "debug/incremental/approval-unselected/file",
+            "debug/approval-keep",
+        ] {
+            assert_eq!(std::fs::read(target.join(path)).unwrap(), [7_u8; 8192]);
+        }
+        assert_eq!(
+            std::fs::read_to_string(daemon.home.0.join("approval-keep.log")).unwrap(),
+            "keep"
+        );
+        assert!(repository.0.join("src/lib.rs").exists());
+        assert!(target.parent().unwrap().join("src/src/lib.rs").exists());
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(target.parent().unwrap().join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["units"], serde_json::json!({}));
+        assert_eq!(record["compilations"], serde_json::json!([]));
+        assert!(
+            record
+                .get("passed")
+                .is_none_or(|passed| passed.as_array().unwrap().is_empty())
+        );
+
+        // A replay returns the original outcome; it must not delete a new
+        // artifact that subsequently occupies the formerly approved path.
+        std::fs::write(&artifact, "new artifact").unwrap();
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Execute {
+                    preview: preview.clone()
+                }
+            ),
+            complete
+        );
+        assert_eq!(operate(&daemon, Operation::Receipt { preview }), complete);
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "new artifact");
+    }
+
+    #[test]
+    fn cache_owned_execution_survives_requester_disconnect_and_keeps_status_responsive() {
+        let (daemon, _, target) = fixture();
+        let group = target.join("debug/incremental/approval-unselected");
+        for index in 0..2000 {
+            std::fs::write(group.join(format!("artifact-{index:04}")), "artifact").unwrap();
+        }
+        let inventory = inventory(&daemon);
+        let item = inventory
+            .items
+            .iter()
+            .find(|item| {
+                item.unit.is_none() && item.reclaimable_bytes.is_some_and(|bytes| bytes > 100_000)
+            })
+            .expect("large measured incremental scope");
+        let Response::Preview(preview) = operate(
+            &daemon,
+            Operation::Preview {
+                owner: inventory.owner.clone(),
+                inventory: inventory.revision.clone(),
+                items: vec![item.id.clone()],
+            },
+        ) else {
+            panic!("approval");
+        };
+        let mut requester = daemon.connect();
+        serde_json::to_writer(
+            &mut requester,
+            &buildd::protocol::Request::Cache {
+                host: None,
+                operation: Operation::Execute {
+                    preview: preview.clone(),
+                },
+            },
+        )
+        .unwrap();
+        requester.write_all(b"\n").unwrap();
+        let mut line = String::new();
+        let mut requester = BufReader::new(requester);
+        requester.read_line(&mut line).unwrap();
+        let response: Result<Response, buildd::client::CacheError> =
+            serde_json::from_str(&line).unwrap();
+        assert!(
+            matches!(
+                response.unwrap(),
+                Response::Receipt {
+                    executing: true,
+                    result: None,
+                    ..
+                }
+            ),
+            "acceptance owns execution before a worker completion"
+        );
+        drop(requester);
+        let status = daemon.connect();
+        status
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            client::status(status).unwrap().slots.len(),
+            1,
+            "status is serviced by the event loop while filesystem work has its own worker"
+        );
+        assert!(matches!(
+            operate(
+                &daemon,
+                Operation::Receipt {
+                    preview: preview.clone()
+                }
+            ),
+            Response::Receipt {
+                result: Some(Outcome::Completed { .. }),
+                executing: false,
+                ..
+            }
+        ));
+        let completed = operate(
+            &daemon,
+            Operation::Receipt {
+                preview: preview.clone(),
+            },
+        );
+        assert_eq!(operate(&daemon, Operation::Execute { preview }), completed);
+        assert!(!group.exists());
+        assert!(target.join("debug/deps/pkg-aaaaaaaaaaaaaaaa").exists());
+    }
+
+    #[test]
+    fn cache_remote_forwarding_preserves_typed_failures_and_old_daemon_rejection() {
+        use buildd::client::CacheError;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Only this fixture daemon gets a PATH containing the fixture SSH.
+        // Exercise its actual request dispatch and forwarding wire boundary
+        // without contacting hosts or changing the process-wide environment.
+        let commands = TempDir::new();
+        let ssh = commands.0.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/usr/bin/env python3
+import json, sys
+request = json.loads(sys.stdin.readline())
+assert request == {'type':'cache', 'host':None, 'operation':{'operation':'capabilities'}}
+sys.stdout.write(sys.argv[-1] + '\n')
+sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut paths = vec![commands.0.clone()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let path = std::env::join_paths(paths).unwrap();
+        let cases = [
+            (
+                "transport",
+                serde_json::to_string(&Err::<Response, _>(CacheError::Transport(
+                    "fixture remote transport lost".into(),
+                )))
+                .unwrap(),
+            ),
+            (
+                "invalid",
+                serde_json::to_string(&Err::<Response, _>(CacheError::InvalidResponse(
+                    "fixture invalid reply".into(),
+                )))
+                .unwrap(),
+            ),
+            (
+                "old",
+                serde_json::to_string(&Message::Rejected {
+                    reason: "fixture unsupported cache request".into(),
+                })
+                .unwrap(),
+            ),
+            ("malformed", "{}".into()),
+            (
+                "valid",
+                serde_json::to_string(&Ok::<_, CacheError>(Response::Refused {
+                    reason: Refusal::Busy,
+                }))
+                .unwrap(),
+            ),
+        ];
+        let remote_os = if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        };
+        let mut config = "slots = 1\njobs = 4\nmin_free_gib = 0\n".to_owned();
+        for (name, reply) in &cases {
+            config.push_str(&format!(
+                "\n[[remote]]\nname = {name:?}\nssh = \"fixture\"\nos = {remote_os:?}\ncommand = {}\n",
+                serde_json::to_string(reply).unwrap()
+            ));
+        }
+        let daemon = Daemon::configured_path(&config, Some(&path));
+        let ask = |host: &str| {
+            client::cache(daemon.connect(), Some(host.into()), Operation::Capabilities)
+        };
+        assert!(
+            matches!(ask("transport"), Err(CacheError::Transport(reason)) if reason.contains("fixture remote transport lost"))
+        );
+        assert!(
+            matches!(ask("invalid"), Err(CacheError::InvalidResponse(reason)) if reason.contains("fixture invalid reply"))
+        );
+        assert!(
+            matches!(ask("old"), Err(CacheError::Rejected(reason)) if reason.contains("fixture unsupported cache request"))
+        );
+        assert!(matches!(
+            ask("malformed"),
+            Err(CacheError::InvalidResponse(_))
+        ));
+        assert_eq!(
+            ask("valid"),
+            Ok(Response::Refused {
+                reason: Refusal::Busy
+            })
+        );
+        assert!(
+            matches!(ask("absent"), Err(CacheError::Rejected(reason)) if reason.contains("unknown cache host"))
+        );
+    }
+
+    #[test]
+    fn cache_changed_targets_are_terminal_refusals_and_symlink_leaves_preserve_sources() {
+        let (daemon, _repository, target) = fixture();
+        let inventory = inventory(&daemon);
+        assert!(inventory.complete, "{inventory:?}");
+        let preview = preview(&daemon, &inventory);
+        let artifact = target.join("debug/deps/pkg-aaaaaaaaaaaaaaaa");
+        std::fs::write(&artifact, [9_u8; 8193]).unwrap();
+        let refused = Response::Receipt {
+            preview: preview.clone(),
+            result: Some(Outcome::Refused {
+                reason: Refusal::Changed,
+            }),
+            executing: false,
+        };
+        assert_eq!(
+            operate(
+                &daemon,
+                Operation::Execute {
+                    preview: preview.clone()
+                }
+            ),
+            refused
+        );
+        assert_eq!(operate(&daemon, Operation::Receipt { preview }), refused);
+        assert_eq!(std::fs::read(&artifact).unwrap(), [9_u8; 8193]);
+        assert!(
+            target
+                .join("debug/.fingerprint/pkg-aaaaaaaaaaaaaaaa/file")
+                .exists()
+        );
+        let source = target.parent().unwrap().join("src/src/lib.rs");
+        let before = std::fs::read(&source).unwrap();
+        let link = target.join("debug/incremental/approval-link");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let fresh = self::inventory(&daemon);
+        assert!(fresh.complete, "{fresh:?}");
+        let Response::Preview(preview) = operate(
+            &daemon,
+            Operation::Preview {
+                owner: fresh.owner.clone(),
+                inventory: fresh.revision.clone(),
+                items: fresh
+                    .items
+                    .iter()
+                    .filter(|item| item.unit.is_none())
+                    .map(|item| item.id.clone())
+                    .collect(),
+            },
+        ) else {
+            panic!("symlink leaf preview")
+        };
+        assert!(matches!(
+            operate(&daemon, Operation::Execute { preview }),
+            Response::Receipt {
+                result: Some(Outcome::Completed { .. }),
+                ..
+            }
+        ));
+        assert!(std::fs::symlink_metadata(link).is_err());
+        assert_eq!(std::fs::read(source).unwrap(), before);
+    }
+}
+
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process};
@@ -47,13 +599,18 @@ impl Daemon {
     }
 
     fn configured(config: &str) -> Self {
+        Self::configured_path(config, None)
+    }
+
+    fn configured_path(config: &str, path: Option<&std::ffi::OsStr>) -> Self {
         let home = TempDir::new();
         std::fs::write(home.0.join("config.toml"), config).unwrap();
-        let process = Process::new(env!("CARGO_BIN_EXE_buildd"))
-            .arg("daemon")
-            .env("BUILDD_HOME", &home.0)
-            .spawn()
-            .unwrap();
+        let mut command = Process::new(env!("CARGO_BIN_EXE_buildd"));
+        command.arg("daemon").env("BUILDD_HOME", &home.0);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let process = command.spawn().unwrap();
         let daemon = Self { home, process };
         let deadline = Instant::now() + Duration::from_secs(10);
         while client::connect(&daemon.home.0).is_err() {

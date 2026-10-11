@@ -479,6 +479,7 @@ fn status(home: &Path) -> Result<ExitCode, String> {
                 let doing = match slot.chore {
                     Some(Chore::Measuring) => "measuring",
                     Some(Chore::Evicting) => "evicting",
+                    Some(Chore::Cache) => "cache reserved",
                     None => "idle",
                 };
                 println!("slot {}{size}: {doing}{worktree}", slot.name);

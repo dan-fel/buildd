@@ -325,8 +325,120 @@ bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
 
 One JSON object per line over the Unix socket (`src/protocol.rs`): `build`
 streams a build, `status` describes slots and queue, `activity` adds what
-`top` shows, `remotes` asks the remote hosts' daemons, `failures` sums up
-what failed. Programs integrate through the library's `client` module.
+`top` shows, `remotes` asks the remote hosts’ daemons, `failures` sums up what failed. Programs integrate through the library's `client` module,
+with `default-features = false`: the default `cli` feature adds the command and the terminal UI
+`top` draws with.
+
+## Cache-owner protocol
+
+Library clients use `client::cache(stream, host, operation)` and typed
+`cache::{Operation, Response}`. The wire request is
+`{"type":"cache","host":null,"operation":{"operation":"capabilities"}}`.
+`host` may instead be a configured remote **name**; the existing SSH `serve`
+transport asks that host's actual daemon, without relaying local cache records.
+An old daemon rejects this request: clients must show capability-unavailable,
+not invent inventory. Protocol 2 capabilities return the host/cache-home
+identity, random daemon incarnation, and all limits. No general version
+handshake is assumed. Cache replies serialize
+`Result<cache::Response, client::CacheError>`: `Ok` carries the service response;
+`Err` preserves transport, rejection or invalid-response failure across remote
+forwarding. An old daemon's `Message::Rejected` remains a real rejection.
+Both request and response lines are bounded at 1 MiB before decoding.
+
+A remote cache exchange owns its SSH session, with nonblocking input, output
+and diagnostics, one 10 s deadline covering partial writes and reads, and
+requester-disconnect detection. Diagnostics are drained continuously but retain
+at most 4 KiB. Every result retires and reaps the session. Timeout/disconnect
+can happen after execute reached the owner: they never imply rollback, cancel
+an approval or cause an automatic retry. Recover through the exact receipt.
+
+1. Ask for capabilities, then `slots` with that exact `Owner`. This cache-local
+   listing returns at most 16 service-owned slot IDs and their current protection;
+   follow its `next` with `slots.after` to reach every slot. Choose one to 16 of
+   these IDs for `inventory.slots`. Unknown or duplicate IDs are refused. Each
+   inventory scans only those slots, so earlier caches cannot hide a later slot.
+2. Inventory returns a revision, fixed expiry, slot protection and at most 64
+   service-issued item IDs per page. Empty progress pages may precede measured
+   items. Follow every `next` using `inventory_page` with that revision and the
+   exact cursor; a progress cursor resumes the owner's directory iterators,
+   while an item cursor reads the completed catalog. Select at most 64 IDs
+   from one revision. IDs name compiled-unit groups or incremental caches;
+   callers never submit paths or commands. An unfinished group has no invented
+   size, and unsupported groups explicitly refuse approval. `release_inventory`
+   retires a discovery revision and its iterators/catalog, cancelling active
+   discovery through the same worker-expiry boundary. Release before inspecting
+   other slots when discovery approaches the global quota. Already issued
+   preparations and approval/execution receipts remain usable independently.
+3. Preview returns `preparing` while a bounded worker measures only selected
+   scopes under scheduler exclusion. Poll `preview_status` with its owner and
+   preparation ID for the exact preview or refusal. This measurement is the
+   approval truth; inventory estimates are discovery only. Preview deletes
+   nothing, and all exclusion is released before a person approves it.
+4. Approve the **entire** returned preview in the caller's policy/UI, including
+   owner, expiry, IDs and estimates; send that exact preview to execute.
+   Buildd's private socket authorizes its OS owner, not workspace/UI policy.
+   Execute accepts ownership and returns a pending receipt with `executing`.
+   Its worker revalidates exactly the selected scopes under exclusion for all
+   selected slots, including the same Cargo roots, entry identities/metadata
+   and real ancestor directories. Changes in unrelated scopes do not invalidate
+   approval. Normal symlink leaves are measured and unlinked without following
+   their referents; symlink ancestors and unsupported entry kinds are protected.
+   Validation claims are persisted as invalid before the first artifact removal.
+   Cleanup removes only selected incremental caches and compiled-unit artifacts;
+   it never prunes the whole target or removes sources, mirrors, logs, products,
+   registry or unrelated paths. Ordinary automatic maintenance remains independent.
+5. Query `receipt` until execution publishes completed, partial or refused.
+   Repeating execute with an identical preview returns that receipt and never
+   deletes again; changing any payload field is refused. A lost connection,
+   transport failure or deadline never implies rollback: recover through the
+   same receipt, without an implicit retry or a new cleanup. `unknown`
+   (expired/missing receipt or restarted/foreign daemon) preserves uncertainty.
+   `cancel` is terminal before accepted execution; accepted execution belongs
+   to the owner and continues after the requester disconnects.
+
+A single filesystem worker runs slices of at most 8192 iterator/removal steps
+and 250 ms, keeping directory iterators between slices and leaving the daemon
+scheduler/event loop responsive. Inventory retains compact group accounting,
+not every target pathname. It publishes a scope only after its entire
+measurement completes. Inventory exclusion is released after every slice;
+any intervening daemon-owned filesystem writer advances its slot generation
+before writing and invalidates continuation/selection from the old revision.
+Preview and execute keep all selected-slot exclusion for their technical work,
+with no lease across user approval. Selected manifests across all selected
+slots retain at most 8192 entries. A scope that cannot fit is explicitly
+unsupported; pagination does not relax the manifest bound.
+
+The owner has one global 512 KiB admission budget for retained path/string
+bytes across its inventories, preparations, approvals and active worker. It
+counts roots, relative paths, scope selectors, iterator contexts,
+catalog text and receipt payloads, reserving publication/terminal receipt text
+before dispatch. This is a text quota, not a claim about total allocator/OS
+memory; entry/slot/receipt limits bound bookkeeping. Completed catalogs own
+one row per item; unresolved inodes refer to its existing measurement by a
+stable numeric identity rather than cloning scope text. Verification transfers approved manifest entries instead of
+keeping a second copy; removal retains roots once and uses relative paths with
+numeric item indexes. Limits and protected slots are reported explicitly,
+never replaced by cached status sizes. All pages and preparation share one
+revision and expiry; continuation never refreshes the lifetime.
+
+These guarantees require exclusive buildd ownership of slot targets. Direct
+filesystem writers must stop before owner work and remain stopped through
+execute. Scheduler exclusion covers every buildd writer, but cannot stop an
+external writer replacing a pathname between validation and unlink; hostile
+same-owner mutation is outside this contract. Deadline/expiry is checked between
+filesystem operations, and one blocked OS syscall cannot be preempted. Released or expired
+inventory/preparation results drop their worker resources before releasing
+exclusion; accepted execute retains a terminal receipt independently of the
+requester. Reclaimable estimates count a hardlinked inode only when all its
+links belong to that individual scope; external/cross-scope links stay
+conservative, so combined removal can free more than the sum of estimates.
+
+There are at most eight inventories and eight receipts, expiring after 60 s;
+capacity is refused, never evicted behind an approval. Daemon request lines are
+limited to 1 MiB. Inventory IDs and outcomes are incarnation-scoped, not
+persisted across restart. A client applies its own authority to what a person
+may clean, binds approval to the full preview, labels incomplete or unknown
+outcomes, and refreshes after execution. Tests use owned temporary caches only.
 
 ## Not yet
 

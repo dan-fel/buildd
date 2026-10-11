@@ -477,6 +477,7 @@ fn chore(chore: Option<Chore>) -> &'static str {
     match chore {
         Some(Chore::Measuring) => "measuring",
         Some(Chore::Evicting) => "evicting",
+        Some(Chore::Cache) => "cache reserved",
         None => "idle",
     }
 }
