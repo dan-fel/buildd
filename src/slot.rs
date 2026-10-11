@@ -457,11 +457,16 @@ impl Pruning {
     }
 }
 
+/// The directories of a profile whose entries are named with the hash of the
+/// compiled unit they belong to.
+const UNIT_DIRECTORIES: [&str; 4] = ["deps", ".fingerprint", "build", "examples"];
+
 /// The key of the compiled unit a file under `target` belongs to: its
 /// profile directory and the hash Cargo names all of the unit's files with,
 /// as in `debug/deps/libfoo-0123456789abcdef.rlib`,
-/// `debug/.fingerprint/foo-0123456789abcdef` and
-/// `debug/build/foo-0123456789abcdef/out`. None for files outside a unit,
+/// `debug/.fingerprint/foo-0123456789abcdef`,
+/// `debug/build/foo-0123456789abcdef/out` and
+/// `debug/examples/foo-0123456789abcdef`. None for files outside a unit,
 /// such as uplifted binaries.
 pub(crate) fn unit_key(target: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(target).ok()?;
@@ -471,7 +476,7 @@ pub(crate) fn unit_key(target: &Path, path: &Path) -> Option<String> {
         .collect::<Option<Vec<_>>>()?;
     let at = parts
         .iter()
-        .position(|part| matches!(*part, "deps" | ".fingerprint" | "build"))?;
+        .position(|part| UNIT_DIRECTORIES.contains(part))?;
     let hash = unit_hash(parts.get(at + 1)?)?;
     Some(format!("{}/{hash}", parts[..at].join("/")))
 }
@@ -549,7 +554,7 @@ fn evictables(target: &Path, used: &HashMap<String, u64>) -> Result<Vec<Evictabl
             }
         }
         let mut units = BTreeMap::<String, (Vec<PathBuf>, SystemTime)>::new();
-        for kind in ["deps", ".fingerprint", "build"] {
+        for kind in UNIT_DIRECTORIES {
             let directory = profile.join(kind);
             if !directory.is_dir() {
                 continue;
@@ -997,6 +1002,11 @@ mod tests {
                 "aarch64-apple-darwin/release/deps/libx-0123456789abcdef.rmeta",
                 Some("aarch64-apple-darwin/release/0123456789abcdef"),
             ),
+            (
+                "debug/examples/demo-0123456789abcdef",
+                Some("debug/0123456789abcdef"),
+            ),
+            ("debug/examples/demo", None),
             ("debug/app", None),
             ("debug/deps/libnohash.rlib", None),
             ("debug/deps/libshort-0123.rlib", None),
@@ -1088,6 +1098,42 @@ mod tests {
                 .join("debug/deps/libunrecorded-3333333333333333.rlib")
                 .exists()
         );
+    }
+
+    #[test]
+    fn an_examples_executable_and_objects_go_with_its_unit() {
+        let home = TempDir::new();
+        let slot = SlotDirectory::new(&home.0, Path::new("/repo/.git"), 0);
+        let target = slot.target();
+        let example = |hash: &str, age: u64| {
+            for name in [
+                format!("debug/examples/demo-{hash}"),
+                format!("debug/examples/demo-{hash}.d"),
+                format!("debug/examples/demo-{hash}.demo.1a2b3c-cgu.0.rcgu.o"),
+                format!("debug/.fingerprint/app-{hash}/example-demo"),
+            ] {
+                file(&target.join(&name), 100_000);
+                set_modified(&target.join(&name), age);
+            }
+            set_modified(&target.join(format!("debug/.fingerprint/app-{hash}")), age);
+        };
+        example("1111111111111111", 7200);
+        example("2222222222222222", 60);
+        let size = disk_usage(&target, &[]).unwrap().total;
+
+        let (pruning, evicted) = slot.enforce_limit(size - 250_000, &HashMap::new()).unwrap();
+        assert!(
+            matches!(pruning, Pruning::Evicted { units: 1, .. }),
+            "{pruning:?}"
+        );
+        assert_eq!(evicted, ["debug/1111111111111111"]);
+        let left = std::fs::read_dir(target.join("debug/examples"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.contains("1111111111111111"))
+            .collect::<Vec<_>>();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(target.join("debug/examples/demo-2222222222222222").exists());
     }
 
     #[test]
