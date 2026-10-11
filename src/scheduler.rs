@@ -1321,9 +1321,14 @@ impl<D: Distance> Scheduler<D> {
             .jobs
             .values()
             .any(|job| job.queued() && !job.optional());
-        // Why a build waits for memory is found again in each pass.
-        for job in self.jobs.values_mut().filter(|job| job.queued()) {
+        // Queue reasons belong to this pass. Remember earlier holds only to
+        // avoid reporting the same decision again while it remains valid.
+        let mut previously_held = HashSet::new();
+        for (id, job) in self.jobs.iter_mut().filter(|(_, job)| job.queued()) {
             job.memory_needed = None;
+            if job.hold.take().is_some() {
+                previously_held.insert(*id);
+            }
         }
         for id in self.queue_order() {
             let busy = self.slots.iter().filter(|slot| slot.busy()).count();
@@ -1343,15 +1348,12 @@ impl<D: Distance> Scheduler<D> {
             }
             let (slot, warm) = match self.choose_slot(id, &claimed) {
                 Placement::Start { slot, warm } => (slot, warm),
-                Placement::Wait => {
-                    self.jobs.get_mut(&id).expect("queued above").hold = None;
-                    continue;
-                }
+                Placement::Wait => continue,
                 Placement::Hold { hold, slot } => {
                     let expected = self.estimate(&self.jobs[&id]).unwrap_or(0);
                     *claimed.entry(slot).or_default() += expected;
                     let job = self.jobs.get_mut(&id).expect("queued above");
-                    if job.hold.is_none() {
+                    if !previously_held.contains(&id) {
                         effects.push(Effect::Report(EventKind::Held {
                             who: job.who(),
                             operation: job.operation.clone(),
@@ -1413,6 +1415,13 @@ impl<D: Distance> Scheduler<D> {
                     Vec::new()
                 },
             }));
+        }
+        // A later build may have taken the last idle slot after earlier
+        // builds chose to wait for warmth. That choice no longer delays them.
+        if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
+            for job in self.jobs.values_mut().filter(|job| job.queued()) {
+                job.hold = None;
+            }
         }
         effects
     }
@@ -2589,6 +2598,11 @@ mod tests {
         // A third would wait about 25 s there: the idle slot is sooner.
         let third = submit_operation(&mut scheduler, 6, "/e", "e1", Command::Test, &[]);
         assert!(matches!(starts(&third)[..], [(_, 0, _)]), "{third:?}");
+        let (_, queue) = scheduler.status(|_| 0);
+        assert!(
+            queue.iter().all(|build| build.held.is_none()),
+            "every slot is busy: waiting for warmth no longer delays a build"
+        );
         let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert!(matches!(starts(&next)[..], [(_, 1, _)]), "{next:?}");
     }
