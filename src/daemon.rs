@@ -848,7 +848,7 @@ impl Daemon {
     fn status(&self) -> Status {
         let (slots, queue) = self
             .scheduler
-            .status(|job| self.runs.get(&job).map_or(0, |run| run.charge()));
+            .status(|job| self.runs.get(&job).map_or(0, |run| run.in_use()));
         let (jobs, idle_jobs) = self.budget.jobs();
         let (memory, memory_in_use) = self.scheduler.memory();
         Status {
@@ -1126,9 +1126,9 @@ impl Run {
         }
     }
 
-    /// The jobs the build is charged now.
-    fn charge(&self) -> usize {
-        self.lock().lease.as_ref().map_or(0, |lease| lease.charge())
+    /// The jobs the build uses now.
+    fn in_use(&self) -> usize {
+        self.lock().lease.as_ref().map_or(0, |lease| lease.in_use())
     }
 
     /// Stops the build: `SIGTERM` to Cargo's process group now, `SIGKILL`

@@ -82,6 +82,26 @@ impl Account {
         }
     }
 
+    /// What the build uses now: Cargo's implicit token and the tokens its
+    /// processes took, and while its tests run, at least the tests' share.
+    /// Tokens dealt to it that wait in its FIFO are not in use.
+    fn in_use(&self, test_jobs: usize) -> usize {
+        let in_use = 1 + self.deposited.saturating_sub(self.waiting());
+        if self.testing {
+            in_use.max(test_jobs)
+        } else {
+            in_use
+        }
+    }
+
+    /// Tokens waiting in the FIFO.
+    fn waiting(&self) -> usize {
+        rustix::io::ioctl_fionread(&self.reader).map_or_else(
+            |error| panic!("a FIFO the daemon holds open can be queried: {error}"),
+            |waiting| usize::try_from(waiting).expect("a FIFO holds few bytes"),
+        )
+    }
+
     /// Takes back every token waiting in the FIFO.
     fn withdraw_waiting(&mut self) {
         let mut buffer = [0; 64];
@@ -170,10 +190,10 @@ impl Budget {
         })
     }
 
-    /// Jobs the budget has, and of those, the ones no build is charged for.
+    /// Jobs the budget has, and of those, the ones no build uses now.
     pub(crate) fn jobs(&self) -> (usize, usize) {
         let ledger = self.ledger();
-        (ledger.jobs, ledger.free())
+        (ledger.jobs, ledger.idle())
     }
 
     fn deal_forever(&self) -> ! {
@@ -203,6 +223,17 @@ impl Ledger {
             .map(|account| account.charge(self.test_jobs))
             .sum::<usize>();
         self.jobs.saturating_sub(charged)
+    }
+
+    /// Jobs no build uses now. Free jobs are dealt into the FIFOs of
+    /// compiling builds at once, so this counts what waits there too.
+    fn idle(&self) -> usize {
+        let in_use = self
+            .accounts
+            .values()
+            .map(|account| account.in_use(self.test_jobs))
+            .sum::<usize>();
+        self.jobs.saturating_sub(in_use)
     }
 
     /// Takes back the tokens waiting in every FIFO and deals what is free.
@@ -271,10 +302,10 @@ impl Lease {
             .testing = true;
     }
 
-    /// What the build is charged now.
-    pub(crate) fn charge(&self) -> usize {
+    /// The jobs the build uses now.
+    pub(crate) fn in_use(&self) -> usize {
         let ledger = self.budget.ledger();
-        ledger.accounts[&self.id].charge(ledger.test_jobs)
+        ledger.accounts[&self.id].in_use(ledger.test_jobs)
     }
 }
 
@@ -323,16 +354,6 @@ mod tests {
     use super::*;
     use crate::snapshot::tests::TempDir;
 
-    impl Account {
-        /// Tokens waiting in the FIFO.
-        fn waiting(&self) -> usize {
-            rustix::io::ioctl_fionread(&self.reader).map_or_else(
-                |error| panic!("a FIFO the daemon holds open can be queried: {error}"),
-                |waiting| usize::try_from(waiting).expect("a FIFO holds few bytes"),
-            )
-        }
-    }
-
     /// A ledger without its dealer thread, dealt by hand.
     fn ledger(jobs: usize, test_jobs: usize, scratch: &Path) -> Ledger {
         Ledger {
@@ -379,10 +400,12 @@ mod tests {
         let mut ledger = ledger(6, 3, &scratch.0);
         let (a, b) = (open(&mut ledger), open(&mut ledger));
         ledger.deal();
-        // Each build is charged its implicit token; the rest is dealt.
+        // Each build is charged its implicit token; the rest is dealt, and
+        // waits unused.
         assert_eq!(ledger.free(), 0);
         assert_eq!(ledger.accounts[&a].waiting(), 2);
         assert_eq!(ledger.accounts[&b].waiting(), 2);
+        assert_eq!(ledger.idle(), 4);
         // A's process takes one and keeps it; the rest is dealt again, B
         // first this time.
         take(&ledger, a);
@@ -391,6 +414,8 @@ mod tests {
         assert_eq!(ledger.accounts[&a].waiting(), 1);
         assert_eq!(ledger.accounts[&b].waiting(), 2);
         assert_eq!(ledger.free(), 0);
+        assert_eq!(ledger.accounts[&a].in_use(3), 2);
+        assert_eq!(ledger.idle(), 3);
         // No scratch file stays behind.
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
@@ -430,6 +455,7 @@ mod tests {
         ledger.accounts.get_mut(&b).unwrap().testing = true;
         ledger.deal();
         assert_eq!(ledger.accounts[&b].charge(3), 3);
+        assert_eq!(ledger.accounts[&b].in_use(3), 3, "tests use their share");
         assert_eq!(ledger.accounts[&b].waiting(), 0, "tests take no tokens");
         assert_eq!(ledger.accounts[&a].charge(3), 2);
         assert_eq!(ledger.accounts[&a].waiting(), 0, "the budget is spent");

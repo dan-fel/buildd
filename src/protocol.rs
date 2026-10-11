@@ -343,7 +343,8 @@ pub struct RunningBuild {
     pub fresh: u64,
     /// Nobody waits for it any more; it is being stopped.
     pub cancelled: bool,
-    /// Jobs of the budget it is charged now.
+    /// Jobs of the budget it uses now: Cargo's own and the tokens its
+    /// processes took, and at least the tests' share while its tests run.
     #[serde(default)]
     pub tokens: usize,
     pub phase: Phase,

@@ -1537,7 +1537,7 @@ impl<D: Distance> Scheduler<D> {
     }
 
     /// The slots and the queue, next build first, with the jobs each running
-    /// build is charged as `tokens` says.
+    /// build uses as `tokens` says.
     pub(crate) fn status(
         &self,
         tokens: impl Fn(JobId) -> usize,
