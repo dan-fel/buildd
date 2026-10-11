@@ -66,6 +66,10 @@ pub(crate) const MEASURE_DUE: u32 = 8;
 /// What builds used this recently is in use: evicting it means the budget
 /// or free disk is below what builds use.
 const IN_USE: Duration = Duration::from_secs(10 * 60);
+/// How many compilations a slot remembers what their latest build used,
+/// the most recently run ones: agents run many one-off selections, and a
+/// slot's record is written after every build.
+const KEPT_COMPILATIONS: usize = 256;
 /// How much an earlier build weighs in [`CompileCost`] each time a new one
 /// is added: about the last hundred count.
 const COMPILE_COST_DECAY: f64 = 0.99;
@@ -325,6 +329,12 @@ impl Slot {
                 build_ms: succeeded.then_some(build_ms),
                 peak_memory,
             }),
+        }
+        while self.compilations.len() > KEPT_COMPILATIONS {
+            let oldest = (0..self.compilations.len())
+                .min_by_key(|index| self.compilations[*index].at)
+                .expect("more than none are kept");
+            self.compilations.remove(oldest);
         }
     }
 
@@ -2686,6 +2696,38 @@ mod tests {
             7
         );
         assert_eq!(build(3, "a3", &all[..4], 0), 4);
+    }
+
+    #[test]
+    fn a_slot_remembers_the_compilations_run_most_recently() {
+        let mut scheduler = scheduler(1);
+        for build in 0..=KEPT_COMPILATIONS {
+            let args = ["-p".to_owned(), format!("crate-{build}")];
+            let effects = submit_operation(
+                &mut scheduler,
+                build as u64,
+                "/a",
+                "a1",
+                Command::Check,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let [(job, ..)] = starts(&effects)[..] else {
+                panic!("{effects:?}");
+            };
+            used(&mut scheduler, job, &units("a", 1));
+            let ended = scheduler.exited(job, &ok(), None, BuildReport::default());
+            if !measures(&ended).is_empty() {
+                scheduler.measured(SlotKey(0), Ok(inventory(&units("a", 1), 1)));
+            }
+        }
+        let compilations = &scheduler.slots[0].compilations;
+        assert_eq!(compilations.len(), KEPT_COMPILATIONS);
+        assert!(
+            !compilations
+                .iter()
+                .any(|run| run.compilation.args == ["-p", "crate-0"]),
+            "the first, run longest ago, is forgotten"
+        );
     }
 
     #[test]
