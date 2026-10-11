@@ -1216,6 +1216,10 @@ impl<D: Distance> Scheduler<D> {
             .jobs
             .values()
             .any(|job| job.queued() && !job.optional());
+        // Why a build waits for memory is found again in each pass.
+        for job in self.jobs.values_mut().filter(|job| job.queued()) {
+            job.memory_needed = None;
+        }
         for id in self.queue_order() {
             let busy = self.slots.iter().filter(|slot| slot.busy()).count();
             if busy >= self.capacity {
@@ -2475,6 +2479,22 @@ mod tests {
         assert_eq!(scheduler.memory(), (10, 4));
         let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert_eq!(starts(&next).len(), 1, "the test runs alone: {next:?}");
+        let (_, queue) = scheduler.status(|_| 0);
+        assert_eq!(queue[0].memory_needed, Some(4), "{queue:?}");
+        // With memory to spare and every slot busy, it waits for a slot.
+        scheduler.memory = 100;
+        let idle = scheduler
+            .slots
+            .iter()
+            .position(|slot| !slot.busy())
+            .unwrap();
+        scheduler.slots[idle].chore = Some(Chore::Measuring);
+        submit_optional(&mut scheduler, 6, "/p", "p1");
+        let (_, queue) = scheduler.status(|_| 0);
+        assert!(
+            queue.iter().all(|build| build.memory_needed.is_none()),
+            "{queue:?}"
+        );
     }
 
     #[test]
