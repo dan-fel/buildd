@@ -26,8 +26,9 @@
 //!   the same directory used. It waits for a busy slot while one is idle
 //!   only when that is expected to be faster: the busy slot's build ends
 //!   (its compilation's last wall time) and the build compiles its share
-//!   there sooner than the idle slot compiles its share cold, units costing
-//!   what they cost lately. Without estimates it never waits.
+//!   there sooner than the idle slot compiles its share cold, as recent
+//!   builds' wall times grew with the units they compiled. Without
+//!   estimates it never waits.
 //! - **Queue order.** The shortest expected build first, less the time it
 //!   has waited, so short builds go ahead of long ones and a long one goes
 //!   once it has waited its own length.
@@ -65,8 +66,9 @@ pub(crate) const MEASURE_DUE: u32 = 8;
 /// What builds used this recently is in use: evicting it means the budget
 /// or free disk is below what builds use.
 const IN_USE: Duration = Duration::from_secs(10 * 60);
-/// A build that compiled at least this many units tells what one costs.
-const UNIT_COST_SAMPLE: u64 = 5;
+/// How much an earlier build weighs in [`CompileCost`] each time a new one
+/// is added: about the last hundred count.
+const COMPILE_COST_DECAY: f64 = 0.99;
 
 /// How far apart two trees of a repository are, as the work Cargo redoes
 /// when a slot holding one is checked out to the other.
@@ -349,6 +351,69 @@ impl Slot {
     }
 }
 
+/// How a repository's compile time grows with the units a build compiles:
+/// a fixed part (starting Cargo, checking what is fresh, linking) and a part
+/// per unit, fitted by least squares over its builds, earlier ones weighing
+/// less. Cargo compiles units side by side, so one more unit costs far less
+/// than a build's wall time divided by its units: in one workspace, about
+/// 0.2 s against a 0.8 s average.
+#[derive(Debug, Default)]
+struct CompileCost {
+    /// Weighted sums over the builds: of the weights, units, wall times in
+    /// milliseconds, units squared, and units times wall time.
+    weight: f64,
+    units: f64,
+    ms: f64,
+    units_squared: f64,
+    units_ms: f64,
+}
+
+impl CompileCost {
+    /// A build compiled `units` units in `ms` milliseconds of wall time.
+    fn add(&mut self, units: u64, ms: u64) {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "counts and times far below 2^52"
+        )]
+        let (units, ms) = (units as f64, ms as f64);
+        for sum in [
+            &mut self.weight,
+            &mut self.units,
+            &mut self.ms,
+            &mut self.units_squared,
+            &mut self.units_ms,
+        ] {
+            *sum *= COMPILE_COST_DECAY;
+        }
+        self.weight += 1.0;
+        self.units += units;
+        self.ms += ms;
+        self.units_squared += units * units;
+        self.units_ms += units * ms;
+    }
+
+    /// The wall time compiling `units` is expected to take, in milliseconds;
+    /// None until builds that compiled different amounts were seen.
+    fn ms(&self, units: u64) -> Option<u64> {
+        // The units' weighted variance, times the weight squared: below one
+        // unit squared, the builds tell nothing about one more unit.
+        let spread = self.weight * self.units_squared - self.units * self.units;
+        if spread < self.weight * self.weight {
+            return None;
+        }
+        let per_unit = ((self.weight * self.units_ms - self.units * self.ms) / spread).max(0.0);
+        let fixed = ((self.ms - per_unit * self.units) / self.weight).max(0.0);
+        #[expect(clippy::cast_precision_loss, reason = "a unit count far below 2^52")]
+        let units = units as f64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a positive number of milliseconds far below 2^64"
+        )]
+        Some((fixed + per_unit * units).round() as u64)
+    }
+}
+
 /// An eviction under way: the shortage it covers, and the items of each
 /// slot's inventory it removes, by slot index.
 struct Eviction {
@@ -368,9 +433,8 @@ pub(crate) struct Scheduler<D> {
     jobs: BTreeMap<JobId, Job>,
     waiting: HashMap<WaiterId, JobId>,
     slots: Vec<Slot>,
-    /// Per repository, the wall time compiling one unit took lately, in
-    /// milliseconds: a moving average over builds that compiled enough.
-    unit_ms: HashMap<PathBuf, u64>,
+    /// Per repository, how compile time grows with the units compiled.
+    compile_cost: HashMap<PathBuf, CompileCost>,
     /// The eviction under way.
     evicting: Option<Eviction>,
     /// The latest eviction took what builds used in the last ten minutes.
@@ -458,7 +522,7 @@ impl<D: Distance> Scheduler<D> {
             jobs: BTreeMap::new(),
             waiting: HashMap::new(),
             slots: Vec::new(),
-            unit_ms: HashMap::new(),
+            compile_cost: HashMap::new(),
             evicting: None,
             undersized: false,
         }
@@ -816,12 +880,14 @@ impl<D: Distance> Scheduler<D> {
         entry.job = None;
         entry.unmeasured += 1;
         entry.idle_since = Instant::now();
-        // What compiling one unit costs here, for weighing cold builds.
-        let compile_ms = build_ms - test_ms.unwrap_or(0).min(build_ms);
-        if job.compiled >= UNIT_COST_SAMPLE {
-            let sample = compile_ms / job.compiled;
-            let cost = self.unit_ms.entry(job.repository.clone()).or_insert(sample);
-            *cost = (*cost * 3 + sample) / 4;
+        // How compile time grows with units here, for weighing cold builds.
+        // A cancelled or killed build's time says nothing.
+        if let Outcome::Exited { .. } = outcome {
+            let compile_ms = build_ms - test_ms.unwrap_or(0).min(build_ms);
+            self.compile_cost
+                .entry(job.repository.clone())
+                .or_default()
+                .add(job.compiled, compile_ms);
         }
         let entry = &mut self.slots[slot];
         entry.last = Some(LastBuild {
@@ -1409,8 +1475,8 @@ impl<D: Distance> Scheduler<D> {
         if job.optional() {
             return None;
         }
-        let unit_ms = *self.unit_ms.get(&job.repository)?;
-        let cold_ms = work.saturating_mul(unit_ms);
+        let cost = self.compile_cost.get(&job.repository)?;
+        let cold_ms = cost.ms(work)?;
         let mut best: Option<(Hold, usize)> = None;
         for (index, slot) in self.slots.iter().enumerate() {
             let Some(running) = slot.job.filter(|_| slot.repository == job.repository) else {
@@ -1438,7 +1504,7 @@ impl<D: Distance> Scheduler<D> {
             let wait_ms = expected
                 .saturating_sub(elapsed)
                 .saturating_add(claimed.get(&index).copied().unwrap_or(0))
-                .saturating_add(missing.saturating_add(distance).saturating_mul(unit_ms));
+                .saturating_add(cost.ms(missing.saturating_add(distance))?);
             if wait_ms < cold_ms && best.as_ref().is_none_or(|(best, _)| wait_ms < best.wait_ms) {
                 let hold = Hold {
                     slot: slot_name(&slot.repository, slot.index),
@@ -2247,7 +2313,12 @@ mod tests {
         // Compiling a unit takes a second: slot 0 lacks 12 units and is 10
         // packages away, 22 s cold; slot 1 ends in about 5 s and is 10
         // packages away, 15 s.
-        scheduler.unit_ms.insert("/repo/.git".into(), 1000);
+        let cost = scheduler
+            .compile_cost
+            .entry("/repo/.git".into())
+            .or_default();
+        cost.add(10, 10_000);
+        cost.add(20, 20_000);
         let held = submit_operation(&mut scheduler, 4, "/c", "c1", Command::Test, &[]);
         assert!(starts(&held).is_empty(), "{held:?}");
         assert!(matches!(
@@ -2288,6 +2359,45 @@ mod tests {
         assert!(matches!(starts(&third)[..], [(_, 0, _)]), "{third:?}");
         let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert!(matches!(starts(&next)[..], [(_, 1, _)]), "{next:?}");
+    }
+
+    #[test]
+    fn compile_cost_is_what_one_more_unit_adds_not_the_average() {
+        let mut cost = CompileCost::default();
+        cost.add(10, 22_000);
+        assert_eq!(cost.ms(10), None, "one size of build tells nothing more");
+        // 20 s to start, check what is fresh and link, then 0.2 s a unit:
+        // averaged per unit, the small builds would say 4.4 s.
+        for units in [5, 40, 120, 400] {
+            cost.add(units, 20_000 + 200 * units);
+        }
+        assert_eq!(cost.ms(0), Some(20_000));
+        assert_eq!(cost.ms(400), Some(100_000));
+        // Bigger builds that were not slower cost nothing more per unit.
+        let mut flat = CompileCost::default();
+        flat.add(10, 30_000);
+        flat.add(100, 20_000);
+        assert_eq!(flat.ms(1_000), flat.ms(0));
+    }
+
+    #[test]
+    fn a_build_starts_cold_when_waiting_costs_more_than_its_missing_units() {
+        let mut scheduler = checked_and_tested();
+        scheduler.slots[1].compilations[0].build_ms = Some(5000);
+        let running = submit_operation(&mut scheduler, 3, "/b", "b2", Command::Test, &[]);
+        let [(_, 1, _)] = starts(&running)[..] else {
+            panic!("{running:?}");
+        };
+        // 20 s fixed and 0.2 s a unit: 22 units cold in slot 0 take 24.4 s,
+        // slot 1 ends in about 5 s and then takes 22 s for its 10.
+        let cost = scheduler
+            .compile_cost
+            .entry("/repo/.git".into())
+            .or_default();
+        cost.add(10, 22_000);
+        cost.add(100, 40_000);
+        let cold = submit_operation(&mut scheduler, 4, "/c", "c1", Command::Test, &[]);
+        assert!(matches!(starts(&cold)[..], [(_, 0, _)]), "{cold:?}");
     }
 
     #[test]
