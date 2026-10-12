@@ -26,7 +26,8 @@ usage:
                            JSON on standard output instead
         --copy-to DIR      after a successful build, copy the executables
                            Cargo produced, with their debug information,
-                           into DIR
+                           into DIR on the machine that builds: with --os,
+                           the remote host, and DIR must be absolute
         --rustflags FLAGS  pass FLAGS to every rustc, as RUSTFLAGS would
         --rerun-all        nextest: also run test binaries that are unchanged
                            since they passed (they are skipped otherwise)
@@ -121,7 +122,9 @@ struct Options {
 
 impl Options {
     /// Takes the options off the front of `args`, leaving Cargo's
-    /// arguments; a relative directory is taken relative to `directory`.
+    /// arguments. A relative directory to copy to is taken relative to
+    /// `directory`, except with `--os`: it names a directory on the machine
+    /// that builds, which may be another one.
     fn take(args: &mut Vec<String>, directory: &Path) -> Result<Self, String> {
         let mut options = Self::default();
         let mut taken = 0;
@@ -145,7 +148,7 @@ impl Options {
             match name {
                 "--json" if inline.is_none() => options.json = true,
                 "--rerun-all" if inline.is_none() => options.rerun_all = true,
-                "--copy-to" => options.copy_to = Some(directory.join(value(&mut taken)?)),
+                "--copy-to" => options.copy_to = Some(value(&mut taken)?.into()),
                 "--os" => options.os = Some(value(&mut taken)?),
                 "--rustflags" => {
                     options.rustflags = value(&mut taken)?
@@ -158,6 +161,16 @@ impl Options {
             taken += 1;
         }
         args.drain(..taken);
+        if let Some(copy_to) = options.copy_to.take() {
+            if copy_to.is_relative() && options.os.is_some() {
+                return Err(format!(
+                    "with --os, --copy-to names a directory on the machine that builds: \
+                     give it as an absolute path, not {}",
+                    copy_to.display()
+                ));
+            }
+            options.copy_to = Some(directory.join(copy_to));
+        }
         let misplaced = args
             .iter()
             .take_while(|argument| *argument != "--")
@@ -634,5 +647,28 @@ mod tests {
                 .unwrap_err()
                 .contains("needs a value")
         );
+    }
+
+    #[test]
+    fn with_os_the_directory_to_copy_to_is_on_the_building_machine_and_absolute() {
+        let (options, _) = take(&["--copy-to", "/srv/bin", "--os", "linux", "-p", "x"]);
+        assert_eq!(
+            options.unwrap(),
+            Options {
+                copy_to: Some("/srv/bin".into()),
+                os: Some("linux".into()),
+                ..Options::default()
+            }
+        );
+        for relative in [
+            &["--copy-to", "bin", "--os", "linux"][..],
+            &["--os=linux", "--copy-to=bin"],
+        ] {
+            let (refused, _) = take(relative);
+            assert!(
+                refused.unwrap_err().contains("absolute path"),
+                "{relative:?}"
+            );
+        }
     }
 }

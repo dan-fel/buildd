@@ -454,6 +454,9 @@ impl Connection {
         request: RevisionRequest,
     ) {
         let prepared = request.operation.validate().and_then(|()| {
+            if let Some(directory) = &request.copy_to {
+                copy_destination_here(directory, &self.home)?;
+            }
             let repository = existing_mirror(&self.home, &request.project)?;
             if request.prefix.is_absolute()
                 || request
@@ -494,7 +497,7 @@ impl Connection {
             revision: request.revision,
             operation: request.operation,
             label: request.label,
-            copy_to: None,
+            copy_to: request.copy_to,
             rerun_all: request.rerun_all,
             optional: request.optional,
         };
@@ -512,8 +515,8 @@ impl Connection {
         let os = request.os.clone().expect("only builds for an OS go remote");
         let prepared = request.operation.validate().and_then(|()| {
             let remote = self.remote_for(&os)?;
-            if request.copy_to.is_some() {
-                return Err("--copy-to builds on this machine only".into());
+            if let Some(directory) = &request.copy_to {
+                copy_destination(directory)?;
             }
             let source = snapshot::resolve(&request.directory)?;
             let revision = source.snapshot(&self.home.join("tmp"))?;
@@ -539,6 +542,7 @@ impl Connection {
             prefix: source.prefix.clone(),
             operation: request.operation,
             label,
+            copy_to: request.copy_to,
             rerun_all: request.rerun_all,
             optional: request.optional,
         };
@@ -587,14 +591,8 @@ impl Connection {
     fn build(self, mut stream: UnixStream, reader: BufReader<UnixStream>, request: BuildRequest) {
         let copy_to = request.copy_to;
         let prepared = request.operation.validate().and_then(|()| {
-            if let Some(directory) = copy_to
-                .as_ref()
-                .filter(|directory| !directory.is_absolute())
-            {
-                return Err(format!(
-                    "the directory to copy to must be absolute: {}",
-                    directory.display()
-                ));
+            if let Some(directory) = &copy_to {
+                copy_destination_here(directory, &self.home)?;
             }
             let source = snapshot::resolve(&request.directory)?;
             let revision = source.snapshot(&self.home.join("tmp"))?;
@@ -667,6 +665,37 @@ impl Connection {
         }
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
+}
+
+/// Checks a directory a request names to copy products into: an absolute
+/// path without `..`, which means the same on every machine.
+fn copy_destination(directory: &Path) -> Result<(), String> {
+    if !directory.is_absolute()
+        || directory
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "the directory to copy to must be absolute, without `..`: {}",
+            directory.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a directory on this machine to copy products into, as
+/// [`copy_destination`] does, and that it is outside buildd's `home`, whose
+/// slots no copy may write into.
+fn copy_destination_here(directory: &Path, home: &Path) -> Result<(), String> {
+    copy_destination(directory)?;
+    if directory.starts_with(home) {
+        return Err(format!(
+            "the directory to copy to is inside buildd's home {}: {}",
+            home.display(),
+            directory.display()
+        ));
+    }
+    Ok(())
 }
 
 /// How many pushed trees a mirror keeps referenced, newest first: enough for
@@ -1715,6 +1744,26 @@ mod tests {
                     .is_some_and(|extension| extension == "pack")
             })
             .count()
+    }
+
+    #[test]
+    fn products_are_copied_only_to_absolute_directories_outside_the_home() {
+        let home = Path::new("/srv/buildd");
+        assert_eq!(copy_destination_here(Path::new("/srv/bin"), home), Ok(()));
+        for refused in [
+            "bin",
+            "./bin",
+            "/srv/out/../buildd/slots",
+            "/srv/buildd/slots/x/0/target",
+        ] {
+            assert!(
+                copy_destination_here(Path::new(refused), home).is_err(),
+                "{refused}"
+            );
+        }
+        // Another machine's home is that machine's to check.
+        assert_eq!(copy_destination(Path::new("/srv/buildd/out")), Ok(()));
+        assert!(copy_destination(Path::new("out")).is_err());
     }
 
     #[test]

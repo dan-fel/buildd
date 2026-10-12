@@ -232,6 +232,12 @@ command = "bash -lc 'buildd serve'"   # login shell: same tools as a terminal
 
 - The caller names the OS. buildd never picks one itself, since results
   differ by OS. A request for an OS no host builds for is rejected.
+- Products stay on the machine that built them. With `--os`, `--copy-to DIR`
+  names a directory on the remote host, so a script there uses exactly the
+  binaries buildd built for the tree; `DIR` must be absolute, without `..`,
+  and outside that host's buildd home. As here, they are copied out of the
+  slot after success: the slot's target is never shared or pointed
+  elsewhere.
 - The remote daemon is an ordinary daemon and knows nothing about who uses
   it.
 - `buildd drain` stops a daemon taking new builds (for example during a
@@ -270,7 +276,7 @@ buildd's own options come before Cargo's arguments:
 | option | effect |
 |---|---|
 | `--os OS` | build on a remote host for that OS |
-| `--copy-to DIR` | after success, copy the built executables (and `.dSYM`) into `DIR` |
+| `--copy-to DIR` | after success, copy the built executables (and `.dSYM`) into `DIR` on the machine that builds (see Remote hosts) |
 | `--rustflags FLAGS` | flags for every rustc (like `RUSTFLAGS`); part of the build's identity |
 | `--json` | print every daemon message as a JSON line, for programs |
 | `--rerun-all` | `nextest`: also run binaries that would be skipped |

@@ -122,7 +122,8 @@ pub struct BuildRequest {
     /// worktree's folder name when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// An absolute directory to copy the executables Cargo produced into,
+    /// An absolute directory on the machine that builds (this one, or the
+    /// remote host for `os`) to copy the executables Cargo produced into,
     /// with their debug information, once the build succeeds. Requests that
     /// copy elsewhere are different builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +158,9 @@ pub struct RevisionRequest {
     pub operation: Operation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// An absolute directory on this machine, as [`BuildRequest::copy_to`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_to: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rerun_all: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

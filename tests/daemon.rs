@@ -649,16 +649,71 @@ impl Daemon {
 
     /// Builds and collects every message.
     fn build(&self, directory: &Path, command: Command, args: &[&str]) -> Vec<Message> {
+        self.submit(request(directory, command, args))
+    }
+
+    /// Sends `request` and collects every message.
+    fn submit(&self, request: BuildRequest) -> Vec<Message> {
         let mut messages = Vec::new();
-        client::build(
-            self.connect(),
-            request(directory, command, args),
-            |message| {
-                messages.push(message.clone());
-            },
-        )
+        client::build(self.connect(), request, |message| {
+            messages.push(message.clone());
+        })
         .unwrap();
         messages
+    }
+}
+
+/// A daemon and the remote host it builds on for another OS: a second
+/// daemon on this machine, reached through an `ssh` that runs the remote
+/// command here.
+struct RemoteHost {
+    local: Daemon,
+    remote: Daemon,
+    /// The OS the remote host builds for, as requests name it.
+    os: &'static str,
+    _commands: TempDir,
+}
+
+impl RemoteHost {
+    fn start() -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let remote = Daemon::start(1);
+        let commands = TempDir::new();
+        let ssh = commands.0.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut paths = vec![commands.0.clone()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let path = std::env::join_paths(paths).unwrap();
+        let os = if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        };
+        let serve = format!(
+            "BUILDD_HOME='{}' '{}' serve",
+            remote.home.0.display(),
+            env!("CARGO_BIN_EXE_buildd")
+        );
+        let local = Daemon::configured_path(
+            &format!(
+                "slots = 1\njobs = 4\nmin_free_gib = 0\n\n[[remote]]\nname = \"far\"\n\
+                 ssh = \"fixture\"\nos = {os:?}\ncommand = {}\n",
+                serde_json::to_string(&serve).unwrap()
+            ),
+            Some(&path),
+        );
+        Self {
+            local,
+            remote,
+            os,
+            _commands: commands,
+        }
     }
 }
 
@@ -833,14 +888,7 @@ fn executables_are_copied_out_and_rustflags_reach_the_compiler() {
     let out = TempDir::new();
     let mut request = request(&repository.0, Command::Build, &["--bins"]);
     request.copy_to = Some(out.0.join("bin"));
-    let build = |request: BuildRequest| {
-        let mut messages = Vec::new();
-        client::build(daemon.connect(), request, |message| {
-            messages.push(message.clone());
-        })
-        .unwrap();
-        messages
-    };
+    let build = |request: BuildRequest| daemon.submit(request);
 
     let refused = build(request.clone());
     assert_eq!(outcome(&refused), &Outcome::Exited { code: 101 });
@@ -871,6 +919,55 @@ fn executables_are_copied_out_and_rustflags_reach_the_compiler() {
             .success(),
         "the copy runs"
     );
+}
+
+#[test]
+fn a_remote_build_copies_its_executables_on_the_machine_that_built_them() {
+    let host = RemoteHost::start();
+    let repository = crate_repository(None);
+    std::fs::create_dir(repository.0.join("src/bin")).unwrap();
+    std::fs::write(repository.0.join("src/bin/tool.rs"), "fn main() {}\n").unwrap();
+    let mut request = request(&repository.0, Command::Build, &["--bins"]);
+    request.os = Some(host.os.into());
+    request.copy_to = Some("bin".into());
+    let relative = host.local.submit(request.clone());
+    assert!(
+        matches!(&relative[..], [Message::Rejected { reason }] if reason.contains("absolute")),
+        "{relative:#?}"
+    );
+    request.copy_to = Some(host.remote.home.0.join("bin"));
+    let into_home = host.local.submit(request.clone());
+    assert!(
+        matches!(&into_home[..], [.., Message::Rejected { reason }] if reason.contains("buildd's home")),
+        "the remote daemon refuses its own home: {into_home:#?}"
+    );
+
+    // Here, the remote machine's directory is this machine's too.
+    let out = TempDir::new();
+    request.copy_to = Some(out.0.join("bin"));
+    let built = host.local.submit(request);
+    assert!(outcome(&built).success(), "{built:#?}");
+    assert!(
+        built.iter().any(
+            |message| matches!(message, Message::Started { slot, .. } if slot.starts_with("far:"))
+        ),
+        "{built:#?}"
+    );
+    let copied = built
+        .iter()
+        .filter_map(|message| match message {
+            Message::Copied { artifact } => {
+                Some(serde_json::from_str::<serde_json::Value>(artifact).unwrap())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let copy = out.0.join("bin/tool");
+    assert_eq!(copied.len(), 1, "{built:#?}");
+    assert_eq!(copied[0]["executable"], copy.to_str().unwrap());
+    assert!(Process::new(&copy).status().unwrap().success());
+    assert!(host.local.status().slots.is_empty(), "built remotely only");
+    assert_eq!(host.remote.status().slots.len(), 1);
 }
 
 #[test]
@@ -1147,6 +1244,7 @@ fn a_tree_pushed_into_a_mirror_builds_like_a_worktree_and_drain_stops_new_builds
                 rustflags: Vec::new(),
             },
             label: Some("remote".into()),
+            copy_to: None,
             rerun_all: false,
             optional: false,
         });
