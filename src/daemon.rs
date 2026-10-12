@@ -1395,7 +1395,7 @@ impl Building {
             });
         }
         let outcome = match &self.start.copy_to {
-            Some(directory) if step.success() => self.copy(&products, directory).unwrap_or(step),
+            Some(directory) if step.success() => self.copy(&products, directory),
             _ => step,
         };
         (outcome, Some(usage))
@@ -1565,18 +1565,21 @@ impl Building {
 
     /// Copies `products` into `directory` and tells the build's waiters
     /// where they went; how the build failed when copying did.
-    fn copy(&self, products: &[Product], directory: &Path) -> Result<Outcome, Outcome> {
+    fn copy(&self, products: &[Product], directory: &Path) -> Outcome {
         let job = self.start.job;
         let _ = self.events.send(Event::Copying { job });
-        let messages =
-            products::copy(products, directory).map_err(|reason| Outcome::Failed { reason })?;
-        for artifact in messages {
-            let _ = self.events.send(Event::Output {
-                job,
-                message: Message::Copied { artifact },
-            });
+        match products::copy(products, directory) {
+            Ok(messages) => {
+                for artifact in messages {
+                    let _ = self.events.send(Event::Output {
+                        job,
+                        message: Message::Copied { artifact },
+                    });
+                }
+                Outcome::Exited { code: 0 }
+            }
+            Err(reason) => Outcome::Failed { reason },
         }
-        Ok(Outcome::Exited { code: 0 })
     }
 
     /// Sends each line of `output` to the scheduler on a thread of its own:

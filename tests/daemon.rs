@@ -895,6 +895,15 @@ fn executables_are_copied_out_and_rustflags_reach_the_compiler() {
     assert!(!out.0.join("bin").exists(), "a failed build copies nothing");
 
     request.operation.rustflags = vec!["--cfg".into(), "buildd_flag".into()];
+    // Copying fails under a file: the build fails although Cargo succeeded.
+    std::fs::write(out.0.join("file"), "").unwrap();
+    let mut blocked = request.clone();
+    blocked.copy_to = Some(out.0.join("file/bin"));
+    let not_copied = build(blocked);
+    assert!(
+        matches!(outcome(&not_copied), Outcome::Failed { reason } if reason.contains("could not create")),
+        "{not_copied:#?}"
+    );
     let built = build(request);
     assert!(outcome(&built).success(), "{built:#?}");
     let copy = out.0.join("bin/tool");
