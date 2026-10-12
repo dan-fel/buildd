@@ -49,6 +49,7 @@ fn build_kind(operation: &Operation) -> &'static str {
             "workspace tests"
         }
         Command::Test | Command::Nextest => "scoped tests",
+        Command::Run => "commands",
     }
 }
 

@@ -1,4 +1,5 @@
-//! The Cargo commands buildd runs and how it runs them in a slot.
+//! What a build runs: Cargo's subcommands, and how buildd runs them in a
+//! slot, or `run`, a command of the client's own.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 
-/// A Cargo subcommand buildd runs.
+/// What a build runs: a Cargo subcommand, or a command of the client's own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -17,16 +18,20 @@ pub enum Command {
     /// `cargo nextest run`: the tests `test` compiles, each in a process of
     /// its own, `test_jobs` at a time.
     Nextest,
+    /// Not Cargo: the program and arguments the operation's `args` name,
+    /// run in the slot's checkout of the snapshot.
+    Run,
 }
 
 impl Command {
     /// Every command, in the order usage lists them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Check,
         Self::Clippy,
         Self::Build,
         Self::Test,
         Self::Nextest,
+        Self::Run,
     ];
 
     /// The subcommand's name.
@@ -38,7 +43,14 @@ impl Command {
             Self::Build => "build",
             Self::Test => "test",
             Self::Nextest => "nextest",
+            Self::Run => "run",
         }
+    }
+
+    /// Whether Cargo runs it, in the slot's target.
+    #[must_use]
+    pub fn uses_cargo(self) -> bool {
+        self != Self::Run
     }
 
     /// Whether it runs tests once compilation finishes.
@@ -100,7 +112,7 @@ impl Compilation {
         let (command, args) = match operation.command {
             Command::Test => (Command::Test, test_compilation_args(&operation.args, false)),
             Command::Nextest => (Command::Test, test_compilation_args(&operation.args, true)),
-            Command::Check | Command::Clippy | Command::Build => {
+            Command::Check | Command::Clippy | Command::Build | Command::Run => {
                 (operation.command, operation.args.clone())
             }
         };
@@ -194,8 +206,9 @@ fn test_compilation_args(args: &[String], nextest: bool) -> Vec<String> {
     compiled
 }
 
-/// A Cargo command and its arguments as the client gave them. Two equal
-/// operations on one revision are one build.
+/// A command and its arguments as the client gave them: Cargo's arguments,
+/// or for `run`, the program and its arguments. Two equal operations on one
+/// revision are one build.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct Operation {
     pub command: Command,
@@ -210,10 +223,20 @@ impl Operation {
     /// Checks that the arguments leave the slot's target directory,
     /// checkout, output format and parallelism to buildd. Arguments after
     /// `--` belong to rustc, Clippy or the test harness and are not checked.
+    /// A `run` names a program, and has no rustc to pass flags to.
     ///
     /// # Errors
-    /// Names the first reserved argument.
+    /// Names the first reserved argument, or what a `run` lacks.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.command.uses_cargo() {
+            if self.args.first().is_none_or(String::is_empty) {
+                return Err("run needs a command to run".into());
+            }
+            if !self.rustflags.is_empty() {
+                return Err("run compiles nothing: it takes no rustc flags".into());
+            }
+            return Ok(());
+        }
         for argument in self.args.iter().take_while(|argument| *argument != "--") {
             let reserved = RESERVED_OPTIONS.iter().any(|option| {
                 argument == option
@@ -358,6 +381,7 @@ pub(crate) fn command(
         Command::Check | Command::Clippy | Command::Build | Command::Test => command
             .arg(operation.command.as_str())
             .arg("--message-format=json"),
+        Command::Run => panic!("a command of the client's own runs without Cargo"),
     };
     if operation.command == Command::Test {
         command.env("RUST_TEST_THREADS", test_jobs.to_string());
@@ -659,6 +683,31 @@ mod tests {
         for command in Command::ALL {
             assert_eq!(Command::parse(command.as_str()), Some(command));
         }
-        assert_eq!(Command::parse("run"), None);
+        assert_eq!(Command::parse("bench"), None);
+    }
+
+    #[test]
+    fn a_run_names_a_program_and_its_arguments_are_its_own() {
+        let run = |args: &[&str]| Operation {
+            command: Command::Run,
+            ..operation(args)
+        };
+        // Its arguments are the program's, Cargo's options included.
+        assert_eq!(
+            run(&["make", "--jobs=4", "--target-dir", "-C", "x"]).validate(),
+            Ok(())
+        );
+        assert!(run(&[]).validate().is_err());
+        assert!(run(&[""]).validate().is_err());
+        let mut flagged = run(&["make"]);
+        flagged.rustflags = vec!["--cfg".into(), "x".into()];
+        assert!(flagged.validate().is_err());
+        // Its identity is all of its arguments.
+        assert_ne!(
+            Compilation::new(Path::new(""), &run(&["make", "a"])),
+            Compilation::new(Path::new(""), &run(&["make", "b"]))
+        );
+        assert_eq!(run(&["make", "-j"]).to_string(), "run make -j");
+        assert_eq!(run(&["make"]).merged(&run(&["make", "x"])), None);
     }
 }

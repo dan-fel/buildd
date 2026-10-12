@@ -32,6 +32,7 @@ mod prewarm;
 mod products;
 pub mod protocol;
 mod remote;
+mod run;
 mod scheduler;
 mod slot;
 pub mod snapshot;

@@ -33,6 +33,18 @@ usage:
                            since they passed (they are skipped otherwise)
         --os OS            build on OS (linux, macos): on the remote host
                            config.toml names for it when it is not this one
+  buildd run [--json] [--copy-to DIR] [--os OS] -- COMMAND [ARGS...]
+      Run COMMAND, not Cargo, on the same snapshot of this worktree a build
+      would compile, in a build slot, queued and cancelled like builds, and
+      exit with its status. It runs in the slot's checkout, in the
+      directory matching this one; COMMAND with a `/` is a path from there,
+      a bare name is looked up in the daemon's PATH. It gets the daemon's
+      environment plus BUILDD_TREE (the tree id), BUILDD_JOBS (the cores it
+      may keep busy), BUILDD_OUT (an empty directory for its outputs) and,
+      for Cargo it starts, CARGO_TARGET_DIR (a target of its own, deleted
+      afterwards; never the slot's) and CARGO_BUILD_JOBS. With --copy-to,
+      what it left in BUILDD_OUT is moved into DIR on the machine that ran
+      it once it succeeds. Withdrawing it stops its whole process group.
   buildd status
       Show the build slots and the queue.
   buildd failures [--hours N] [--os OS]
@@ -193,6 +205,9 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
     let directory = std::env::current_dir()
         .map_err(|error| format!("could not read the current directory: {error}"))?;
     let options = Options::take(&mut args, &directory)?;
+    if command == Command::Run {
+        args = run_arguments(&options, args)?;
+    }
     let request = BuildRequest {
         directory,
         operation: Operation {
@@ -216,7 +231,7 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
             );
         })?
     } else {
-        client::build(connect(home)?, request, render)?
+        client::build(connect(home)?, request, |message| render(message, command))?
     };
     Ok(match last {
         Message::Finished {
@@ -236,6 +251,20 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
     })
 }
 
+/// The program and arguments of `buildd run`, from what follows its
+/// options: `-- COMMAND [ARGS...]`.
+fn run_arguments(options: &Options, args: Vec<String>) -> Result<Vec<String>, String> {
+    if !options.rustflags.is_empty() || options.rerun_all {
+        return Err("run compiles and tests nothing: it takes --json, --copy-to and --os".into());
+    }
+    match args.split_first() {
+        Some((separator, command)) if separator == "--" && !command.is_empty() => {
+            Ok(command.to_vec())
+        }
+        _ => Err("usage: buildd run [OPTIONS] -- COMMAND [ARGS...]".into()),
+    }
+}
+
 /// A line of Cargo's JSON output.
 #[derive(Deserialize)]
 struct CargoMessage {
@@ -248,14 +277,21 @@ struct Diagnostic {
     rendered: Option<String>,
 }
 
-/// Prints a message the way Cargo would have: diagnostics and Cargo's own
-/// lines to standard error, test output to standard output.
-fn render(message: &Message) {
+/// Prints a message of a build of `command` the way Cargo would have:
+/// diagnostics and Cargo's own lines to standard error, test output to
+/// standard output. A command of the client's own prints as it would alone.
+fn render(message: &Message, command: Command) {
     match message {
         Message::Queued { revision } => eprintln!("buildd: tree {} queued", revision.short()),
         Message::Started { revision, slot } => {
-            eprintln!("buildd: building tree {} in slot {slot}", revision.short());
+            let doing = if command.uses_cargo() {
+                "building"
+            } else {
+                "running on"
+            };
+            eprintln!("buildd: {doing} tree {} in slot {slot}", revision.short());
         }
+        Message::Stdout { line } if !command.uses_cargo() => println!("{line}"),
         Message::Stdout { line } => match serde_json::from_str::<CargoMessage>(line) {
             Ok(cargo) => {
                 if cargo.reason == "compiler-message"
@@ -273,6 +309,7 @@ fn render(message: &Message) {
                 .and_then(|artifact| artifact["executable"].as_str().map(str::to_owned));
             eprintln!("buildd: copied {}", copy.as_deref().unwrap_or(artifact));
         }
+        Message::Delivered { path } => eprintln!("buildd: delivered {}", path.display()),
         Message::Finished {
             revision,
             outcome,
@@ -646,6 +683,38 @@ mod tests {
                 .0
                 .unwrap_err()
                 .contains("needs a value")
+        );
+    }
+
+    #[test]
+    fn run_takes_its_command_after_the_separator() {
+        let (options, rest) = take(&["--os", "linux", "--copy-to=/out", "--", "make", "-j"]);
+        let options = options.unwrap();
+        assert_eq!(run_arguments(&options, rest).unwrap(), ["make", "-j"]);
+        for missing in [&[][..], &["--"], &["make"]] {
+            let (options, rest) = take(missing);
+            assert!(
+                run_arguments(&options.unwrap(), rest)
+                    .unwrap_err()
+                    .contains("usage"),
+                "{missing:?}"
+            );
+        }
+        for compiling in [
+            &["--rustflags=-g", "--", "make"][..],
+            &["--rerun-all", "--", "make"],
+        ] {
+            let (options, rest) = take(compiling);
+            assert!(
+                run_arguments(&options.unwrap(), rest).is_err(),
+                "{compiling:?}"
+            );
+        }
+        // After the separator, buildd's option names are the command's.
+        let (options, rest) = take(&["--", "tool", "--json"]);
+        assert_eq!(
+            run_arguments(&options.unwrap(), rest).unwrap(),
+            ["tool", "--json"]
         );
     }
 

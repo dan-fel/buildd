@@ -979,6 +979,267 @@ fn a_remote_build_copies_its_executables_on_the_machine_that_built_them() {
     assert_eq!(host.remote.status().slots.len(), 1);
 }
 
+/// A request to run `command` in `directory`.
+fn run_request(directory: &Path, command: &[&str]) -> BuildRequest {
+    request(directory, Command::Run, command)
+}
+
+fn lines(messages: &[Message], stdout: bool) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Stdout { line } if stdout => Some(line.clone()),
+            Message::Stderr { line } if !stdout => Some(line.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn delivered(messages: &[Message]) -> Vec<PathBuf> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Delivered { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_command_runs_on_the_worktrees_snapshot_in_a_slot_and_delivers_its_outputs() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    // Uncommitted, as the command sees them.
+    std::fs::write(repository.0.join("note.txt"), "uncommitted note\n").unwrap();
+    let tools = repository.0.join("tools");
+    std::fs::create_dir(&tools).unwrap();
+    let script = tools.join("report.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nset -e\n\
+         echo \"dir $PWD\"\necho \"tree $BUILDD_TREE\"\necho \"jobs $BUILDD_JOBS\"\n\
+         echo \"target $CARGO_TARGET_DIR\"\ncat ../note.txt\necho \"argument $1\"\n\
+         echo image > \"$BUILDD_OUT/disk.img\"\n\
+         mkdir \"$BUILDD_OUT/kernel\"\necho kernel > \"$BUILDD_OUT/kernel/image\"\n\
+         echo stray > stray.txt\necho changed > ../note.txt\necho 'on stderr' >&2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = TempDir::new();
+    let mut request = run_request(&tools, &["./report.sh", "two words"]);
+    request.copy_to = Some(out.0.join("products"));
+    let ran = daemon.submit(request);
+    assert!(outcome(&ran).success(), "{ran:#?}");
+    let tree = started(&ran);
+    git(&repository.0, &["add", "--all"]);
+    assert_eq!(
+        tree,
+        git(&repository.0, &["write-tree"]).trim(),
+        "the snapshot ran"
+    );
+
+    let project = std::fs::read_dir(daemon.home.0.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let checkout = project.join("0/src");
+    let stdout = lines(&ran, true);
+    let target = stdout[3].strip_prefix("target ").unwrap().to_owned();
+    assert_eq!(
+        stdout,
+        [
+            format!("dir {}", checkout.join("tools").display()),
+            format!("tree {tree}"),
+            "jobs 2".to_owned(),
+            format!("target {target}"),
+            "uncommitted note".to_owned(),
+            "argument two words".to_owned(),
+        ]
+    );
+    assert!(
+        Path::new(&target).starts_with(daemon.home.0.join("runs")),
+        "Cargo the command starts has a target of its own: {target}"
+    );
+    assert!(
+        lines(&ran, false).contains(&"on stderr".to_owned()),
+        "{ran:#?}"
+    );
+    assert_eq!(
+        delivered(&ran),
+        [
+            out.0.join("products/disk.img"),
+            out.0.join("products/kernel")
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.0.join("products/kernel/image")).unwrap(),
+        "kernel\n"
+    );
+    // The slot holds the snapshot again, and the command's own directories
+    // are gone.
+    assert!(!checkout.join("tools/stray.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("note.txt")).unwrap(),
+        "uncommitted note\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(daemon.home.0.join("runs"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(
+        !project.join("0/target").exists(),
+        "the slot's target is untouched"
+    );
+
+    // A failing command delivers nothing and its status is the result.
+    let mut request = run_request(
+        &repository.0,
+        &["sh", "-c", "echo partial > \"$BUILDD_OUT/partial\"; exit 3"],
+    );
+    request.copy_to = Some(out.0.join("failed"));
+    let failed = daemon.submit(request);
+    assert_eq!(
+        outcome(&failed),
+        &Outcome::Exited { code: 3 },
+        "{failed:#?}"
+    );
+    assert!(delivered(&failed).is_empty());
+    assert!(!out.0.join("failed").exists());
+
+    let finished = daemon
+        .activity()
+        .events
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::Finished { operation, .. } => Some(operation.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        finished,
+        [
+            "run ./report.sh two words",
+            "run sh -c echo partial > \"$BUILDD_OUT/partial\"; exit 3"
+        ]
+    );
+}
+
+#[test]
+fn commands_without_a_program_or_with_rustc_flags_are_refused() {
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    let empty = daemon.submit(run_request(&repository.0, &[]));
+    assert!(
+        matches!(&empty[..], [Message::Rejected { reason }] if reason.contains("needs a command")),
+        "{empty:#?}"
+    );
+    let mut flagged = run_request(&repository.0, &["true"]);
+    flagged.operation.rustflags = vec!["-g".into()];
+    let flagged = daemon.submit(flagged);
+    assert!(
+        matches!(&flagged[..], [Message::Rejected { reason }] if reason.contains("rustc flags")),
+        "{flagged:#?}"
+    );
+    let mut relative = run_request(&repository.0, &["true"]);
+    relative.copy_to = Some("out".into());
+    let relative = daemon.submit(relative);
+    assert!(
+        matches!(&relative[..], [Message::Rejected { reason }] if reason.contains("absolute")),
+        "{relative:#?}"
+    );
+    let missing = daemon.submit(run_request(&repository.0, &["./absent.sh"]));
+    assert!(
+        matches!(outcome(&missing), Outcome::Failed { reason } if reason.contains("could not start")),
+        "{missing:#?}"
+    );
+}
+
+#[test]
+fn a_command_nobody_waits_for_is_stopped_with_its_whole_process_group() {
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    let marks = TempDir::new();
+    let pid = marks.0.join("pid");
+    let stream = daemon.connect();
+    let reader = stream.try_clone().unwrap();
+    let request = run_request(
+        &repository.0,
+        &[
+            "sh",
+            "-c",
+            "sleep 300 & echo $! > \"$1\"; wait",
+            "sh",
+            pid.to_str().unwrap(),
+        ],
+    );
+    let client = std::thread::spawn(move || client::build(stream, request, |_| {}));
+    wait_until("the command started its child", || {
+        std::fs::read_to_string(&pid).is_ok_and(|text| text.ends_with('\n'))
+    });
+    let sleeping = rustix::process::Pid::from_raw(
+        std::fs::read_to_string(&pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    )
+    .expect("a pid is positive");
+    let status = daemon.status();
+    let running = status.slots[0].build.as_ref().unwrap();
+    assert_eq!(running.phase, buildd::protocol::Phase::Running);
+    assert_eq!(running.tokens, 2, "charged its fixed share: {status:?}");
+
+    reader.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(
+        client.join().unwrap().is_err(),
+        "the withdrawn client hears no end"
+    );
+    wait_until("the slot is idle", || {
+        daemon.status().slots[0].build.is_none()
+    });
+    wait_until("the command's child is gone", || {
+        rustix::process::test_kill_process(sleeping).is_err()
+    });
+    wait_until("every job is free again", || {
+        let status = daemon.status();
+        status.idle_jobs == status.jobs
+    });
+}
+
+#[test]
+fn a_remote_command_delivers_its_outputs_on_the_machine_that_ran_it() {
+    let host = RemoteHost::start();
+    let repository = crate_repository(None);
+    let out = TempDir::new();
+    let mut request = run_request(
+        &repository.0,
+        &["sh", "-c", "echo \"$BUILDD_TREE\" > \"$BUILDD_OUT/tree\""],
+    );
+    request.os = Some(host.os.into());
+    request.copy_to = Some(out.0.join("results"));
+    let ran = host.local.submit(request);
+    assert!(outcome(&ran).success(), "{ran:#?}");
+    assert!(
+        ran.iter().any(
+            |message| matches!(message, Message::Started { slot, .. } if slot.starts_with("far:"))
+        ),
+        "{ran:#?}"
+    );
+    assert_eq!(delivered(&ran), [out.0.join("results/tree")]);
+    assert_eq!(
+        std::fs::read_to_string(out.0.join("results/tree"))
+            .unwrap()
+            .trim(),
+        started(&ran)
+    );
+}
+
 #[test]
 fn nextest_runs_the_tests_test_compiles_and_reports_the_phase() {
     let daemon = Daemon::start(1);

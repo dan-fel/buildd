@@ -912,8 +912,11 @@ impl<D: Distance> Scheduler<D> {
         entry.unmeasured += 1;
         entry.idle_since = Instant::now();
         // How compile time grows with units here, for weighing cold builds.
-        // A cancelled or killed build's time says nothing.
-        if let Outcome::Exited { .. } = outcome {
+        // A cancelled or killed build's time says nothing, and neither does
+        // a command of the client's own, which compiles nothing.
+        if let Outcome::Exited { .. } = outcome
+            && job.operation.command.uses_cargo()
+        {
             let compile_ms = build_ms - test_ms.unwrap_or(0).min(build_ms);
             self.compile_cost
                 .entry(job.repository.clone())
@@ -1367,7 +1370,10 @@ impl<D: Distance> Scheduler<D> {
             in_use += memory;
             self.clock += 1;
             let job = &self.jobs[&id];
-            let first = self.built_worktrees.insert(job.waiters[0].worktree.clone());
+            // A command of the client's own compiles nothing: it is never a
+            // worktree's warm or cold first build.
+            let first = job.operation.command.uses_cargo()
+                && self.built_worktrees.insert(job.waiters[0].worktree.clone());
             let entry = &mut self.slots[slot];
             entry.advance_generation();
             entry.job = Some(id);
@@ -1694,6 +1700,8 @@ impl<D: Distance> Scheduler<D> {
                         tokens,
                         phase: if copying {
                             Phase::Copying
+                        } else if !job.operation.command.uses_cargo() {
+                            Phase::Running
                         } else if job.operation.command.runs_tests() && compiled_at.is_some() {
                             Phase::Testing
                         } else {
@@ -2541,6 +2549,36 @@ mod tests {
             reports(&effects)[..],
             [_, EventKind::Started { warm: false, .. }]
         ));
+    }
+
+    #[test]
+    fn a_command_of_the_clients_own_runs_in_a_slot_and_says_nothing_about_compiling() {
+        let mut scheduler = scheduler(1);
+        let effects = submit_operation(&mut scheduler, 1, "/a", "a1", Command::Run, &["make"]);
+        let [(job, 0, _)] = starts(&effects)[..] else {
+            panic!("{effects:?}");
+        };
+        let (slots, _) = scheduler.status(|_| 0);
+        assert_eq!(slots[0].build.as_ref().unwrap().phase, Phase::Running);
+        assert!(matches!(
+            reports(&effects)[..],
+            [
+                _,
+                EventKind::Started {
+                    first: false,
+                    warm: false,
+                    ..
+                }
+            ]
+        ));
+        scheduler.exited(
+            job,
+            &Outcome::Exited { code: 0 },
+            None,
+            BuildReport::default(),
+        );
+        assert!(scheduler.compile_cost.is_empty());
+        assert!(scheduler.slots[0].compilations.is_empty());
     }
 
     #[test]

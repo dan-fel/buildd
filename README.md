@@ -25,6 +25,7 @@ buildd check -p my-crate              # starts the daemon on first use
 buildd test -p my-crate -- some_test  # same arguments as cargo
 buildd nextest --workspace            # every test in its own process
 buildd test --os linux --workspace    # on a remote Linux host
+buildd run --os linux -- ./image.sh   # any command, on the same snapshot
 buildd status                         # one-shot summary
 buildd top                            # live view; q quits
 buildd failures                       # what failed lately, and why
@@ -117,6 +118,7 @@ slots/<repo>-<hash>/<n>/
   its tokens.
 - Tests run on `test_jobs` threads. While tests run, the build is charged at
   least `test_jobs` tokens, since tests use cores without taking tokens.
+  A `run` command is charged the same share for its whole run.
 
 ## Memory and disk
 
@@ -163,6 +165,51 @@ buildd nextest --workspace
 - If a test reads files from a package it doesn't depend on, skipping can't
   see changes to them. Keep such data in the test's own package or outside
   every package.
+
+## Other commands
+
+```text
+buildd run [--copy-to DIR] [--os OS] -- COMMAND [ARGS...]
+   │
+   snapshot, queue, slot, checkout   as for a build: same tree, same slots,
+   │                                 CPU budget, drain and withdrawal
+   COMMAND in <slot>/src/<the directory you ran from>
+   │   output streamed back, exit status passed on, tree named
+   │
+   success and --copy-to? → what it left in $BUILDD_OUT moves into DIR
+   │
+   checkout reset to the tree; $BUILDD_OUT and its Cargo target deleted
+```
+
+For work that isn't Cargo but must see exactly the tree a build would:
+a script that builds a disk image, a Go test suite.
+
+- **Program.** With a `/` it is a path from the run's directory (in the
+  slot's checkout); a bare name is looked up in the daemon's `PATH`.
+- **Environment.** The daemon's, not the client's, plus:
+
+  | variable | value |
+  |---|---|
+  | `BUILDD_TREE` | the snapshot's tree id |
+  | `BUILDD_JOBS` | the cores it may keep busy: `test_jobs`, which it is charged for |
+  | `BUILDD_OUT` | an empty directory for its outputs |
+  | `CARGO_TARGET_DIR` | a target of its own for Cargo it starts, deleted afterwards |
+  | `CARGO_BUILD_JOBS` | `BUILDD_JOBS` |
+
+- **The slot's target is not its own.** Cargo it starts never builds there,
+  and the checkout is reset to the tree when it ends. It runs as the
+  daemon's user, so nothing but this contract keeps it from writing the
+  slot's target by its path: one that does voids what buildd promises about
+  that slot. To use binaries buildd built, build them with `--copy-to` first.
+- **Outputs.** With `--copy-to DIR` (absolute with `--os`, on that host),
+  each entry of `$BUILDD_OUT` replaces one of the same name in `DIR` as a
+  whole once the command succeeds; otherwise they are deleted.
+- **Stopping.** Ctrl-C withdraws it like a build: `SIGTERM` to its process
+  group, `SIGKILL` 5 s later. When the command exits, whatever it left in
+  its process group is killed. A process that leaves the group escapes.
+- **Sharing.** Equal requests (tree, directory, command, arguments,
+  `--copy-to`) share one run, and a newer one from a worktree replaces its
+  queued older one, as builds do.
 
 ## Logs and failures
 
@@ -232,9 +279,10 @@ command = "bash -lc 'buildd serve'"   # login shell: same tools as a terminal
 
 - The caller names the OS. buildd never picks one itself, since results
   differ by OS. A request for an OS no host builds for is rejected.
-- Products stay on the machine that built them. With `--os`, `--copy-to DIR`
-  names a directory on the remote host, so a script there uses exactly the
-  binaries buildd built for the tree; `DIR` must be absolute, without `..`,
+- Products (executables, or a `run` command's outputs) stay on the machine
+  that made them. With `--os`, `--copy-to DIR` names a directory on the
+  remote host, so a script there uses exactly the binaries buildd built for
+  the tree; `DIR` must be absolute, without `..`,
   and outside that host's buildd home. As here, they are copied out of the
   slot after success: the slot's target is never shared or pointed
   elsewhere.
@@ -276,7 +324,7 @@ buildd's own options come before Cargo's arguments:
 | option | effect |
 |---|---|
 | `--os OS` | build on a remote host for that OS |
-| `--copy-to DIR` | after success, copy the built executables (and `.dSYM`) into `DIR` on the machine that builds (see Remote hosts) |
+| `--copy-to DIR` | after success, copy the built executables (and `.dSYM`), or what `run` left in `$BUILDD_OUT`, into `DIR` on the machine that builds (see Remote hosts) |
 | `--rustflags FLAGS` | flags for every rustc (like `RUSTFLAGS`); part of the build's identity |
 | `--json` | print every daemon message as a JSON line, for programs |
 | `--rerun-all` | `nextest`: also run binaries that would be skipped |
@@ -298,6 +346,7 @@ sock                 the daemon's socket
 daemon.log           output of a daemon a client started
 events.jsonl         every event as JSON (rotates to .1 at 10 MB)
 logs/                every build's output (see Logs and failures)
+runs/                each running command's $BUILDD_OUT and Cargo target
 slots/               see Slots
 mirrors/<project>    repositories remote machines push into
 prewarm/<project>    buildd's worktree of each prewarmed repository

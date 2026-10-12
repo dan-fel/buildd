@@ -397,6 +397,7 @@ fn remote_lines(remote: &RemoteActivity) -> Vec<Line<'static>> {
                     let phase = match build.phase {
                         Phase::Compiling => "compiling",
                         Phase::Testing => "testing",
+                        Phase::Running => "running",
                         Phase::Copying => "copying",
                     };
                     format!(
@@ -523,6 +524,7 @@ fn slot_lines(slot: &SlotStatus, budget: u64) -> [Line<'static>; 2] {
             let phase = match build.phase {
                 Phase::Compiling => "",
                 Phase::Testing => "testing · ",
+                Phase::Running => "running · ",
                 Phase::Copying => "copying · ",
             };
             let state = if build.cancelled {

@@ -185,7 +185,8 @@ impl Config {
 pub fn prewarm_operation(build: &[String]) -> Result<crate::cargo::Operation, String> {
     let (command, args) = build.split_first().ok_or("an empty build")?;
     let command = crate::cargo::Command::parse(command)
-        .ok_or_else(|| format!("unknown command `{command}`"))?;
+        .filter(|command| command.uses_cargo())
+        .ok_or_else(|| format!("unknown command `{command}`: prewarming runs Cargo"))?;
     let operation = crate::cargo::Operation {
         command,
         args: args.to_vec(),

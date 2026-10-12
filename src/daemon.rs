@@ -34,6 +34,7 @@ use crate::protocol::{
     RemoteActivity, Request, RevisionRequest, Shortage, Status, Usage,
 };
 use crate::remote;
+use crate::run::{self, RunDirectory};
 use crate::scheduler::{
     Effect, JobId, Measurement, Removal, Scheduler, SlotKey, Start, Submission, WaiterId,
 };
@@ -154,6 +155,17 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     let listener = UnixListener::bind(&socket)
         .map_err(|error| format!("could not listen on {}: {error}", socket.display()))?;
     let budget = Budget::new(config.jobs, config.test_jobs, &home.join("tmp"))?;
+    // What commands left when an earlier daemon stopped: no run goes on.
+    match std::fs::remove_dir_all(home.join("runs")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not remove {}: {error}",
+                home.join("runs").display()
+            ));
+        }
+    }
     log!(
         "listening on {} with {} slots, {} of build disk and {} jobs",
         socket.display(),
@@ -1028,6 +1040,7 @@ impl Daemon {
                     start,
                     log: Arc::new(Mutex::new(Some(log))),
                     logs,
+                    runs: self.home.join("runs"),
                     budget: self.budget.clone(),
                     test_jobs: self.config.test_jobs,
                     workspace,
@@ -1219,9 +1232,9 @@ struct Run(Mutex<RunState>);
 #[derive(Default)]
 struct RunState {
     cancelled: bool,
-    /// Cargo's process group, once it runs.
+    /// The process group of Cargo or the command, once it runs.
     group: Option<Pid>,
-    /// Cargo has exited; its group id may be reused.
+    /// Its leader has exited; its group id may be reused.
     exited: bool,
     /// Its account in the job budget, once it has one.
     lease: Option<Arc<Lease>>,
@@ -1237,7 +1250,7 @@ impl Run {
     /// The build's tests run: it is charged their share of the machine.
     fn testing(&self) {
         if let Some(lease) = &self.lock().lease {
-            lease.testing();
+            lease.fixed_share();
         }
     }
 
@@ -1246,7 +1259,7 @@ impl Run {
         self.lock().lease.as_ref().map_or(0, |lease| lease.in_use())
     }
 
-    /// Stops the build: `SIGTERM` to Cargo's process group now, `SIGKILL`
+    /// Stops the build: `SIGTERM` to its process group now, `SIGKILL`
     /// after a grace period.
     fn cancel(self: &Arc<Self>) {
         let mut state = self.lock();
@@ -1277,11 +1290,12 @@ fn signal_group(group: Pid, signal: Signal) {
     }
 }
 
-/// Kills what remains of the process group of `cargo`, which has exited but
-/// is not reaped yet: processes it started and left behind.
+/// Kills what remains of process group `group`, whose leader (Cargo or the
+/// command) has exited but is not reaped yet: processes it started and left
+/// behind.
 fn kill_leftovers(group: Pid) {
     match rustix::process::kill_process_group(group, Signal::KILL) {
-        // No members left, or (macOS) only the unreaped Cargo itself, which
+        // No members left, or (macOS) only the unreaped leader itself, which
         // a signal cannot reach.
         Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => {}
         Err(error) => log!("could not kill process group {group:?}: {error}"),
@@ -1317,9 +1331,12 @@ struct Building {
     log: Arc<Mutex<Option<BuildLog>>>,
     /// Where build logs are kept.
     logs: PathBuf,
+    /// Where `run` commands get directories of their own.
+    runs: PathBuf,
     slot: SlotDirectory,
     budget: Budget,
-    /// Threads a test build's tests run on.
+    /// Threads a test build's tests run on, and the cores a `run` command
+    /// may keep busy.
     test_jobs: usize,
     /// The repository's workspace, once known: what decides which test
     /// binaries a run of every test may skip.
@@ -1350,7 +1367,8 @@ impl Building {
         });
     }
 
-    /// How the build ended and, when Cargo ran, what it used.
+    /// How the build ended and, when Cargo or the command ran, what it
+    /// used.
     fn outcome(&self) -> (Outcome, Option<Usage>) {
         let failed = |reason: String| (Outcome::Failed { reason }, None);
         if let Err(reason) = self
@@ -1367,6 +1385,10 @@ impl Building {
         };
         self.run.lock().lease = Some(Arc::clone(&lease));
         let operation = &self.start.operation;
+        if !operation.command.uses_cargo() {
+            lease.fixed_share();
+            return self.run_command();
+        }
         let skipping = match &self.workspace {
             Some(workspace) if !self.start.passed.is_empty() => Some(workspace),
             _ => None,
@@ -1478,38 +1500,110 @@ impl Building {
         lease: &Lease,
         operation: &Operation,
     ) -> Result<(ExitStatus, Usage, Vec<Product>), String> {
+        let target = self.slot.target();
         let mut command = cargo::command(
             &self.slot.source().join(&self.start.prefix),
-            &self.slot.target(),
+            &target,
             operation,
             self.test_jobs,
         );
         lease.configure(&mut command);
+        let products = Arc::new(Mutex::new(Vec::new()));
+        let (status, usage) = self.execute(
+            command,
+            Stream::Cargo {
+                target,
+                products: Arc::clone(&products),
+            },
+        )?;
+        let products = std::mem::take(
+            &mut *products
+                .lock()
+                .expect("no thread panics holding a build's products"),
+        );
+        Ok((status, usage, products))
+    }
+
+    /// Runs the client's own command in the slot, on the build's fixed
+    /// share of the machine, as [`crate::run`] explains: forwards its
+    /// output, puts the slot's checkout back to the build's tree, and moves
+    /// its outputs where the request asked once it succeeds.
+    fn run_command(&self) -> (Outcome, Option<Usage>) {
+        let failed = |reason: String| (Outcome::Failed { reason }, None);
+        let directory = self.slot.source().join(&self.start.prefix);
+        if !directory.is_dir() {
+            return failed(format!(
+                "tree {} has no directory ./{} to run in",
+                self.start.revision.short(),
+                self.start.prefix.display()
+            ));
+        }
+        let own = match RunDirectory::create(&self.runs, &self.start.job.to_string()) {
+            Ok(own) => own,
+            Err(reason) => return failed(reason),
+        };
+        let command = run::command(
+            &directory,
+            &self.start.operation,
+            &self.start.revision,
+            &own,
+            self.test_jobs,
+        );
+        let ran = self.execute(command, Stream::Stdout);
+        // Whatever the command changed in the checkout, the slot holds the
+        // tree it names again. A failure here leaves that to the next
+        // build's checkout, which makes the same reset.
+        if let Err(error) = self
+            .slot
+            .materialize(&self.start.repository, &self.start.revision)
+        {
+            log!("{}: {error}", self.slot.path().display());
+        }
+        let (status, usage) = match ran {
+            Ok(ran) => ran,
+            Err(reason) => return failed(reason),
+        };
+        let step = outcome(status);
+        let outcome = match &self.start.copy_to {
+            Some(destination) if step.success() => self.deliver(&own.out(), destination),
+            _ => step,
+        };
+        (outcome, Some(usage))
+    }
+
+    /// Starts `command`, which runs in a process group of its own, and
+    /// forwards its standard output as `stdout` says and its standard error
+    /// until it exits; a cancellation stops the whole group. Returns how it
+    /// exited and what it used.
+    fn execute(
+        &self,
+        mut command: std::process::Command,
+        stdout: Stream,
+    ) -> Result<(ExitStatus, Usage), String> {
+        let program = command.get_program().to_string_lossy().into_owned();
         let mut child = {
             let mut state = self.run.lock();
             if state.cancelled {
-                return Err("cancelled before Cargo started".into());
+                return Err(format!("cancelled before {program} started"));
             }
             let child = command
                 .spawn()
-                .map_err(|error| format!("could not start cargo: {error}"))?;
+                .map_err(|error| format!("could not start {program}: {error}"))?;
             state.group = Some(Pid::from_child(&child));
             state.exited = false;
             child
         };
         let (done, finished) = crossbeam_channel::bounded(2);
-        let stdout = child.stdout.take().expect("cargo's output is piped");
-        let stderr = child.stderr.take().expect("cargo's errors are piped");
-        let target = self.slot.target();
-        let products = Arc::new(Mutex::new(Vec::new()));
-        self.forward(stdout, Some((target, Arc::clone(&products))), done.clone());
-        self.forward(stderr, None, done);
+        let output = child.stdout.take().expect("the process's output is piped");
+        let errors = child.stderr.take().expect("the process's errors are piped");
+        self.forward(output, stdout, done.clone());
+        self.forward(errors, Stream::Stderr, done);
 
         let pid = Pid::from_child(&child);
         let peak = self.sample_memory(pid);
-        // Wait without reaping, so Cargo's process group id cannot be reused
+        // Wait without reaping, so the process group id cannot be reused
         // while the group's remaining processes are killed and before a
-        // pending cancellation learns that Cargo exited.
+        // pending cancellation learns that the process exited.
         loop {
             match rustix::process::waitid(
                 WaitId::Pid(pid),
@@ -1518,7 +1612,7 @@ impl Building {
                 Err(rustix::io::Errno::INTR) => {}
                 Ok(_) => break,
                 Err(error) => {
-                    panic!("waiting for our own cargo child fails only by a bug: {error}")
+                    panic!("waiting for our own child fails only by a bug: {error}")
                 }
             }
         }
@@ -1532,16 +1626,11 @@ impl Building {
                 break;
             }
         }
-        let products = std::mem::take(
-            &mut *products
-                .lock()
-                .expect("no thread panics holding a build's products"),
-        );
-        Ok((status, usage, products))
+        Ok((status, usage))
     }
 
-    /// Samples the resident memory of Cargo's process group `group` every
-    /// [`MEMORY_SAMPLE`] until Cargo exits, keeping the peak.
+    /// Samples the resident memory of process group `group` every
+    /// [`MEMORY_SAMPLE`] until its leader exits, keeping the peak.
     fn sample_memory(&self, group: Pid) -> Arc<AtomicU64> {
         let peak = Arc::new(AtomicU64::new(0));
         let sampled = Arc::clone(&peak);
@@ -1582,14 +1671,32 @@ impl Building {
         }
     }
 
-    /// Sends each line of `output` to the scheduler on a thread of its own:
-    /// Cargo's standard output, whose messages name files in `target` and
-    /// whose executables go to `products`, or its standard error when
-    /// `target` is None.
+    /// Moves what the command left in `staged` into `destination` and
+    /// tells the build's waiters where each output went; how the build
+    /// failed when moving did.
+    fn deliver(&self, staged: &Path, destination: &Path) -> Outcome {
+        let job = self.start.job;
+        let _ = self.events.send(Event::Copying { job });
+        match products::deliver(staged, destination) {
+            Ok(delivered) => {
+                for path in delivered {
+                    let _ = self.events.send(Event::Output {
+                        job,
+                        message: Message::Delivered { path },
+                    });
+                }
+                Outcome::Exited { code: 0 }
+            }
+            Err(reason) => Outcome::Failed { reason },
+        }
+    }
+
+    /// Sends each line of `output`, read as `stream` says, to the scheduler
+    /// on a thread of its own.
     fn forward(
         &self,
         output: impl std::io::Read + Send + 'static,
-        target: Option<(PathBuf, Arc<Mutex<Vec<Product>>>)>,
+        stream: Stream,
         done: Sender<()>,
     ) {
         let events = self.events.clone();
@@ -1609,15 +1716,19 @@ impl Building {
                         job,
                         message: Message::Stdout { line },
                     };
-                    let reported = match &target {
-                        None => {
+                    let reported = match &stream {
+                        Stream::Stderr => {
                             log_line(&log, &line, BuildLog::stderr);
                             vec![Event::Output {
                                 job,
                                 message: Message::Stderr { line },
                             }]
                         }
-                        Some((target, products)) => match Line::of(&line) {
+                        Stream::Stdout => {
+                            log_line(&log, &line, BuildLog::stdout);
+                            vec![stdout(line)]
+                        }
+                        Stream::Cargo { target, products } => match Line::of(&line) {
                             Line::Crate {
                                 fresh,
                                 outputs,
@@ -1663,6 +1774,20 @@ impl Building {
             log!("could not read a build's output: {error}");
         }
     }
+}
+
+/// How a process's output is read.
+enum Stream {
+    /// Cargo's standard output: its JSON messages name files in `target`,
+    /// and the executables they report go to `products`.
+    Cargo {
+        target: PathBuf,
+        products: Arc<Mutex<Vec<Product>>>,
+    },
+    /// A command's standard output, passed on as it is.
+    Stdout,
+    /// Standard error, passed on as it is.
+    Stderr,
 }
 
 /// Adds `line` to a build's `log` as `stream` while the build runs.

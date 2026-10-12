@@ -9,9 +9,10 @@
 //! (With one jobserver for all builds, a compiler killed while holding
 //! tokens took them with it for the daemon's lifetime.)
 //!
-//! A build whose tests run is charged at least the tests' share of the
-//! machine: test threads and the processes they start use it without
-//! taking tokens, so compilation elsewhere shrinks to what is left.
+//! A build whose tests run, or a command `run` runs, is charged at least a
+//! fixed share of the machine, `test_jobs`: test threads, the processes
+//! they start and such commands use it without taking tokens, so
+//! compilation elsewhere shrinks to what is left.
 //!
 //! Every [`TICK`] the daemon takes back the tokens waiting in each FIFO and
 //! deals every free token again, one at a time to each compiling build in
@@ -67,15 +68,17 @@ struct Account {
     /// Tokens written into the FIFO and not taken back: held by the build's
     /// processes or waiting in the FIFO.
     deposited: usize,
-    testing: bool,
+    /// Its processes use cores without taking tokens: it is charged at
+    /// least the fixed share and dealt no tokens.
+    fixed_share: bool,
 }
 
 impl Account {
     /// What the build is charged: Cargo's implicit token and every token
-    /// deposited, and while its tests run, at least the tests' share.
+    /// deposited, and with a fixed share, at least that.
     fn charge(&self, test_jobs: usize) -> usize {
         let charge = 1 + self.deposited;
-        if self.testing {
+        if self.fixed_share {
             charge.max(test_jobs)
         } else {
             charge
@@ -83,11 +86,11 @@ impl Account {
     }
 
     /// What the build uses now: Cargo's implicit token and the tokens its
-    /// processes took, and while its tests run, at least the tests' share.
-    /// Tokens dealt to it that wait in its FIFO are not in use.
+    /// processes took, and with a fixed share, at least that. Tokens dealt
+    /// to it that wait in its FIFO are not in use.
     fn in_use(&self, test_jobs: usize) -> usize {
         let in_use = 1 + self.deposited.saturating_sub(self.waiting());
-        if self.testing {
+        if self.fixed_share {
             in_use.max(test_jobs)
         } else {
             in_use
@@ -247,7 +250,7 @@ impl Ledger {
             .accounts
             .range(self.turn..)
             .chain(self.accounts.range(..self.turn))
-            .filter(|(_, account)| !account.testing)
+            .filter(|(_, account)| !account.fixed_share)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         for id in order.iter().cycle().take(free) {
@@ -292,14 +295,16 @@ impl Lease {
         }
     }
 
-    /// The build's tests run: it is charged at least their share from now on.
-    pub(crate) fn testing(&self) {
+    /// The build's processes use cores without taking tokens from now on,
+    /// as tests and commands of the client's own do: it is charged at least
+    /// the fixed share, `test_jobs`.
+    pub(crate) fn fixed_share(&self) {
         self.budget
             .ledger()
             .accounts
             .get_mut(&self.id)
             .expect("a lease's account stays open")
-            .testing = true;
+            .fixed_share = true;
     }
 
     /// The jobs the build uses now.
@@ -340,7 +345,7 @@ fn fifo(path: &Path) -> Result<Account, String> {
             writer,
             child_reader,
             deposited: 0,
-            testing: false,
+            fixed_share: false,
         })
     })();
     let removed = std::fs::remove_file(path);
@@ -452,7 +457,7 @@ mod tests {
         ledger.deal();
         assert_eq!(held(&ledger, a), 1);
         // B's tests run: it is charged three, and A keeps what it holds.
-        ledger.accounts.get_mut(&b).unwrap().testing = true;
+        ledger.accounts.get_mut(&b).unwrap().fixed_share = true;
         ledger.deal();
         assert_eq!(ledger.accounts[&b].charge(3), 3);
         assert_eq!(ledger.accounts[&b].in_use(3), 3, "tests use their share");

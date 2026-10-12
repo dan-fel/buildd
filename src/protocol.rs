@@ -124,8 +124,9 @@ pub struct BuildRequest {
     pub label: Option<String>,
     /// An absolute directory on the machine that builds (this one, or the
     /// remote host for `os`) to copy the executables Cargo produced into,
-    /// with their debug information, once the build succeeds. Requests that
-    /// copy elsewhere are different builds.
+    /// with their debug information, once the build succeeds; for `run`,
+    /// what the command left in `BUILDD_OUT`. Requests that copy elsewhere
+    /// are different builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_to: Option<PathBuf>,
     /// For a `nextest` run of every test: run the test binaries that passed
@@ -183,14 +184,17 @@ pub enum Message {
     /// Cargo runs for `revision` in `slot`.
     Started { revision: Revision, slot: String },
     /// A line of Cargo's standard output: JSON messages (diagnostics, the
-    /// final build message) and test output.
+    /// final build message) and test output; for `run`, of the command's.
     Stdout { line: String },
-    /// A line of Cargo's standard error.
+    /// A line of Cargo's standard error, or the command's.
     Stderr { line: String },
     /// An executable was copied out of the slot as the request asked:
     /// Cargo's `compiler-artifact` message for it, with every path naming the
     /// copy.
     Copied { artifact: String },
+    /// An output a `run` command left in `BUILDD_OUT` was moved to `path`,
+    /// on the machine that ran it, as the request asked.
+    Delivered { path: PathBuf },
     /// The build of `revision` ended. For `test`, `test_ms` is the part of
     /// `build_ms` after compilation finished: running the tests.
     Finished {
@@ -244,12 +248,12 @@ pub struct TestTime {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
-    /// Cargo exited with `code`.
+    /// Cargo, or a `run` command, exited with `code`.
     Exited { code: i32 },
-    /// Cargo was killed by `signal`.
+    /// Cargo, or a `run` command, was killed by `signal`.
     Signaled { signal: i32 },
-    /// Cargo could not run (preparing the slot or starting it failed), or
-    /// it succeeded and copying its executables out failed.
+    /// Cargo or the command could not run (preparing the slot or starting
+    /// it failed), or it succeeded and copying its products out failed.
     Failed { reason: String },
 }
 
@@ -372,7 +376,9 @@ pub enum Phase {
     Compiling,
     /// A `test` build whose compilation finished runs its tests.
     Testing,
-    /// Cargo succeeded; its executables are copied out of the slot.
+    /// A `run` command runs.
+    Running,
+    /// Cargo or the command succeeded; its products are copied out.
     Copying,
 }
 
