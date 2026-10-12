@@ -837,7 +837,7 @@ mod tests {
             "debug/deps/libserde-0123456789abcdef.rlib",
             "debug/deps/libserde-fedcba9876543210.rlib",
             "debug/deps/libserde-fedcba9876543210.rmeta",
-            "debug/deps/libone-0123456789abcdef.rlib",
+            "debug/deps/libone-1111111111111111.rlib",
             "release/deps/libserde-0123456789abcdef.rlib",
         ] {
             file(&target.join(name), 10);
