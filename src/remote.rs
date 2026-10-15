@@ -324,22 +324,6 @@ fn send(child: &mut Child, request: &Request) -> Result<(), String> {
         .map_err(|error| format!("could not send the request: {error}"))
 }
 
-/// Why `remote` answered `line` instead of a message: what SSH or the
-/// remote command said.
-fn failure(child: &mut Child, remote: &Remote, line: &str) -> String {
-    let _ = child.kill();
-    let mut errors = String::new();
-    if let Some(stderr) = child.stderr.take() {
-        let _ = BufReader::new(stderr).read_line(&mut errors);
-    }
-    let said = if line.trim().is_empty() {
-        errors.trim()
-    } else {
-        line.trim()
-    };
-    format!("{} ({}) did not answer: {said}", remote.name, remote.ssh)
-}
-
 /// What `remote`'s daemon is doing.
 pub(crate) fn activity(_home: &Path, remote: &Remote) -> Result<Activity, String> {
     ask(remote, &Request::Activity, None)
@@ -510,50 +494,194 @@ pub(crate) fn build(
     request: RevisionRequest,
     requester: &std::os::unix::net::UnixStream,
     started: impl Fn(&std::sync::Arc<std::sync::Mutex<Child>>),
-    mut pass: impl FnMut(&Message) -> bool,
+    pass: impl FnMut(&Message) -> bool,
 ) -> Result<(), String> {
     let project = push(remote, source, revision, requester, &started)?;
     let mut child = serve(remote)?;
-    send(
+    if let Err(reason) = send(
         &mut child,
         &Request::BuildRevision(RevisionRequest { project, ..request }),
-    )?;
+    ) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "{} ({}): {reason}{}",
+            remote.name,
+            remote.ssh,
+            diagnostics(child.stderr.take().expect("piped"))
+        ));
+    }
+    forward(remote, child, started, pass)
+}
+
+/// Every exit, including a malformed line or a failed read, retires the
+/// session and preserves the reason instead of hiding it as an early EOF.
+fn forward(
+    remote: &Remote,
+    mut child: Child,
+    started: impl Fn(&std::sync::Arc<std::sync::Mutex<Child>>),
+    mut pass: impl FnMut(&Message) -> bool,
+) -> Result<(), String> {
     let stdout = child.stdout.take().expect("piped");
     let child = std::sync::Arc::new(std::sync::Mutex::new(child));
     started(&child);
-    let mut last = None;
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        let message = serde_json::from_str::<Message>(&line).map_err(|_| {
-            failure(
-                &mut child
-                    .lock()
-                    .expect("no thread panics holding the ssh child"),
-                remote,
-                &line,
-            )
-        })?;
-        let message = match message {
-            Message::Started { revision, slot } => Message::Started {
-                revision,
-                slot: format!("{}:{slot}", remote.name),
-            },
-            other => other,
-        };
-        let is_final = message.is_final();
-        if !pass(&message) || is_final {
-            last = Some(is_final);
-            break;
+    let result = (|| {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.map_err(|error| format!("reading SSH output: {error}"))?;
+            let message = serde_json::from_str::<Message>(&line).map_err(|error| {
+                format!(
+                    "invalid build message: {error}: {}",
+                    line.chars().take(512).collect::<String>()
+                )
+            })?;
+            let message = match message {
+                Message::Started { revision, slot } => Message::Started {
+                    revision,
+                    slot: format!("{}:{slot}", remote.name),
+                },
+                other => other,
+            };
+            if !pass(&message) || message.is_final() {
+                return Ok(());
+            }
         }
-    }
+        Err("SSH output ended before the build's final message".to_owned())
+    })();
     let mut child = child
         .lock()
-        .expect("no thread panics holding the ssh child");
+        .expect("no thread panics holding the SSH child");
+    let exited = child.try_wait();
     let _ = child.kill();
     let _ = child.wait();
-    match last {
-        Some(_) => Ok(()),
-        None => Err(format!("lost {} before the build ended", remote.name)),
+    result.map_err(|reason| {
+        let status = match exited {
+            Ok(Some(status)) => format!("SSH {status}"),
+            Ok(None) => "SSH was still running when its output ended".into(),
+            Err(error) => format!("could not read SSH exit status: {error}"),
+        };
+        let diagnostics = diagnostics(child.stderr.take().expect("piped"));
+        format!(
+            "{} ({}): {reason}; {status}{diagnostics}",
+            remote.name, remote.ssh
+        )
+    })
+}
+
+/// SSH has been retired. Read available diagnostics without waiting for an
+/// unrelated descendant that might still hold stderr open.
+fn diagnostics(mut stderr: std::process::ChildStderr) -> String {
+    use std::os::fd::AsRawFd as _;
+    let fd = stderr.as_raw_fd();
+    // SAFETY: stderr owns the descriptor through the complete read. Preserve
+    // its other flags and make the diagnostic read nonblocking.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return format!(
+            "; could not read SSH stderr: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 4097];
+    while bytes.len() < buffer.len() {
+        let room = buffer.len() - bytes.len();
+        match stderr.read(&mut buffer[..room]) {
+            Ok(0) => break,
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return format!("; could not read SSH stderr: {error}"),
+        }
+    }
+    let truncated = bytes.len() > 4096;
+    bytes.truncate(4096);
+    let text = String::from_utf8_lossy(&bytes);
+    let said = text.trim();
+    let suffix = if truncated {
+        " [SSH diagnostics exceeded 4 KiB]"
+    } else {
+        ""
+    };
+    if said.is_empty() {
+        String::new()
+    } else {
+        format!("; SSH stderr: {said}{suffix}")
+    }
+}
+
+#[cfg(test)]
+mod stream_end_to_end {
+    use super::*;
+
+    fn stream(script: &str, exited: bool) -> (Result<(), String>, Vec<Message>) {
+        let mut child = Command::new("python3")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id().try_into().unwrap()).unwrap();
+        // Small pipe contents fit before we read; waiting makes the fixture's
+        // exit status deterministic, independent of EOF/reaping scheduling.
+        if exited {
+            child.wait().unwrap();
+        }
+        let remote = Remote {
+            name: "fixture".into(),
+            ssh: "test-host".into(),
+            os: "linux".into(),
+            command: "unused".into(),
+        };
+        let mut messages = Vec::new();
+        let result = forward(
+            &remote,
+            child,
+            |_| {},
+            |message| {
+                messages.push(message.clone());
+                true
+            },
+        );
+        assert!(matches!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
+        (result, messages)
+    }
+
+    #[test]
+    fn early_exit_retains_ssh_status_and_diagnostics() {
+        let (result, messages) = stream(
+            "import sys\nprint('{\"type\":\"queued\",\"revision\":\"abc\"}')\nsys.stderr.write('channel fixture closed\\n')\nsys.exit(7)",
+            true,
+        );
+        assert_eq!(messages.len(), 1);
+        let error = result.unwrap_err();
+        assert!(error.contains("final message"), "{error}");
+        assert!(error.contains("exit status: 7"), "{error}");
+        assert!(error.contains("channel fixture closed"), "{error}");
+    }
+
+    #[test]
+    fn malformed_and_invalid_utf8_streams_preserve_the_failure() {
+        let (result, _) = stream("print('not a build message')", true);
+        assert!(result.unwrap_err().contains("invalid build message"));
+        let (result, _) = stream("import sys\nsys.stdout.buffer.write(b'\\xff\\n')", true);
+        assert!(result.unwrap_err().contains("reading SSH output"));
+        let (result, _) = stream("print('{\"type\":\"rejected\",\"reason\":\"busy\"}')", true);
+        assert_eq!(result, Ok(()), "a final rejection is a complete stream");
+    }
+
+    #[test]
+    fn malformed_stream_retires_the_still_running_session() {
+        let (result, _) = stream(
+            "import sys\nprint('not a build message', flush=True)\nsys.stdin.read()",
+            false,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("invalid build message"), "{error}");
+        assert!(error.contains("SSH was still running"), "{error}");
     }
 }
 
