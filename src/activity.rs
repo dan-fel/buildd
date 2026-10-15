@@ -174,7 +174,7 @@ impl ActivityLog {
                 totals.skipped += skipped;
                 totals.compiled += compiled;
                 totals.fresh += fresh;
-                totals.cpu_ms += usage.map_or(0, |usage| usage.cpu_ms);
+                totals.cpu_ms += usage.as_ref().map_or(0, |usage| usage.cpu_ms);
             }
             EventKind::Dropped { .. } => totals.dropped += 1,
             EventKind::Cancelled { .. } => totals.cancelled += 1,
@@ -316,10 +316,11 @@ mod tests {
                 queued_ms: 0,
                 compiled: 3,
                 fresh: 97,
-                usage: Some(Usage {
+                usage: Some(Box::new(Usage {
                     cpu_ms: 1500,
                     peak_memory: 1,
-                }),
+                    test_memory: None,
+                })),
                 report: BuildReport::default(),
             },
         );

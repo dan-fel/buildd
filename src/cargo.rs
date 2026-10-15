@@ -461,9 +461,9 @@ pub(crate) enum Line {
     /// A build script's report, with the directory it wrote; also inside the
     /// slot.
     BuildScript { out_dir: PathBuf },
-    /// Cargo's message that compilation ended; for `test`, the tests run
-    /// next. The client gets it too.
-    BuildFinished,
+    /// Cargo's compilation result. Tests can run only after success.
+    /// The client gets it too.
+    BuildFinished { success: bool },
     /// Diagnostics and every other line (test output): for the client.
     Forward,
 }
@@ -479,6 +479,7 @@ impl Line {
             filenames: Vec<PathBuf>,
             executable: Option<PathBuf>,
             out_dir: Option<PathBuf>,
+            success: Option<bool>,
         }
         match serde_json::from_str::<Message<'_>>(line) {
             Ok(Message {
@@ -499,8 +500,9 @@ impl Line {
             }) => Self::BuildScript { out_dir },
             Ok(Message {
                 reason: "build-finished",
+                success: Some(success),
                 ..
-            }) => Self::BuildFinished,
+            }) => Self::BuildFinished { success },
             _ => Self::Forward,
         }
     }
@@ -600,8 +602,13 @@ mod tests {
         );
         assert_eq!(
             Line::of(r#"{"reason":"build-finished","success":true}"#),
-            Line::BuildFinished
+            Line::BuildFinished { success: true }
         );
+        assert_eq!(
+            Line::of(r#"{"reason":"build-finished","success":false}"#),
+            Line::BuildFinished { success: false }
+        );
+        assert_eq!(Line::of(r#"{"reason":"build-finished"}"#), Line::Forward);
         for forwarded in [
             r#"{"reason":"compiler-message","message":{"rendered":"x"}}"#,
             "test tests::it_works ... ok",

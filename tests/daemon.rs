@@ -1021,6 +1021,31 @@ fn a_build_compiles_the_worktrees_uncommitted_content_outside_the_worktree() {
 }
 
 #[test]
+fn compiling_tests_without_running_does_not_enter_the_test_phase() {
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    let messages = daemon.build(&repository.0, Command::Test, &["--no-run"]);
+    assert!(outcome(&messages).success(), "{messages:#?}");
+    assert!(
+        matches!(
+            messages.last(),
+            Some(Message::Finished { test_ms: None, .. })
+        ),
+        "{messages:#?}"
+    );
+    let event = daemon
+        .activity()
+        .events
+        .into_iter()
+        .find_map(|event| match event.kind {
+            buildd::protocol::EventKind::Finished { usage, .. } => usage,
+            _ => None,
+        })
+        .expect("the compilation's resource usage");
+    assert!(event.test_memory.is_none());
+}
+
+#[test]
 fn executables_are_copied_out_and_rustflags_reach_the_compiler() {
     let daemon = Daemon::start(1);
     let repository = crate_repository(None);

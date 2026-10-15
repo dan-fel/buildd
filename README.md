@@ -127,7 +127,9 @@ slots/<repo>-<hash>/<n>/
 ```text
 memory   a queued build starts when
            Σ peaks of running builds + its own peak ≤ memory_gib
-         peak = summed RSS of the build's process group, recorded per compilation
+         peak = summed RSS of its process tree and group, recorded per compilation
+         testing releases the compilation reservation once a measured test-phase
+         peak at the same test_jobs is known; unknown phases keep the full peak
          a build that doesn't fit holds the queue, so big builds aren't starved
 
 disk     a slot quiet for 2 s is measured: what its target holds, and what
@@ -144,6 +146,13 @@ serve. Below that, eviction deletes caches still in use and builds start
 cold; `status` and `top` flag the budget as too small. Fewer, larger slots
 win. Builds of a few crates need 12–15 GiB per slot. Full-workspace `test`
 plus `clippy --all-targets` need about 30 GiB.
+
+The free-disk floor applies even below `disk_gib`: increasing the cache allowance
+does not create free space. Keep enough space for the warm targets and the output
+of running builds, or move the buildd home to a larger volume. Tests in separate
+process groups, including nextest's children, count toward the memory peaks.
+Filtered test runs retain the largest measured peak of their compilation; they
+cannot replace a broader run's reservation with their smaller footprint.
 
 ## Tests
 

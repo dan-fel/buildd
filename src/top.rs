@@ -749,7 +749,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
                 Outcome::Signaled { .. } => ("was killed", Style::new().fg(Color::Red)),
                 Outcome::Failed { .. } => ("could not run", Style::new().fg(Color::Red)),
             };
-            let mut cpu = usage.map_or_else(String::new, |usage| {
+            let mut cpu = usage.as_ref().map_or_else(String::new, |usage| {
                 format!(", CPU {}", brief(usage.cpu_ms))
             });
             if *skipped > 0 {
@@ -1074,10 +1074,11 @@ mod tests {
                         queued_ms: 0,
                         compiled: 2,
                         fresh: 233,
-                        usage: Some(Usage {
+                        usage: Some(Box::new(Usage {
                             cpu_ms: 3400,
                             peak_memory: 1 << 30,
-                        }),
+                            test_memory: None,
+                        })),
                         report: BuildReport::default(),
                     },
                 },

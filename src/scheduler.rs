@@ -226,7 +226,7 @@ enum State {
         slot: usize,
         started: Instant,
         /// When Cargo reported that compilation finished.
-        compiled_at: Option<Instant>,
+        testing_at: Option<Instant>,
         /// Cargo succeeded and its executables are being copied out.
         copying: bool,
         cancelled: bool,
@@ -309,7 +309,7 @@ impl Slot {
         units: Vec<String>,
         succeeded: bool,
         build_ms: u64,
-        peak_memory: Option<u64>,
+        usage: Option<Usage>,
     ) {
         // A build that used no units says nothing about what it needs.
         if units.is_empty() {
@@ -327,8 +327,15 @@ impl Slot {
                     run.units.clear();
                     run.build_ms = Some(build_ms);
                 }
-                if peak_memory.is_some() {
-                    run.peak_memory = peak_memory;
+                if let Some(usage) = usage {
+                    run.peak_memory = Some(run.peak_memory.unwrap_or(0).max(usage.peak_memory));
+                    if let Some(mut tests) = usage.test_memory {
+                        if let Some(earlier) = run.test_memory.filter(|old| old.jobs == tests.jobs)
+                        {
+                            tests.peak_memory = tests.peak_memory.max(earlier.peak_memory);
+                        }
+                        run.test_memory = Some(tests);
+                    }
                 }
                 run.units.extend(units);
                 run.at = at;
@@ -339,7 +346,8 @@ impl Slot {
                 at,
                 units: units.into_iter().collect(),
                 build_ms: succeeded.then_some(build_ms),
-                peak_memory,
+                peak_memory: usage.map(|usage| usage.peak_memory),
+                test_memory: usage.and_then(|usage| usage.test_memory),
             }),
         }
         while self.compilations.len() > KEPT_COMPILATIONS {
@@ -439,6 +447,8 @@ pub(crate) struct Scheduler<D> {
     capacity: usize,
     /// Memory running builds may use together, by their expected peaks.
     memory: u64,
+    /// Test peaks are reusable only at the same test concurrency.
+    test_jobs: usize,
     distance: D,
     /// Worktrees a build has started for.
     built_worktrees: HashSet<PathBuf>,
@@ -524,11 +534,13 @@ impl<D: Distance> Scheduler<D> {
         &mut self.distance
     }
 
-    pub(crate) fn new(capacity: usize, memory: u64, distance: D) -> Self {
+    pub(crate) fn new(capacity: usize, memory: u64, test_jobs: usize, distance: D) -> Self {
         assert!(capacity > 0, "a scheduler runs at least one build");
+        assert!(test_jobs > 0, "tests have a positive concurrency");
         Self {
             capacity,
             memory,
+            test_jobs,
             distance,
             built_worktrees: HashSet::new(),
             clock: 0,
@@ -797,20 +809,40 @@ impl<D: Distance> Scheduler<D> {
         }
     }
 
-    /// Cargo reported that running job `id` finished compiling. Returns
-    /// whether its tests run now.
-    pub(crate) fn compiled(&mut self, id: JobId) -> bool {
+    /// The running job entered testing. Release its compilation reservation
+    /// when a test-phase peak is known, and admit work that now fits.
+    pub(crate) fn testing(&mut self, id: JobId) -> Vec<Effect> {
+        let test_memory = self.jobs.get(&id).and_then(|job| {
+            let compilation = Compilation::of(job);
+            self.slots
+                .iter()
+                .filter(|slot| slot.repository == job.repository)
+                .flat_map(|slot| &slot.compilations)
+                .filter(|run| run.compilation == compilation)
+                .filter_map(|run| run.test_memory)
+                .filter(|tests| tests.jobs == self.test_jobs)
+                .map(|tests| tests.peak_memory)
+                .max()
+        });
         // Like output, a report can arrive after the build ended.
         let Some(Job {
-            state: State::Running { compiled_at, .. },
+            state: State::Running {
+                testing_at, memory, ..
+            },
             operation,
             ..
         }) = self.jobs.get_mut(&id)
         else {
-            return false;
+            return Vec::new();
         };
-        compiled_at.get_or_insert_with(Instant::now);
-        operation.command.runs_tests()
+        if !operation.command.runs_tests() || testing_at.is_some() {
+            return Vec::new();
+        }
+        *testing_at = Some(Instant::now());
+        if let Some(peak) = test_memory {
+            *memory = peak;
+        }
+        self.start_ready()
     }
 
     /// Cargo succeeded for running job `id`, whose executables are being
@@ -876,15 +908,15 @@ impl<D: Distance> Scheduler<D> {
         let State::Running {
             slot,
             started,
-            compiled_at,
+            testing_at,
             ..
         } = job.state
         else {
             panic!("only running jobs exit");
         };
-        let test_ms = compiled_at
+        let test_ms = testing_at
             .filter(|_| job.operation.command.runs_tests())
-            .map(|compiled_at| millis(compiled_at.elapsed()));
+            .map(|testing_at| millis(testing_at.elapsed()));
         let compilation = Compilation::of(&job);
         let entry = &mut self.slots[slot];
         // Every unit the build used ends its use now, in the order Cargo
@@ -904,7 +936,7 @@ impl<D: Distance> Scheduler<D> {
                 std::mem::take(&mut job.units).into_keys().collect(),
                 *code == 0,
                 build_ms,
-                usage.map(|usage| usage.peak_memory),
+                usage,
             );
         }
         let persist = entry.persist();
@@ -948,7 +980,7 @@ impl<D: Distance> Scheduler<D> {
                 .unwrap_or(0),
             compiled: job.compiled,
             fresh: job.fresh,
-            usage,
+            usage: usage.map(Box::new),
             report,
         })];
         effects.push(persist);
@@ -1386,7 +1418,7 @@ impl<D: Distance> Scheduler<D> {
             job.state = State::Running {
                 slot,
                 started: Instant::now(),
-                compiled_at: None,
+                testing_at: None,
                 copying: false,
                 cancelled: false,
                 memory,
@@ -1476,9 +1508,8 @@ impl<D: Distance> Scheduler<D> {
         (self.memory, self.memory_in_use())
     }
 
-    /// What a build of `job` is expected to use at its peak: what the latest
-    /// build of its compilation used, or the most any build of the same
-    /// command used; nothing when no build of it ran.
+    /// Largest recorded peak of this compilation, or of its command when
+    /// the compilation is unknown. Filters cannot lower a broader run's peak.
     fn memory_estimate(&self, job: &Job) -> u64 {
         let compilation = Compilation::of(job);
         self.compilation_memory(&job.repository, &compilation)
@@ -1503,8 +1534,8 @@ impl<D: Distance> Scheduler<D> {
         };
         runs()
             .filter(|run| &run.compilation == compilation && run.peak_memory.is_some())
-            .max_by_key(|run| run.at)
-            .and_then(|run| run.peak_memory)
+            .filter_map(|run| run.peak_memory)
+            .max()
             .or_else(|| {
                 runs()
                     .filter(|run| run.compilation.command == compilation.command)
@@ -1695,7 +1726,7 @@ impl<D: Distance> Scheduler<D> {
                     let job = &self.jobs[&id];
                     let State::Running {
                         started,
-                        compiled_at,
+                        testing_at,
                         copying,
                         cancelled,
                         ..
@@ -1716,7 +1747,7 @@ impl<D: Distance> Scheduler<D> {
                             Phase::Copying
                         } else if !job.operation.command.uses_cargo() {
                             Phase::Running
-                        } else if job.operation.command.runs_tests() && compiled_at.is_some() {
+                        } else if job.operation.command.runs_tests() && testing_at.is_some() {
                             Phase::Testing
                         } else {
                             Phase::Compiling
@@ -1850,7 +1881,7 @@ mod tests {
     }
 
     fn scheduler(capacity: usize) -> Scheduler<Table> {
-        Scheduler::new(capacity, u64::MAX, Table::default())
+        Scheduler::new(capacity, u64::MAX, 2, Table::default())
     }
 
     fn source(worktree: &str) -> Source {
@@ -2811,6 +2842,107 @@ mod tests {
     }
 
     #[test]
+    fn entering_testing_releases_the_compile_peak_and_starts_waiting_work() {
+        let mut scheduler = checked_and_tested();
+        scheduler.memory = 10;
+        scheduler.slots[0].compilations[0].peak_memory = Some(4);
+        let history = &mut scheduler.slots[1].compilations[0];
+        history.peak_memory = Some(8);
+        history.test_memory = Some(crate::protocol::TestMemory {
+            jobs: 2,
+            peak_memory: 2,
+        });
+        let running = submit_operation(&mut scheduler, 3, "/t", "t1", Command::Nextest, &[]);
+        let [(job, ..)] = starts(&running)[..] else {
+            panic!("{running:?}");
+        };
+        assert!(starts(&submit(&mut scheduler, 4, "/c", "c1")).is_empty());
+        assert_eq!(scheduler.memory(), (10, 8));
+        let admitted = scheduler.testing(job);
+        assert_eq!(starts(&admitted).len(), 1, "{admitted:?}");
+        assert_eq!(scheduler.memory(), (10, 6));
+        assert!(scheduler.status(|_| 0).1.is_empty());
+        assert!(
+            scheduler.testing(job).is_empty(),
+            "the transition is idempotent"
+        );
+    }
+
+    #[test]
+    fn unknown_test_peaks_and_other_test_concurrency_keep_the_full_reservation() {
+        for previous_jobs in [None, Some(1)] {
+            let mut scheduler = checked_and_tested();
+            scheduler.memory = 10;
+            scheduler.slots[0].compilations[0].peak_memory = Some(4);
+            let history = &mut scheduler.slots[1].compilations[0];
+            history.peak_memory = Some(8);
+            history.test_memory = previous_jobs.map(|jobs| crate::protocol::TestMemory {
+                jobs,
+                peak_memory: 2,
+            });
+            let running = submit_operation(&mut scheduler, 3, "/t", "t1", Command::Test, &[]);
+            let [(job, ..)] = starts(&running)[..] else {
+                panic!("{running:?}");
+            };
+            assert!(starts(&submit(&mut scheduler, 4, "/c", "c1")).is_empty());
+            assert!(scheduler.testing(job).is_empty());
+            assert_eq!(scheduler.memory(), (10, 8));
+            assert_eq!(scheduler.status(|_| 0).1.len(), 1);
+        }
+    }
+
+    #[test]
+    fn filtered_runs_cannot_erase_a_broader_runs_memory_peaks() {
+        let mut scheduler = checked_and_tested();
+        let slot = &mut scheduler.slots[1];
+        let compilation = slot.compilations[0].compilation.clone();
+        let history = &mut slot.compilations[0];
+        history.peak_memory = Some(8);
+        history.test_memory = Some(crate::protocol::TestMemory {
+            jobs: 2,
+            peak_memory: 4,
+        });
+        slot.ran(
+            compilation.clone(),
+            units("t", 12),
+            true,
+            1,
+            Some(Usage {
+                cpu_ms: 1,
+                peak_memory: 3,
+                test_memory: Some(crate::protocol::TestMemory {
+                    jobs: 2,
+                    peak_memory: 1,
+                }),
+            }),
+        );
+        assert_eq!(slot.compilations[0].peak_memory, Some(8));
+        assert_eq!(slot.compilations[0].test_memory.unwrap().peak_memory, 4);
+        let record = persisted(&[slot.persist()])[0].1.clone();
+        let mut restored = super::Scheduler::new(2, 10, 2, Table::default());
+        restored.restore("/repo/.git".into(), 0, revision("r1"), record);
+        assert_eq!(
+            restored.forecast_memory(
+                Path::new("/repo/.git"),
+                Path::new(""),
+                &Operation {
+                    command: Command::Nextest,
+                    args: Vec::new(),
+                    rustflags: Vec::new(),
+                }
+            ),
+            8
+        );
+        assert_eq!(
+            restored.slots[0].compilations[0]
+                .test_memory
+                .unwrap()
+                .peak_memory,
+            4
+        );
+    }
+
+    #[test]
     fn evicted_units_count_as_missing() {
         let mut scheduler = checked_and_tested();
         scheduler.distance.0.insert(("b1".into(), "c1".into()), 1);
@@ -3097,7 +3229,7 @@ mod tests {
         let Effect::Persist { record, .. } = slot.persist() else {
             panic!("persist")
         };
-        let mut restarted = super::Scheduler::new(1, u64::MAX, Table::default());
+        let mut restarted = super::Scheduler::new(1, u64::MAX, 2, Table::default());
         restarted.restore("/repo/.git".into(), 0, revision("a1"), record);
         let slot = &mut restarted.slots[0];
         slot.ran(compilation(KEPT_COMPILATIONS), units("a", 1), true, 1, None);
@@ -3131,9 +3263,10 @@ mod tests {
                 units: units("a", 1).into_iter().collect(),
                 build_ms: Some(1),
                 peak_memory: None,
+                test_memory: None,
             },
         );
-        let mut restored = super::Scheduler::new(1, u64::MAX, Table::default());
+        let mut restored = super::Scheduler::new(1, u64::MAX, 2, Table::default());
         restored.restore("/repo/.git".into(), 0, revision("a1"), record);
         assert_eq!(restored.slots[0].compilations.len(), KEPT_COMPILATIONS);
         assert_eq!(
@@ -3230,15 +3363,16 @@ mod tests {
         let usage = Usage {
             cpu_ms: 1200,
             peak_memory: 1 << 20,
+            test_memory: None,
         };
         let finished = scheduler.exited(job, &ok(), Some(usage), BuildReport::default());
         assert!(matches!(
             reports(&finished)[..],
             [
-                EventKind::Finished { compiled: 1, fresh: 2, usage: Some(Usage { cpu_ms: 1200, .. }), who, .. },
+                EventKind::Finished { compiled: 1, fresh: 2, usage: Some(usage), who, .. },
                 // The next build starts in the slot that just did `check`.
                 EventKind::Started { warm: true, first: true, .. },
-            ] if who.len() == 2
+            ] if who.len() == 2 && usage.cpu_ms == 1200
         ));
     }
 
@@ -3253,7 +3387,7 @@ mod tests {
             scheduler.status(|_| 0).0[0].build.as_ref().unwrap().phase,
             Phase::Compiling
         );
-        scheduler.compiled(job);
+        scheduler.testing(job);
         assert_eq!(
             scheduler.status(|_| 0).0[0].build.as_ref().unwrap().phase,
             Phase::Testing
@@ -3285,7 +3419,7 @@ mod tests {
         let [(job, ..)] = starts(&effects)[..] else {
             panic!("{effects:?}");
         };
-        scheduler.compiled(job);
+        scheduler.testing(job);
         let finished = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert!(matches!(
             sent(&finished, 2)[..],
@@ -3343,6 +3477,7 @@ mod tests {
                 units: units("c", 12).into_iter().collect(),
                 build_ms: None,
                 peak_memory: None,
+                test_memory: None,
             }],
             units: units("c", 12)
                 .into_iter()

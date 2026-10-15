@@ -31,7 +31,7 @@ use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
     Activity, BuildReport, BuildRequest, Capacity, EventKind, Failures, Message, Mirror, Outcome,
-    RemoteActivity, Request, RevisionRequest, Shortage, Status, Usage,
+    RemoteActivity, Request, RevisionRequest, Shortage, Status, TestMemory, Usage,
 };
 use crate::remote;
 use crate::run::{self, RunDirectory};
@@ -44,8 +44,6 @@ use crate::snapshot::{self, Source};
 /// How long a cancelled build may take to stop after `SIGTERM` before its
 /// process group is killed.
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
-/// How often a build's memory is sampled.
-const MEMORY_SAMPLE: Duration = Duration::from_secs(1);
 /// How long output is still read after Cargo exits. Only a process that left
 /// the build's process group can hold the output open longer; its remaining
 /// output is abandoned.
@@ -102,7 +100,7 @@ enum Event {
         unit: String,
     },
     /// Cargo finished compiling for `job`; a test build runs its tests now.
-    Compiled {
+    Testing {
         job: JobId,
     },
     /// Cargo succeeded for `job`; its executables are copied out now.
@@ -208,7 +206,12 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .name("buildd-accept".into())
         .spawn(move || accepting.accept(&listener))
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
-    let mut scheduler = Scheduler::new(config.slots, config.memory, GitDistance::default());
+    let mut scheduler = Scheduler::new(
+        config.slots,
+        config.memory,
+        config.test_jobs,
+        GitDistance::default(),
+    );
     restore_slots(home, &config, &mut scheduler)?;
     crate::prewarm::spawn(home, config.prewarm.clone());
     Daemon {
@@ -1052,13 +1055,11 @@ impl Daemon {
                     self.scheduler.unit_used(job, unit);
                     Vec::new()
                 }
-                Event::Compiled { job } => {
-                    if self.scheduler.compiled(job)
-                        && let Some(run) = self.runs.get(&job)
-                    {
+                Event::Testing { job } => {
+                    if let Some(run) = self.runs.get(&job) {
                         run.testing();
                     }
-                    Vec::new()
+                    self.scheduler.testing(job)
                 }
                 Event::Copying { job } => {
                     self.scheduler.copying(job);
@@ -1662,6 +1663,12 @@ impl Building {
             Stream::Cargo {
                 target,
                 products: Arc::clone(&products),
+                tests: operation.command.runs_tests()
+                    && !operation
+                        .args
+                        .iter()
+                        .take_while(|arg| arg.as_str() != "--")
+                        .any(|arg| arg == "--no-run"),
             },
         )?;
         let products = std::mem::take(
@@ -1741,14 +1748,21 @@ impl Building {
             state.exited = false;
             child
         };
+        let pid = Pid::from_child(&child);
+        let monitor = match memory::Monitor::start(child.id()) {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                kill_leftovers(pid);
+                self.run.lock().exited = true;
+                reap(&child);
+                return Err(format!("could not start memory sampling: {error}"));
+            }
+        };
         let (done, finished) = crossbeam_channel::bounded(2);
         let output = child.stdout.take().expect("the process's output is piped");
         let errors = child.stderr.take().expect("the process's errors are piped");
-        self.forward(output, stdout, done.clone());
-        self.forward(errors, Stream::Stderr, done);
-
-        let pid = Pid::from_child(&child);
-        let peak = self.sample_memory(pid);
+        self.forward(output, stdout, done.clone(), Some(monitor.events.clone()));
+        self.forward(errors, Stream::Stderr, done, None);
         // Wait without reaping, so the process group id cannot be reused
         // while the group's remaining processes are killed and before a
         // pending cancellation learns that the process exited.
@@ -1764,10 +1778,15 @@ impl Building {
                 }
             }
         }
+        let (peak, test_peak) = monitor.finish();
         kill_leftovers(pid);
         self.run.lock().exited = true;
         let (status, mut usage) = reap(&child);
-        usage.peak_memory = usage.peak_memory.max(peak.load(Ordering::Relaxed));
+        usage.peak_memory = usage.peak_memory.max(peak);
+        usage.test_memory = test_peak.map(|peak_memory| TestMemory {
+            jobs: self.test_jobs,
+            peak_memory,
+        });
         let deadline = std::time::Instant::now() + OUTPUT_GRACE;
         for _ in 0..2 {
             if finished.recv_deadline(deadline).is_err() {
@@ -1775,29 +1794,6 @@ impl Building {
             }
         }
         Ok((status, usage))
-    }
-
-    /// Samples the resident memory of process group `group` every
-    /// [`MEMORY_SAMPLE`] until its leader exits, keeping the peak.
-    fn sample_memory(&self, group: Pid) -> Arc<AtomicU64> {
-        let peak = Arc::new(AtomicU64::new(0));
-        let sampled = Arc::clone(&peak);
-        let run = Arc::clone(&self.run);
-        let spawned = std::thread::Builder::new()
-            .name("buildd-memory".into())
-            .spawn(move || {
-                while !run.lock().exited {
-                    sampled.fetch_max(
-                        memory::group_resident(group.as_raw_nonzero().get()),
-                        Ordering::Relaxed,
-                    );
-                    std::thread::sleep(MEMORY_SAMPLE);
-                }
-            });
-        if let Err(error) = spawned {
-            log!("could not sample a build's memory: {error}");
-        }
-        peak
     }
 
     /// Copies `products` into `directory` and tells the build's waiters
@@ -1846,6 +1842,7 @@ impl Building {
         output: impl std::io::Read + Send + 'static,
         stream: Stream,
         done: Sender<()>,
+        memory: Option<Sender<memory::Sample>>,
     ) {
         let events = self.events.clone();
         let job = self.start.job;
@@ -1876,7 +1873,11 @@ impl Building {
                             log_line(&log, &line, BuildLog::stdout);
                             vec![stdout(line)]
                         }
-                        Stream::Cargo { target, products } => match Line::of(&line) {
+                        Stream::Cargo {
+                            target,
+                            products,
+                            tests,
+                        } => match Line::of(&line) {
                             Line::Crate {
                                 fresh,
                                 outputs,
@@ -1899,9 +1900,17 @@ impl Building {
                                 .map(|unit| Event::BuildScript { job, unit })
                                 .into_iter()
                                 .collect(),
-                            Line::BuildFinished => {
+                            Line::BuildFinished { success } => {
                                 log_line(&log, &line, BuildLog::stdout);
-                                vec![Event::Compiled { job }, stdout(line)]
+                                if *tests && success {
+                                    let _ = memory
+                                        .as_ref()
+                                        .expect("Cargo has a sampler")
+                                        .send(memory::Sample::Testing);
+                                    vec![Event::Testing { job }, stdout(line)]
+                                } else {
+                                    vec![stdout(line)]
+                                }
                             }
                             Line::Forward => {
                                 log_line(&log, &line, BuildLog::stdout);
@@ -1931,6 +1940,7 @@ enum Stream {
     Cargo {
         target: PathBuf,
         products: Arc<Mutex<Vec<Product>>>,
+        tests: bool,
     },
     /// A command's standard output, passed on as it is.
     Stdout,
@@ -1990,6 +2000,7 @@ fn reap(child: &std::process::Child) -> (ExitStatus, Usage) {
         cpu_ms: millis(usage.ru_utime) + millis(usage.ru_stime),
         peak_memory: u64::try_from(usage.ru_maxrss).expect("memory sizes are positive")
             * MAX_RSS_UNIT,
+        test_memory: None,
     };
     (ExitStatus::from_raw(status), usage)
 }

@@ -601,8 +601,8 @@ pub enum EventKind {
         queued_ms: u64,
         compiled: u64,
         fresh: u64,
-        /// What Cargo and its compilers used, when it ran.
-        usage: Option<Usage>,
+        /// What the build and its processes used, when it ran.
+        usage: Option<Box<Usage>>,
         #[serde(default)]
         report: BuildReport,
     },
@@ -651,12 +651,22 @@ impl Shortage {
     }
 }
 
-/// What a Cargo run and the compilers it started used.
+/// What a build and the processes it started used.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub cpu_ms: u64,
-    /// The largest resident memory of its process group, summed over its
-    /// processes and sampled every second, in bytes.
+    /// Peak summed resident memory of its process tree and process group,
+    /// sampled every second, in bytes.
+    pub peak_memory: u64,
+    /// Its test phase, when it was sampled separately from compilation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_memory: Option<TestMemory>,
+}
+
+/// A measured test-phase peak and the concurrency under which it was measured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestMemory {
+    pub jobs: usize,
     pub peak_memory: u64,
 }
 

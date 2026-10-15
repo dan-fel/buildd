@@ -63,9 +63,13 @@ pub(crate) struct CompilationRun {
     /// The wall time of the latest successful build, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) build_ms: Option<u64>,
-    /// The peak memory of the latest build, its processes summed, in bytes.
+    /// Largest measured peak for this compilation, its processes summed,
+    /// in bytes. Execution filters must not erase a broader run's peak.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) peak_memory: Option<u64>,
+    /// Largest sampled test-phase peak at the recorded test concurrency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) test_memory: Option<crate::protocol::TestMemory>,
 }
 
 /// A slot directory a daemon left behind.
@@ -1159,6 +1163,7 @@ mod tests {
                 units: ["debug/0123456789abcdef".to_owned()].into(),
                 build_ms: Some(4200),
                 peak_memory: None,
+                test_memory: None,
             }],
             units: [(
                 "debug/0123456789abcdef".to_owned(),

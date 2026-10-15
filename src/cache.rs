@@ -2195,7 +2195,7 @@ mod tests {
                 std::fs::write(target.join(path), [7_u8; 8192]).unwrap();
             }
             std::fs::write(home.0.join("keep.log"), "logs").unwrap();
-            let mut scheduler = Scheduler::new(1, u64::MAX, EqualDistance);
+            let mut scheduler = Scheduler::new(1, u64::MAX, 2, EqualDistance);
             let revision = Revision::of_tree("1234");
             let compilation = crate::cargo::Compilation::new(
                 Path::new(""),
@@ -2222,6 +2222,7 @@ mod tests {
                         units: ["debug/aaaaaaaaaaaaaaaa".into()].into_iter().collect(),
                         build_ms: None,
                         peak_memory: None,
+                        test_memory: None,
                     }],
                     passed: vec![crate::passed::PassedBinary {
                         id: "test".into(),
