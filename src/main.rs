@@ -615,14 +615,31 @@ fn serve(home: &Path) -> Result<ExitCode, String> {
     std::thread::Builder::new()
         .name("buildd-serve-input".into())
         .spawn(move || {
-            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_daemon);
+            let _ = forward_lines(std::io::stdin().lock(), &mut to_daemon);
             let _ = to_daemon.shutdown(std::net::Shutdown::Write);
         })
         .map_err(|error| format!("could not read standard input: {error}"))?;
-    let mut from_daemon = stream;
-    std::io::copy(&mut from_daemon, &mut std::io::stdout().lock())
+    forward_lines(std::io::BufReader::new(stream), std::io::stdout().lock())
         .map_err(|error| format!("lost the daemon: {error}"))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Publish each newline-delimited protocol frame before waiting for another.
+/// A bulk socket-to-pipe splice can wait with the pipe locked, preventing
+/// SSH from reading even the frame already delivered and answering keepalives.
+fn forward_lines(
+    mut input: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> std::io::Result<()> {
+    let mut frame = Vec::new();
+    loop {
+        frame.clear();
+        if input.read_until(b'\n', &mut frame)? == 0 {
+            return Ok(());
+        }
+        output.write_all(&frame)?;
+        output.flush()?;
+    }
 }
 
 /// Connects to the daemon, starting it when none runs.

@@ -562,6 +562,65 @@ use buildd::cargo::{Command, Operation};
 use buildd::client;
 use buildd::protocol::{Activity, BuildRequest, EventKind, Message, Outcome, Status};
 
+#[test]
+fn serve_publishes_a_queued_frame_before_waiting_for_more_output_and_relays_eof() {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    use std::process::Stdio;
+
+    let home = TempDir::new();
+    let listener = UnixListener::bind(home.0.join("sock")).unwrap();
+    let queued = b"{\"type\":\"queued\",\"revision\":\"abc\"}\n";
+    let withdrawn = b"{\"type\":\"rejected\",\"reason\":\"withdrawn\"}\n";
+    let mut serve = Process::new(env!("CARGO_BIN_EXE_buildd"))
+        .arg("serve")
+        .env("BUILDD_HOME", &home.0)
+        .env_remove("BUILDD_SOCKET")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let daemon = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut input = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        input.read_line(&mut request).unwrap();
+        assert_eq!(request, "{\"type\":\"status\"}\n");
+        stream.write_all(queued).unwrap();
+        // The next message cannot arrive until the requester withdraws.
+        // Waiting must leave the already-published stdout pipe readable.
+        let mut tail = Vec::new();
+        input.read_to_end(&mut tail).unwrap();
+        assert!(tail.is_empty());
+        stream.write_all(withdrawn).unwrap();
+    });
+    let mut input = serve.stdin.take().unwrap();
+    input.write_all(b"{\"type\":\"status\"}\n").unwrap();
+    let output = serve.stdout.take().unwrap();
+    let (published, publication) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = BufReader::new(output);
+        let mut frame = Vec::new();
+        output.read_until(b'\n', &mut frame).unwrap();
+        published.send(frame).unwrap();
+        let mut rest = Vec::new();
+        output.read_to_end(&mut rest).unwrap();
+        rest
+    });
+    let first = publication.recv_timeout(Duration::from_secs(2));
+    // Release the fixture even when the first frame was stranded. This
+    // lets the old splice finish too, so a regression fails without hanging.
+    drop(input);
+    assert!(serve.wait().unwrap().success());
+    let rest = reader.join().unwrap();
+    daemon.join().unwrap();
+    assert_eq!(
+        first.expect("queued frame arrives before requester EOF"),
+        queued
+    );
+    assert_eq!(rest, withdrawn);
+}
+
 /// A temporary directory, removed when dropped. Its path is short: socket
 /// paths are limited to about a hundred bytes.
 struct TempDir(PathBuf);
