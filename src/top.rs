@@ -1,29 +1,68 @@
 //! `buildd top`: what the daemon is doing, refreshed twice a second.
 //!
-//! It shows the slots and what they build for whom, the queue, what sharing
-//! saved since the daemon started, and its recent events.
+//! Hosts share one layout: budgets first, then running and queued work.
+//! Commands, idle caches and statistics expand on request; the content scrolls.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use buildd::cargo::{Command, Operation};
 use buildd::protocol::{
-    Activity, Chore, EventKind, Outcome, Percentiles, Phase, RemoteActivity, Shortage, SlotStatus,
-    Speed,
+    Activity, Chore, EventKind, Outcome, Percentiles, Phase, QueuedBuild, RemoteActivity, Shortage,
+    SlotStatus, Speed, Status,
 };
 use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize as _};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 /// How often the view asks the daemon again.
 const REFRESH: Duration = Duration::from_millis(500);
 /// How long the view waits between asking what remote hosts do: each ask
 /// starts a login shell on each host, and waits for the slowest.
 const REMOTE_REFRESH: Duration = Duration::from_secs(2);
-/// Width of a slot's disk bar.
-const BAR: usize = 12;
+/// The user's view choices, independent of the daemon's changing activity.
+#[derive(Default)]
+pub(crate) struct View {
+    scroll: u16,
+    commands: bool,
+    idle: bool,
+    stats: bool,
+}
+
+impl View {
+    /// Handles navigation; returns true when the user asks to quit.
+    fn key(&mut self, key: KeyEvent, page: u16) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(page),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = u16::MAX,
+            KeyCode::Char(toggle @ ('d' | 'i' | 's')) => {
+                let setting = match toggle {
+                    'd' => &mut self.commands,
+                    'i' => &mut self.idle,
+                    's' => &mut self.stats,
+                    _ => unreachable!("the outer match selected a view toggle"),
+                };
+                *setting = !*setting;
+                self.scroll = 0;
+            }
+            _ => {}
+        }
+        false
+    }
+}
 
 /// Shows what `fetch` returns, with what `fetch_remotes` last returned, until
 /// the user quits with q, Esc or Ctrl-C. Remote hosts are asked on a thread
@@ -49,6 +88,7 @@ pub(crate) fn run(
         .map_err(|error| format!("could not ask remote hosts: {error}"))?;
     let mut terminal =
         ratatui::try_init().map_err(|error| format!("could not set up the terminal: {error}"))?;
+    let mut view = View::default();
     let result = (|| {
         loop {
             let activity = fetch();
@@ -57,15 +97,15 @@ pub(crate) fn run(
                 .expect("no thread panics holding the remotes")
                 .clone();
             terminal
-                .draw(|frame| draw(frame, &activity, &remotes, SystemTime::now()))
+                .draw(|frame| draw(frame, &activity, &remotes, SystemTime::now(), &mut view))
                 .map_err(|error| format!("could not draw: {error}"))?;
             if event::poll(REFRESH).map_err(|error| format!("could not read keys: {error}"))?
                 && let Event::Key(key) =
                     event::read().map_err(|error| format!("could not read keys: {error}"))?
-                && key.kind == KeyEventKind::Press
-                && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)))
+                && view.key(
+                    key,
+                    terminal.size().map_err(|error| error.to_string())?.height / 2,
+                )
             {
                 return Ok(());
             }
@@ -75,232 +115,475 @@ pub(crate) fn run(
     result
 }
 
-/// Draws `activity` and what `remotes` do as of `now`, or why there is none.
+/// Draws the latest activity without giving idle caches or long commands
+/// priority over the work the user is waiting for.
 pub(crate) fn draw(
     frame: &mut Frame<'_>,
     activity: &Result<Activity, String>,
     remotes: &[RemoteActivity],
     now: SystemTime,
+    view: &mut View,
 ) {
     let activity = match activity {
         Ok(activity) => activity,
         Err(error) => {
-            let text = format!("buildd: {error}\nretrying…");
-            frame.render_widget(Paragraph::new(text).red(), frame.area());
+            frame.render_widget(
+                Paragraph::new(format!("buildd: {error}\nretrying… · q quit")).red(),
+                frame.area(),
+            );
             return;
         }
     };
-    let status = &activity.status;
-    let slot_rows = 2 * status.slots.len().max(1);
-    let queue_rows = status.queue.len().clamp(1, 8);
-    let remote_lines = remotes.iter().flat_map(remote_lines).collect::<Vec<_>>();
-    let remote_rows = if remote_lines.is_empty() {
-        0
-    } else {
-        remote_lines.len() + 2
-    };
-    let [
-        header,
-        speed,
-        slots,
-        queue,
-        remote_area,
-        totals,
-        events,
-        footer,
-    ] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(rows(slot_rows + 2)),
-        Constraint::Length(rows(queue_rows + 2)),
-        Constraint::Length(rows(remote_rows)),
-        Constraint::Length(7),
-        Constraint::Min(3),
+    let hosts = std::iter::once(("local", activity))
+        .chain(remotes.iter().filter_map(|remote| {
+            remote
+                .activity
+                .as_ref()
+                .ok()
+                .map(|activity| (remote.name.as_str(), activity.as_ref()))
+        }))
+        .collect::<Vec<_>>();
+    let mut summaries = host_lines("local", std::env::consts::OS, &activity.status);
+    for remote in remotes {
+        match &remote.activity {
+            Ok(activity) => {
+                summaries.extend(host_lines(&remote.name, &remote.os, &activity.status))
+            }
+            Err(error) => summaries.push(
+                Line::from(format!(
+                    "{} ({})  unreachable: {error}",
+                    remote.name, remote.os,
+                ))
+                .red(),
+            ),
+        }
+    }
+    let header =
+        Paragraph::new(summaries)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(format!(
+                " buildd · up {} ",
+                ago(activity.started_at_ms, now)
+            )));
+    let header_height = header
+        .line_count(frame.area().width)
+        .min(usize::from(frame.area().height.saturating_sub(5)));
+    let [header_area, content_area, footer] = Layout::vertical([
+        Constraint::Length(rows(header_height)),
+        Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(frame.area());
+    frame.render_widget(header, header_area);
 
-    let measured = status.slots.iter().filter_map(|slot| slot.size);
-    let disk = status.disk_used;
-    let in_use = status.jobs - status.idle_jobs;
-    let uptime = ago(activity.started_at_ms, now);
-    let free = match status.free_disk {
-        Some(free) if free < status.min_free => {
-            Span::from(format!(" · {} free, below the floor", gib(free))).red()
+    let mut lines = Vec::new();
+    if view.stats {
+        for (host, activity) in &hosts {
+            lines.push(Line::from(format!("{host} · since start")).bold());
+            lines.extend(statistics(activity));
+            lines.push(speed_line(&activity.speed));
+            lines.push(Line::default());
         }
-        Some(free) => Span::from(format!(" · {} free", gib(free))),
-        None => Span::from(" · free disk unknown").red(),
-    };
-    let disk_line = Span::from(format!(
-        "disk {:.1}/{}",
-        gib_number(disk),
-        gib(status.disk_budget)
-    ));
-    let disk_line = if status.undersized {
-        Span::from(format!("{disk_line}, budget below what builds use")).red()
-    } else {
-        disk_line
-    };
-    frame.render_widget(
-        Line::from(vec![
-            Span::from(" buildd ").bold().reversed(),
-            Span::from(format!("  up {uptime} · {} slots · ", status.capacity)),
-            disk_line,
-            Span::from(format!(
-                " · jobs {in_use}/{} · memory {:.1}/{}",
-                status.jobs,
-                gib_number(status.memory_in_use),
-                gib(status.memory),
-            )),
-            free,
-        ]),
-        header,
-    );
-
-    frame.render_widget(speed_line(&activity.speed), speed);
-
-    let slot_lines = if status.slots.is_empty() {
-        vec![Line::from("no slots yet: the first build creates one").dark_gray()]
-    } else {
-        status
-            .slots
-            .iter()
-            .flat_map(|slot| slot_lines(slot, status.disk_budget))
-            .collect()
-    };
-    frame.render_widget(
-        Paragraph::new(slot_lines).block(Block::bordered().title(" slots ")),
-        slots,
-    );
-
-    let queue_lines = if status.queue.is_empty() {
-        vec![Line::from("nothing waiting").dark_gray()]
-    } else {
-        status
-            .queue
-            .iter()
-            .enumerate()
-            .map(|(position, build)| {
-                let estimate = build
-                    .estimate_ms
-                    .map_or_else(String::new, |estimate| format!(" · ~{}", seconds(estimate)));
-                let memory = build.memory_needed.map_or_else(String::new, |needed| {
-                    format!(" · waiting for memory (needs {})", gib(needed))
+    }
+    let running = hosts
+        .iter()
+        .flat_map(|(_, activity)| &activity.status.slots)
+        .filter(|slot| slot.build.is_some() || slot.chore.is_some())
+        .count();
+    lines.push(Line::from(format!("ACTIVE  {running}")).bold().cyan());
+    for (host, activity) in &hosts {
+        for slot in &activity.status.slots {
+            if slot.build.is_some() || slot.chore.is_some() {
+                lines.extend(running_lines(host, slot, view.commands));
+            }
+        }
+    }
+    if running == 0 {
+        lines.push(Line::from("No builds running").dark_gray());
+    }
+    lines.push(Line::default());
+    let queued: usize = hosts
+        .iter()
+        .map(|(_, activity)| activity.status.queue.len())
+        .sum();
+    lines.push(Line::from(format!("QUEUED  {queued}")).bold().yellow());
+    for (host, activity) in &hosts {
+        for (position, build) in activity.status.queue.iter().enumerate() {
+            lines.extend(queued_lines(host, position + 1, build, view.commands));
+        }
+    }
+    if queued == 0 {
+        lines.push(Line::from("Nothing waiting").dark_gray());
+    }
+    if view.idle {
+        lines.push(Line::default());
+        lines.push(Line::from("IDLE CACHES").bold());
+        for (host, activity) in &hosts {
+            for slot in &activity.status.slots {
+                if slot.build.is_some() || slot.chore.is_some() {
+                    continue;
+                }
+                let size = slot.size.map_or_else(|| "unmeasured".to_owned(), gib);
+                let last = slot
+                    .worktree
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map_or_else(String::new, |name| {
+                        format!(" · last for {}", name.to_string_lossy())
+                    });
+                let duplicated = slot
+                    .duplicated
+                    .filter(|count| *count > 0)
+                    .map_or_else(String::new, |count| format!(" · {count} duplicated crates"));
+                let ended = slot.last.as_ref().map_or_else(String::new, |last| {
+                    format!(" · {}", took(last.build_ms, last.test_ms))
                 });
-                let held = build.held.as_ref().map_or_else(String::new, |hold| {
-                    format!(
-                        " · for {} (~{}, cold ~{})",
-                        short_slot(&hold.slot),
-                        seconds(hold.wait_ms),
-                        seconds(hold.cold_ms)
-                    )
-                });
-                Line::from(format!(
-                    "{}. {}  {} @ {}  waiting {}{estimate}{memory}{held}",
-                    position + 1,
-                    build.who.join(", "),
-                    build.operation,
-                    build.revision.short(),
-                    seconds(build.waited_ms),
-                ))
-            })
-            .collect()
-    };
-    frame.render_widget(
-        Paragraph::new(queue_lines).block(Block::bordered().title(" queue ")),
-        queue,
-    );
-    if !remote_lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(remote_lines).block(Block::bordered().title(" remote hosts ")),
-            remote_area,
-        );
+                lines.push(
+                    Line::from(format!(
+                        "{host} {}  {size}{last}{duplicated}{ended}",
+                        short_slot(&slot.name),
+                    ))
+                    .dark_gray(),
+                );
+            }
+        }
     }
 
-    let t = &activity.totals;
-    let crates = t.compiled + t.fresh;
-    let mut total_lines = vec![
-        Line::from(vec![
-            Span::from(format!("requests {} → Cargo runs {}", t.requests, t.builds)).bold(),
-            Span::from(format!(
-                "    shared {} · replaced {} · dropped {} · cancelled {}",
-                t.shared, t.replaced, t.dropped, t.cancelled
-            )),
-        ]),
-        if crates == 0 {
-            Line::from("no crates built yet").dark_gray()
-        } else {
-            Line::from(vec![
-                Span::from(format!("crates reused {}", percent(t.fresh, crates))).green(),
-                Span::from(format!(
-                    "  ({} of {crates}; compiled {})",
-                    t.fresh, t.compiled
-                )),
-            ])
-        },
+    // Local and remote events share one timeline, newest first.
+    let mut events = hosts
+        .iter()
+        .flat_map(|(host, activity)| activity.events.iter().map(move |event| (*host, event)))
+        .collect::<Vec<_>>();
+    events.sort_by_key(|(_, event)| std::cmp::Reverse(event.at_ms));
+    lines.push(Line::default());
+    lines.push(Line::from("RECENT EVENTS").bold());
+    lines.extend(
+        events
+            .into_iter()
+            .filter_map(|(host, event)| {
+                let (text, style) = describe(&event.kind)?;
+                Some(Line::from(vec![
+                    Span::from(format!("{}  {host}  ", clock(event.at_ms))).dark_gray(),
+                    Span::styled(text, style),
+                ]))
+            })
+            .take(8),
+    );
+
+    let block = Block::bordered().title(" work ");
+    let inner = block.inner(content_area);
+    let content = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = content.line_count(inner.width);
+    let max_scroll =
+        u16::try_from(height.saturating_sub(usize::from(inner.height))).unwrap_or(u16::MAX);
+    // Activity can shrink and the terminal can grow between refreshes.
+    view.scroll = view.scroll.min(max_scroll);
+    frame.render_widget(block, content_area);
+    frame.render_widget(content.scroll((view.scroll, 0)), inner);
+    let shown = |on| if on { "on" } else { "off" };
+    frame.render_widget(
         Line::from(format!(
-            "CPU {} across {} Cargo runs · test binaries skipped as passed and unchanged {}",
-            seconds(t.cpu_ms),
-            t.builds,
-            t.skipped
-        )),
-        Line::from(format!(
-            "new worktrees starting on a warm slot: {} of {}",
-            t.warm_first_builds, t.first_builds
+            " q quit · ↑↓/PgUp/PgDn scroll · d commands:{} · i idle:{} · s stats:{}  {}/{}",
+            shown(view.commands),
+            shown(view.idle),
+            shown(view.stats),
+            usize::from(view.scroll) + usize::from(height > 0),
+            height,
+        ))
+        .dark_gray(),
+        footer,
+    );
+}
+
+/// Every host uses the same activity counts and explicitly estimated memory.
+fn host_lines(name: &str, os: &str, status: &Status) -> Vec<Line<'static>> {
+    let running = status
+        .slots
+        .iter()
+        .filter(|slot| slot.build.is_some())
+        .count();
+    let idle = status
+        .slots
+        .iter()
+        .filter(|slot| slot.build.is_none() && slot.chore.is_none())
+        .count();
+    let mut first = vec![
+        Span::from(format!("{name} ({os})")).bold(),
+        Span::from(format!(
+            "  {running}/{} running · {} queued · CPU jobs {}/{} · {idle} idle caches",
+            status.capacity,
+            status.queue.len(),
+            status.jobs - status.idle_jobs,
+            status.jobs,
         )),
     ];
-    let sizes = measured.collect::<Vec<_>>();
-    total_lines.push(if sizes.is_empty() || t.worktrees == 0 {
-        Line::from(format!("disk {} for {} worktrees", gib(disk), t.worktrees))
+    if status.draining {
+        first.push(Span::from(" · draining").yellow());
+    }
+    let memory = Span::from(format!(
+        "  peak estimate {:.1}/{}",
+        gib_number(status.memory_in_use),
+        gib(status.memory),
+    ));
+    let memory = if status.memory_in_use > status.memory {
+        memory.red()
     } else {
-        let average = disk / sizes.len() as u64;
+        memory
+    };
+    let disk = Span::from(format!(
+        " · cache {:.1}/{}",
+        gib_number(status.disk_used),
+        gib(status.disk_budget),
+    ));
+    let disk = if status.undersized {
+        disk.yellow()
+    } else {
+        disk
+    };
+    let free = match status.free_disk {
+        Some(free) if free < status.min_free => Span::from(format!(
+            " · disk {} free (below {} floor)",
+            gib(free),
+            gib(status.min_free),
+        ))
+        .red(),
+        Some(free) => Span::from(format!(" · disk {} free", gib(free))),
+        None => Span::from(" · free disk unknown").red(),
+    };
+    let mut lines = vec![Line::from(first), Line::from(vec![memory, disk, free])];
+    if let Some(needed) = status.queue.iter().find_map(|build| build.memory_needed) {
+        let remaining = status.memory.saturating_sub(status.memory_in_use);
+        lines.push(
+            Line::from(format!(
+                "  Memory queue: next build needs {}; budget remaining {}",
+                gib(needed),
+                gib(remaining),
+            ))
+            .yellow(),
+        );
+    }
+    if status.undersized {
+        lines.push(Line::from("  Recent disk pressure evicted caches builds were using").yellow());
+    }
+    lines
+}
+
+fn running_lines(host: &str, slot: &SlotStatus, commands: bool) -> Vec<Line<'static>> {
+    let Some(build) = &slot.build else {
+        return vec![
+            Line::from(format!(
+                "{host} {}  {}",
+                short_slot(&slot.name),
+                chore(slot.chore)
+            ))
+            .blue(),
+        ];
+    };
+    let phase = if build.cancelled {
+        "stopping"
+    } else {
+        match build.phase {
+            Phase::Compiling => "compiling",
+            Phase::Testing => "testing",
+            Phase::Running => "running",
+            Phase::Copying => "copying",
+        }
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::from(format!("{host} {}", short_slot(&slot.name))).bold(),
+            Span::from(format!(
+                "  {phase} · {} · {} jobs  ",
+                brief(build.elapsed_ms),
+                build.tokens
+            ))
+            .yellow(),
+            Span::from(operation_summary(&build.operation)),
+        ]),
         Line::from(format!(
+            "    {} @ {} · compiled {} · reused {}{}",
+            requesters(&build.who),
+            build.revision.short(),
+            build.compiled,
+            build.fresh,
+            if build.who.len() > 1 {
+                format!(" · shared by {}", build.who.len())
+            } else {
+                String::new()
+            },
+        ))
+        .dark_gray(),
+    ];
+    if commands {
+        lines.extend(command_lines(&build.operation));
+    }
+    lines
+}
+
+fn queued_lines(
+    host: &str,
+    position: usize,
+    build: &QueuedBuild,
+    commands: bool,
+) -> Vec<Line<'static>> {
+    let mut details = vec![
+        Span::from(format!(
+            "    {} @ {}",
+            requesters(&build.who),
+            build.revision.short(),
+        ))
+        .dark_gray(),
+    ];
+    if let Some(memory) = build.memory_needed {
+        details.push(Span::from(format!(" · waiting for memory (needs {})", gib(memory))).yellow());
+    } else if let Some(hold) = &build.held {
+        details.push(
+            Span::from(format!(
+                " · warm {} ~{} vs ~{} cold",
+                short_slot(&hold.slot),
+                brief(hold.wait_ms),
+                brief(hold.cold_ms),
+            ))
+            .yellow(),
+        );
+    }
+    if let Some(estimate) = build.estimate_ms {
+        details.push(Span::from(format!(" · build ~{}", brief(estimate))).dark_gray());
+    }
+    let mut lines = vec![
+        Line::from(vec![
+            Span::from(format!(
+                "{host} #{position}  waited {}  ",
+                brief(build.waited_ms)
+            ))
+            .yellow(),
+            Span::from(operation_summary(&build.operation)),
+        ]),
+        Line::from(details),
+    ];
+    if commands {
+        lines.extend(command_lines(&build.operation));
+    }
+    lines
+}
+
+/// The full original command is available without dominating the overview.
+fn command_lines(operation: &Operation) -> Vec<Line<'static>> {
+    operation
+        .to_string()
+        .lines()
+        .map(|line| Line::from(format!("    {line}")).cyan())
+        .collect()
+}
+
+/// A requester can have several joined requests; list its name only once.
+fn requesters(who: &[String]) -> String {
+    who.iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Summarize known Cargo selections. The full argument language still belongs
+/// to Cargo and is available with `d`, including scripts and test filters.
+fn operation_summary(operation: &Operation) -> String {
+    if operation.command == Command::Run {
+        let program = operation.args.first().expect("run names a program");
+        return format!("run {program}");
+    }
+    let mut parts = vec![operation.command.to_string()];
+    let mut packages = Vec::new();
+    let mut filtered = false;
+    let mut args = operation.args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "-p" | "--package" => {
+                if let Some(package) = args.next() {
+                    packages.push(package);
+                }
+            }
+            "--workspace" | "--all" => parts.push("workspace".into()),
+            "--profile" | "-P" if operation.command == Command::Nextest => {
+                if let Some(profile) = args.next() {
+                    parts.push(profile.into());
+                }
+            }
+            "--doc" => parts.push("doctests".into()),
+            "--all-targets" => parts.push("all targets".into()),
+            "-E" | "--filterset" if operation.command == Command::Nextest => {
+                filtered = true;
+                args.next();
+            }
+            "--" => break,
+            _ if arg.starts_with("--package=") => packages.push(&arg[10..]),
+            _ if arg.starts_with("-p") && !arg.starts_with("--") => packages.push(&arg[2..]),
+            _ if operation.command == Command::Nextest && arg.starts_with("--profile=") => {
+                parts.push(arg[10..].into());
+            }
+            _ if operation.command == Command::Nextest && arg.starts_with("--filterset=") => {
+                filtered = true
+            }
+            _ => {}
+        }
+    }
+    match packages.as_slice() {
+        [] => {}
+        [package] => parts.push((*package).into()),
+        packages => parts.push(format!("{} packages", packages.len())),
+    }
+    if filtered {
+        parts.push("filtered".into());
+    }
+    parts.join(" · ")
+}
+
+fn statistics(activity: &Activity) -> Vec<Line<'static>> {
+    let t = &activity.totals;
+    let mut lines = vec![
+        Line::from(format!(
+            "requests {} → Cargo runs {} · shared {} · replaced {} · dropped {} · cancelled {}",
+            t.requests, t.builds, t.shared, t.replaced, t.dropped, t.cancelled,
+        )),
+        Line::from(format!(
+            "CPU {} · {} unchanged test binaries skipped · warm starts {} of {}",
+            brief(t.cpu_ms),
+            t.skipped,
+            t.warm_first_builds,
+            t.first_builds,
+        )),
+    ];
+    let crates = t.compiled + t.fresh;
+    if crates > 0 {
+        lines.push(
+            Line::from(format!(
+                "crates reused {} ({} of {crates}; compiled {})",
+                percent(t.fresh, crates),
+                t.fresh,
+                t.compiled
+            ))
+            .green(),
+        );
+    }
+    let measured = activity
+        .status
+        .slots
+        .iter()
+        .filter(|slot| slot.size.is_some())
+        .count();
+    if measured > 0 && t.worktrees > 0 {
+        let average = activity.status.disk_used / measured as u64;
+        lines.push(Line::from(format!(
             "disk {} for {} worktrees · separate targets ≈ {} × {} = {} (estimate)",
-            gib(disk),
+            gib(activity.status.disk_used),
             t.worktrees,
             t.worktrees,
             gib(average),
             gib(average * t.worktrees),
-        ))
-    });
-    frame.render_widget(
-        Paragraph::new(total_lines).block(Block::bordered().title(" since start ")),
-        totals,
-    );
-
-    // This daemon's events and each reachable remote host's, newest first;
-    // a remote host's are marked with its name.
-    let mut merged = activity
-        .events
-        .iter()
-        .map(|event| (None, event))
-        .chain(remotes.iter().flat_map(|remote| {
-            remote.activity.iter().flat_map(|remote_activity| {
-                remote_activity
-                    .events
-                    .iter()
-                    .map(|event| (Some(remote.name.as_str()), event))
-            })
-        }))
-        .collect::<Vec<_>>();
-    merged.sort_by_key(|(_, event)| std::cmp::Reverse(event.at_ms));
-    let event_lines = merged
-        .into_iter()
-        .filter_map(|(host, event)| {
-            let (text, style) = describe(&event.kind)?;
-            let mut spans = vec![Span::from(format!("{}  ", clock(event.at_ms))).dark_gray()];
-            if let Some(host) = host {
-                spans.push(Span::from(format!("{host} ")).cyan());
-            }
-            spans.push(Span::styled(text, style));
-            Some(Line::from(spans))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(event_lines).block(Block::bordered().title(" events ")),
-        events,
-    );
-    frame.render_widget(Line::from(" q quit").dark_gray(), footer);
+        )));
+    }
+    lines
 }
 
 /// How fast builds went lately: queue wait and wall time per kind, each as
@@ -338,105 +621,6 @@ fn brief(millis: u64) -> String {
         10_000..60_000 => format!("{} s", millis / 1000),
         _ => format!("{}m{:02}s", millis / 60_000, millis % 60_000 / 1000),
     }
-}
-
-/// A remote host's lines: its budget, then a line per slot and its queue,
-/// or why it could not be asked.
-fn remote_lines(remote: &RemoteActivity) -> Vec<Line<'static>> {
-    let name = Span::from(format!("{} ({})", remote.name, remote.os)).bold();
-    let activity = match &remote.activity {
-        Ok(activity) => activity,
-        Err(error) => {
-            return vec![Line::from(vec![
-                name,
-                Span::from(format!("  unreachable: {error}")).red(),
-            ])];
-        }
-    };
-    let status = &activity.status;
-    let free = status.free_disk.map_or_else(
-        || "free disk unknown".to_owned(),
-        |free| format!("{} free", gib(free)),
-    );
-    let mut first = vec![
-        name,
-        Span::from(format!(
-            "  jobs {}/{} · memory {:.1}/{} · {free}",
-            status.jobs - status.idle_jobs,
-            status.jobs,
-            gib_number(status.memory_in_use),
-            gib(status.memory),
-        )),
-    ];
-    if status.draining {
-        first.push(Span::from("  draining").yellow());
-    }
-    // Slots grouped by repository, in the daemon's order.
-    let mut repositories: Vec<(String, Vec<(&str, &SlotStatus)>)> = Vec::new();
-    for slot in &status.slots {
-        let (repository, index) = split_slot(&slot.name);
-        match repositories.last_mut() {
-            Some((last, slots)) if *last == repository => slots.push((index, slot)),
-            _ => repositories.push((repository, vec![(index, slot)])),
-        }
-    }
-    let width = repositories
-        .iter()
-        .map(|(repository, _)| repository.len())
-        .chain(std::iter::once("queued".len()))
-        .max()
-        .expect("the chain holds one width");
-    let mut lines = vec![Line::from(first)];
-    for (repository, slots) in &repositories {
-        // The repository's name heads its first line only.
-        let mut label = repository.as_str();
-        let mut idle = Vec::new();
-        for (index, slot) in slots {
-            let what = match &slot.build {
-                Some(build) => {
-                    let phase = match build.phase {
-                        Phase::Compiling => "compiling",
-                        Phase::Testing => "testing",
-                        Phase::Running => "running",
-                        Phase::Copying => "copying",
-                    };
-                    format!(
-                        "{index}  {} @ {} for {}  {phase} {}",
-                        build.operation,
-                        build.revision.short(),
-                        build.who.join(", "),
-                        seconds(build.elapsed_ms)
-                    )
-                }
-                None if slot.chore.is_some() => format!("{index}  {}", chore(slot.chore)),
-                None => {
-                    idle.push(*index);
-                    continue;
-                }
-            };
-            lines.push(Line::from(format!("    {label:<width$}  {what}")));
-            label = "";
-        }
-        if !idle.is_empty() {
-            lines.push(
-                Line::from(format!("    {label:<width$}  idle: {}", idle.join(", "))).dark_gray(),
-            );
-        }
-    }
-    for build in &status.queue {
-        lines.push(
-            Line::from(format!(
-                "    {:<width$}  {} @ {} for {}  waiting {}",
-                "queued",
-                build.operation,
-                build.revision.short(),
-                build.who.join(", "),
-                seconds(build.waited_ms)
-            ))
-            .yellow(),
-        );
-    }
-    lines
 }
 
 /// A slot's name as the view shows it: `short_slot("app-c71684b27238d845/2")`
@@ -483,93 +667,6 @@ fn chore(chore: Option<Chore>) -> &'static str {
     }
 }
 
-/// A slot's two lines: its disk, its share of the `budget` all slots
-/// share, and what it does, then for whom.
-fn slot_lines(slot: &SlotStatus, budget: u64) -> [Line<'static>; 2] {
-    let bar = slot.size.map_or_else(
-        || format!("[{}] unmeasured", "·".repeat(BAR)),
-        |size| {
-            let filled = usize::try_from(size.saturating_mul(BAR as u64) / budget.max(1))
-                .expect("a bar fits usize")
-                .min(BAR);
-            format!(
-                "[{}{}] {:>8}",
-                "█".repeat(filled),
-                "░".repeat(BAR - filled),
-                gib(size)
-            )
-        },
-    );
-    let mut first = vec![
-        Span::from(format!("{:<26} ", short_slot(&slot.name))).bold(),
-        Span::styled(bar, Style::new().fg(Color::Cyan)),
-        Span::from("  "),
-    ];
-    let second = match &slot.build {
-        Some(build) => {
-            first.push(
-                Span::from(format!(
-                    "{} @ {}  {}",
-                    build.operation,
-                    build.revision.short(),
-                    seconds(build.elapsed_ms)
-                ))
-                .yellow(),
-            );
-            let shared = if build.who.len() > 1 {
-                Span::from(format!("  shared by {}", build.who.len())).green()
-            } else {
-                Span::from("")
-            };
-            let phase = match build.phase {
-                Phase::Compiling => "",
-                Phase::Testing => "testing · ",
-                Phase::Running => "running · ",
-                Phase::Copying => "copying · ",
-            };
-            let state = if build.cancelled {
-                Span::from("  stopping").red()
-            } else {
-                Span::from(format!(
-                    "  {phase}{} jobs · compiled {} · reused {}",
-                    build.tokens, build.compiled, build.fresh
-                ))
-            };
-            Line::from(vec![
-                Span::from(format!("    for {}", build.who.join(", "))),
-                shared,
-                state,
-            ])
-        }
-        None => {
-            first.push(match slot.chore {
-                Some(_) => Span::from(chore(slot.chore)).blue(),
-                None => Span::from(chore(slot.chore)).dark_gray(),
-            });
-            let last = slot
-                .worktree
-                .as_ref()
-                .and_then(|worktree| worktree.file_name());
-            let mut line = vec![
-                Span::from(last.map_or_else(String::new, |name| {
-                    format!("    last for {}", name.to_string_lossy())
-                }))
-                .dark_gray(),
-            ];
-            if let Some(build) = &slot.last {
-                line.push(
-                    Span::from(format!("  {}", took(build.build_ms, build.test_ms))).dark_gray(),
-                );
-            }
-            if let Some(crates) = slot.duplicated.filter(|crates| *crates > 0) {
-                line.push(Span::from(format!("  {crates} duplicated crates")).yellow());
-            }
-            Line::from(line)
-        }
-    };
-    [Line::from(first), second]
-}
-
 /// An event as a line, or None for those not worth a line of their own.
 fn describe(kind: &EventKind) -> Option<(String, Style)> {
     let plain = Style::new();
@@ -584,6 +681,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             if !shared {
                 return None;
             }
+            let operation = operation_summary(operation);
             (
                 format!(
                     "{who} joined {operation} @ {}: no extra Cargo run",
@@ -597,14 +695,17 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             operation,
             from,
             to,
-        } => (
-            format!(
-                "{who}'s queued {operation} builds newer {} instead of {}",
-                to.short(),
-                from.short()
-            ),
-            Style::new().fg(Color::Yellow),
-        ),
+        } => {
+            let operation = operation_summary(operation);
+            (
+                format!(
+                    "{who}'s queued {operation} builds newer {} instead of {}",
+                    to.short(),
+                    from.short()
+                ),
+                Style::new().fg(Color::Yellow),
+            )
+        }
         EventKind::Started {
             slot,
             who,
@@ -613,11 +714,12 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             warm,
             first,
         } => {
+            let operation = operation_summary(operation);
             let slot = short_slot(slot);
             let mut text = format!(
                 "{slot} started {operation} @ {} for {}",
                 revision.short(),
-                who.join(", ")
+                requesters(who)
             );
             if *first {
                 text.push_str(", a new worktree");
@@ -639,6 +741,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             usage,
             ..
         } => {
+            let operation = operation_summary(operation);
             let slot = short_slot(slot);
             let (ended, style) = match outcome {
                 Outcome::Exited { code: 0 } => ("finished", plain),
@@ -647,7 +750,7 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
                 Outcome::Failed { .. } => ("could not run", Style::new().fg(Color::Red)),
             };
             let mut cpu = usage.map_or_else(String::new, |usage| {
-                format!(", CPU {}", seconds(usage.cpu_ms))
+                format!(", CPU {}", brief(usage.cpu_ms))
             });
             if *skipped > 0 {
                 cpu.push_str(&format!(
@@ -665,25 +768,31 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
         EventKind::Dropped {
             operation,
             revision,
-        } => (
-            format!(
-                "dropped queued {operation} @ {}: nobody waits",
-                revision.short()
-            ),
-            Style::new().fg(Color::Yellow),
-        ),
+        } => {
+            let operation = operation_summary(operation);
+            (
+                format!(
+                    "dropped queued {operation} @ {}: nobody waits",
+                    revision.short()
+                ),
+                Style::new().fg(Color::Yellow),
+            )
+        }
         EventKind::Cancelled {
             slot,
             operation,
             revision,
-        } => (
-            format!(
-                "{} stopped {operation} @ {}: nobody waits",
-                short_slot(slot),
-                revision.short()
-            ),
-            Style::new().fg(Color::Yellow),
-        ),
+        } => {
+            let operation = operation_summary(operation);
+            (
+                format!(
+                    "{} stopped {operation} @ {}: nobody waits",
+                    short_slot(slot),
+                    revision.short()
+                ),
+                Style::new().fg(Color::Yellow),
+            )
+        }
         EventKind::Duplicated { slot, crates } => (
             format!(
                 "{} holds {crates} crates in several variants: builds select different features",
@@ -695,16 +804,19 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
             who,
             operation,
             hold,
-        } => (
-            format!(
-                "{} waits for {} to {operation}: ~{} there, ~{} cold in an idle slot",
-                who.join(", "),
-                short_slot(&hold.slot),
-                seconds(hold.wait_ms),
-                seconds(hold.cold_ms)
-            ),
-            Style::new().fg(Color::Yellow),
-        ),
+        } => {
+            let operation = operation_summary(operation);
+            (
+                format!(
+                    "{} waits for {} to {operation}: ~{} there, ~{} cold in an idle slot",
+                    requesters(who),
+                    short_slot(&hold.slot),
+                    brief(hold.wait_ms),
+                    brief(hold.cold_ms)
+                ),
+                Style::new().fg(Color::Yellow),
+            )
+        }
         EventKind::Evicted {
             shortage,
             freed,
@@ -755,11 +867,11 @@ fn took(build_ms: u64, test_ms: Option<u64>) -> String {
     match test_ms {
         Some(test_ms) => format!(
             "{} (compile {} · tests {})",
-            seconds(build_ms),
-            seconds(build_ms.saturating_sub(test_ms)),
-            seconds(test_ms)
+            brief(build_ms),
+            brief(build_ms.saturating_sub(test_ms)),
+            brief(test_ms)
         ),
-        None => seconds(build_ms),
+        None => brief(build_ms),
     }
 }
 
@@ -783,10 +895,6 @@ fn ago(at_ms: u64, now: SystemTime) -> String {
         60..3600 => format!("{}m", secs / 60),
         _ => format!("{}h{}m", secs / 3600, secs % 3600 / 60),
     }
-}
-
-fn seconds(millis: u64) -> String {
-    format!("{}.{} s", millis / 1000, millis % 1000 / 100)
 }
 
 fn gib(bytes: u64) -> String {
@@ -1015,10 +1123,12 @@ mod tests {
         activity: &Result<Activity, String>,
         remotes: &[RemoteActivity],
         now: SystemTime,
+        view: &mut View,
+        size: (u16, u16),
     ) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
         terminal
-            .draw(|frame| draw(frame, activity, remotes, now))
+            .draw(|frame| draw(frame, activity, remotes, now, view))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1032,24 +1142,38 @@ mod tests {
     }
 
     #[test]
-    fn the_view_shows_sharing_reuse_and_what_each_slot_does() {
+    fn expanded_statistics_keep_sharing_reuse_and_cache_information() {
         let now = SystemTime::now();
-        let text = screen(&Ok(sample(now)), &sample_remotes(), now);
+        let mut view = View {
+            stats: true,
+            idle: true,
+            ..View::default()
+        };
+        let text = screen(
+            &Ok(sample(now)),
+            &sample_remotes(),
+            now,
+            &mut view,
+            (120, 60),
+        );
         for expected in [
-            "up 1h0m · 2 slots · disk 24.0/40.0 GiB · jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free, below the floor",
-            "check -p app-ui @ 7f3a9c0d1e",
-            "for agent-1, agent-7  shared by 2  testing · 4 jobs · compiled 3 · reused 412",
-            "last for agent-2  300.0 s (compile 100.0 s · tests 200.0 s)  12 duplicated crates",
+            "peak estimate 14.0/18.0 GiB",
+            "disk 10.0 GiB free (below 15.0 GiB floor)",
+            "check · app-ui",
+            "testing · 4.2 s · 4 jobs",
+            "agent-1, agent-7 @ 7f3a9c0d1e · compiled 3 · reused 412 · shared by 2",
+            "last for agent-2 · 12 duplicated crates",
             "app-c716/1 gave up 31 units, 4 caches, 1 test files: 2.0 GiB for 1.5 GiB over budget",
-            "1. agent-5  check -p app-protocol @ 3d2e000000  waiting 2.1 s · ~40.0 s · for app-c716/0 (~30.0 s, cold ~300.0 s)",
+            "local #1  waited 2.1 s  check · app-protocol",
+            "warm app-c716/0 ~30 s vs ~5m00s cold",
             "requests 96 → Cargo runs 61",
             "crates reused 97.8%",
             "last hour (median / p90): wait 0.0 s / 12 s · workspace tests 7m05s / 8m32s ×2",
             "pc (linux)  unreachable: ssh: connect to host pc port 22: Connection refused",
-            "new worktrees starting on a warm slot: 6 of 6",
+            "warm starts 6 of 6",
             "separate targets ≈ 15 × 12.0 GiB = 180.0 GiB (estimate)",
-            "agent-7 joined check -p app-ui @ 7f3a9c0d1e: no extra Cargo run",
-            "app-c716/1 finished check -p app-core in 2.1 s: compiled 2, reused 233, CPU 3.4 s",
+            "agent-7 joined check · app-ui @ 7f3a9c0d1e: no extra Cargo run",
+            "app-c716/1 finished check · app-core in 2.1 s: compiled 2, reused 233, CPU 3.4 s",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }
@@ -1057,14 +1181,12 @@ mod tests {
             !text.contains("agent-3"),
             "unshared requests stay out of the events"
         );
-        // Newest events first.
         assert!(text.find("agent-7 joined").unwrap() < text.find("finished check").unwrap());
     }
 
     #[test]
     fn a_remote_hosts_events_join_the_list_marked_with_its_name() {
         let now = SystemTime::now();
-        let local = sample(now);
         let mut remote = sample(now);
         remote
             .events
@@ -1073,48 +1195,154 @@ mod tests {
             panic!("the sample has a finished build");
         };
         *slot = "linux-slot/0".into();
-        let mut remotes = sample_remotes();
-        remotes[0].activity = Ok(Box::new(remote));
-        let text = screen(&Ok(local), &remotes, now);
-        let line = text
-            .lines()
-            .find(|line| line.contains("linux-slot/0 finished"))
-            .unwrap_or_else(|| panic!("{text}"));
-        assert!(line.contains(" pc linux-slot/0"), "{line}");
+        let remotes = [RemoteActivity {
+            name: "pc".into(),
+            os: "linux".into(),
+            activity: Ok(Box::new(remote)),
+        }];
+        let text = screen(
+            &Ok(sample(now)),
+            &remotes,
+            now,
+            &mut View::default(),
+            (120, 40),
+        );
+        assert!(text.contains(" pc  linux-slot/0 finished"), "{text}");
     }
 
     #[test]
-    fn a_remote_host_lists_each_repositorys_busy_slots_and_folds_idle_ones() {
+    fn idle_repositories_do_not_push_remote_work_or_wait_reasons_off_screen() {
         let now = SystemTime::now();
-        let local = sample(now);
+        let mut local = sample(now);
+        local.status.slots.clear();
+        local.status.queue.clear();
+        local.status.idle_jobs = local.status.jobs;
+        local.status.memory_in_use = 0;
+        local.status.disk_used = 0;
+        local.status.free_disk = Some(64 << 30);
+        local.events.clear();
         let mut remote = sample(now);
+        remote.status.memory = 10 << 30;
+        remote.status.memory_in_use = 15 << 30;
+        remote.status.idle_jobs = remote.status.jobs - 4;
+        remote.status.free_disk = Some(100 << 30);
+        remote.status.queue[0].waited_ms = 809_700;
+        remote.status.queue[0].memory_needed = Some(6 << 30);
+        remote.status.queue[0].who.push("agent-5".into());
         let busy = remote.status.slots[0].clone();
-        let idle = SlotStatus {
+        remote.status.slots = vec![busy.clone()];
+        remote.status.slots.extend((0..100).map(|index| SlotStatus {
+            name: format!("fixture-{index}-0123456789abcdef/0"),
             build: None,
             ..busy.clone()
-        };
-        let named = |slot: &SlotStatus, name: &str| SlotStatus {
-            name: name.into(),
-            ..slot.clone()
-        };
-        remote.status.slots = vec![
-            named(&busy, "app-c71684b27238d845-94eb9688803b5f5f/0"),
-            named(&idle, "app-c71684b27238d845-94eb9688803b5f5f/1"),
-            named(&idle, "app-c71684b27238d845-94eb9688803b5f5f/2"),
-            named(&idle, "app-49ce9bdcdd686f74/0"),
-        ];
-        let mut remotes = sample_remotes();
-        remotes[0].activity = Ok(Box::new(remote));
-        let text = screen(&Ok(local), &remotes, now);
+        }));
+        let remotes = [RemoteActivity {
+            name: "pc".into(),
+            os: "linux".into(),
+            activity: Ok(Box::new(remote)),
+        }];
+        let text = screen(&Ok(local), &remotes, now, &mut View::default(), (80, 26));
+        println!("{text}");
         for expected in [
-            "pc (linux)  jobs 6/12 · memory 14.0/18.0 GiB · 10.0 GiB free",
-            "    app-c716  0  check -p app-ui @ 7f3a9c0d1e for agent-1, agent-7  testing 4.2 s",
-            "              idle: 1, 2",
-            "    app-49ce  idle: 0",
-            "    queued    check -p app-protocol @ 3d2e000000 for agent-5  waiting 2.1 s",
+            "100 idle caches",
+            "peak estimate 15.0/10.0 GiB",
+            "Memory queue: next build needs 6.0 GiB; budget remaining 0.0 GiB",
+            "pc app-c716/0",
+            "testing · 4.2 s · 4 jobs",
+            "pc #1  waited 13m29s",
+            "waiting for memory (needs 6.0 GiB)",
+            "q quit",
+            "d commands:off",
+            "i idle:off",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }
+        assert!(
+            !text.contains("fixture-"),
+            "idle fixture names must not crowd out work:\n{text}"
+        );
+        assert!(!text.contains("agent-5, agent-5"), "{text}");
+    }
+
+    #[test]
+    fn scripts_and_filters_expand_without_overwhelming_the_overview() {
+        let now = SystemTime::now();
+        let mut activity = sample(now);
+        activity.status.slots[0].build.as_mut().unwrap().operation = Operation {
+            command: Command::Run,
+            args: vec![
+                "python3".into(),
+                "-c".into(),
+                "import subprocess\nprint('script_detail_marker')".into(),
+            ],
+            rustflags: Vec::new(),
+        };
+        activity.status.queue[0].operation = Operation {
+            command: Command::Nextest,
+            args: [
+                "--profile",
+                "full",
+                "-p",
+                "app-model",
+                "--package=app-ui",
+                "-E",
+                "test(filter_detail_marker) & package(app-ui)",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            rustflags: Vec::new(),
+        };
+        let mut view = View::default();
+        let text = screen(&Ok(activity.clone()), &[], now, &mut view, (80, 28));
+        assert!(text.contains("run python3"), "{text}");
+        assert!(
+            text.contains("nextest · full · 2 packages · filtered"),
+            "{text}"
+        );
+        assert!(!text.contains("script_detail_marker"), "{text}");
+        assert!(!text.contains("filter_detail_marker"), "{text}");
+        view.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), 10);
+        let text = screen(&Ok(activity), &[], now, &mut view, (80, 45));
+        for expected in [
+            "script_detail_marker",
+            "test(filter_detail_marker)",
+            "--package=app-ui",
+            "d commands:on",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn scrolling_reaches_the_end_and_recovers_when_activity_shrinks() {
+        let now = SystemTime::now();
+        let mut activity = sample(now);
+        let queued = activity.status.queue[0].clone();
+        activity
+            .status
+            .queue
+            .extend((0..50).map(|index| QueuedBuild {
+                who: vec![format!("request-{index}")],
+                ..queued.clone()
+            }));
+        let mut view = View::default();
+        view.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), 10);
+        screen(&Ok(activity.clone()), &[], now, &mut view, (80, 20));
+        assert_eq!(view.scroll, 10);
+        view.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 10);
+        let text = screen(&Ok(activity.clone()), &[], now, &mut view, (80, 20));
+        assert!(view.scroll > 50);
+        assert!(text.contains("RECENT EVENTS"), "{text}");
+        activity.status.queue.clear();
+        activity.status.slots.clear();
+        activity.events.clear();
+        let text = screen(&Ok(activity), &[], now, &mut view, (120, 40));
+        assert_eq!(view.scroll, 0);
+        assert!(text.contains("No builds running"), "{text}");
+        assert!(text.contains("Nothing waiting"), "{text}");
+        view.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 10);
+        assert_eq!(view.scroll, 0);
     }
 
     #[test]
@@ -1130,7 +1358,13 @@ mod tests {
 
     #[test]
     fn an_unreachable_daemon_is_shown_not_fatal() {
-        let text = screen(&Err("lost the daemon".into()), &[], SystemTime::now());
+        let text = screen(
+            &Err("lost the daemon".into()),
+            &[],
+            SystemTime::now(),
+            &mut View::default(),
+            (80, 24),
+        );
         assert!(text.contains("buildd: lost the daemon"), "{text}");
     }
 }

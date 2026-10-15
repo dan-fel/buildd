@@ -10,7 +10,7 @@ publish = false
 crossbeam-channel = "0.5.16"
 directories = "6"
 libc = "0.2"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"], optional = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"], optional = true }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

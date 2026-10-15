@@ -293,17 +293,29 @@ command = "bash -lc 'buildd serve'"   # login shell: same tools as a terminal
 
 ## `buildd top`
 
-![buildd top: three slots running workspace tests and Clippy, two builds queued, recent events (older screenshot)](assets/top.svg)
+![buildd top: active work and a memory-blocked queue across two hosts (test fixture)](assets/top.svg)
 
-```text
-header    slots · build disk / disk_gib · jobs in use · expected memory / memory_gib · free disk / floor
-speed     last hour (median / p90): wait 4.3 s / 29 s · checks 18 s / 23 s ×8 · ...
-slots     each running build: phase (compiling, testing, copying), jobs held
-queue     expected duration, and why it waits (memory, or a busy warm slot)
-remotes   the same per host, or why it can't be reached
-totals    since the daemon started (below)
-events    the latest ones
-```
+Every host has the same compact summary: running builds, queue length, CPU
+jobs, **estimated peak memory** versus its budget, cached build disk, and
+free disk. Memory is an admission estimate, not a live RAM measurement or
+a hard limit. Cache pressure and low free disk are called out separately.
+
+Running and queued work share one scrollable view across local and remote
+hosts. A build shows its phase, elapsed time, jobs and compilation progress;
+a queued build puts its wait time first and explains memory or warm-slot
+holds. Commands are summarized, such as `nextest · full · 9 packages · filtered`
+or `run python3`, so scripts and filter expressions cannot bury that status.
+Idle repository caches are counted in each host summary instead of listed
+by default.
+
+| key | action |
+|---|---|
+| `↑` / `↓`, `j` / `k` | scroll |
+| `PageUp` / `PageDown`, `Home` / `End` | move through long queues |
+| `d` | expand full commands, including scripts and filters |
+| `i` | show idle caches and their last worktrees |
+| `s` | show statistics and build speed for each host |
+| `q`, `Esc`, `Ctrl-C` | quit |
 
 If the p90 wait keeps rising, the machine is oversubscribed.
 
