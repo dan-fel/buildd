@@ -19,47 +19,28 @@ use crate::git;
 use crate::protocol::{Activity, Failures, Message, Mirror, Request, RevisionRequest};
 use crate::snapshot::{Revision, Source};
 
-/// Which of the two SSH connections to a host a session goes over: builds
-/// push trees and stream output, so status questions get a connection of
-/// their own instead of queueing behind that traffic.
-#[derive(Clone, Copy)]
-enum Connection {
-    Builds,
-    Status,
-}
-
-/// SSH options: no prompts, and `connection` to each host kept open between
-/// sessions, in a control socket under the daemon's home.
-fn ssh_options(home: &Path, connection: Connection) -> Vec<String> {
-    // Short names: %C is 40 characters, SSH appends 17 while creating the
-    // socket, and a socket path has at most 103 (104 on macOS, with NUL).
-    let control = match connection {
-        Connection::Builds => "ssh-%C",
-        Connection::Status => "ssh-s-%C",
-    };
+/// Each request owns its SSH connection. No detached multiplex master can
+/// outlive the request, retain its pipes or block unrelated builds.
+fn ssh_options() -> [&'static str; 10] {
     [
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=10",
+        "ConnectTimeout=5",
         "-o",
-        "ControlMaster=auto",
+        "ControlMaster=no",
         "-o",
-        "ControlPersist=600",
+        "ControlPath=none",
+        "-o",
+        "ServerAliveInterval=15",
     ]
-    .into_iter()
-    .map(str::to_owned)
-    .chain([
-        "-o".to_owned(),
-        format!("ControlPath={}", home.join(control).display()),
-    ])
-    .collect()
 }
 
 /// `buildd serve` on `remote`, with its standard input and output piped.
-fn serve(home: &Path, remote: &Remote, connection: Connection) -> Result<Child, String> {
+fn serve(remote: &Remote) -> Result<Child, String> {
     Command::new("ssh")
-        .args(ssh_options(home, connection))
+        .args(ssh_options())
+        .args(["-o", "ServerAliveCountMax=2"])
         .arg(&remote.ssh)
         .arg(&remote.command)
         .stdin(Stdio::piped())
@@ -71,34 +52,32 @@ fn serve(home: &Path, remote: &Remote, connection: Connection) -> Result<Child, 
 
 /// Sends `request` to `remote`'s daemon and reads its one-line answer.
 fn ask<T: DeserializeOwned>(
-    home: &Path,
     remote: &Remote,
-    connection: Connection,
     request: &Request,
+    requester: Option<&std::os::unix::net::UnixStream>,
 ) -> Result<T, String> {
-    let mut child = serve(home, remote, connection)?;
-    send(&mut child, request)?;
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("piped"))
-        .read_line(&mut line)
-        .map_err(|error| format!("lost {}: {error}", remote.name))?;
-    let answer = serde_json::from_str(&line).map_err(|_| failure(&mut child, remote, &line));
-    let _ = child.kill();
-    let _ = child.wait();
-    answer
+    let answer = exchange(
+        serve(remote)?,
+        request,
+        requester,
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+        8 * 1024 * 1024,
+    )
+    .map_err(|error| format!("{} ({}): {error}", remote.name, remote.ssh))?;
+    serde_json::from_slice(&answer)
+        .map_err(|error| format!("{} sent an invalid answer: {error}", remote.name))
 }
 
 const CACHE_REQUEST_TIME: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) fn cache(
-    home: &Path,
+    _home: &Path,
     remote: &Remote,
     operation: crate::cache::Operation,
     requester: &std::os::unix::net::UnixStream,
 ) -> Result<crate::cache::Response, crate::client::CacheError> {
     let deadline = std::time::Instant::now() + CACHE_REQUEST_TIME;
-    let child =
-        serve(home, remote, Connection::Status).map_err(crate::client::CacheError::Transport)?;
+    let child = serve(remote).map_err(crate::client::CacheError::Transport)?;
     cache_request(
         child,
         operation,
@@ -120,12 +99,32 @@ pub(crate) fn cache(
 /// absolute deadline and requester lifetime cover writing and reading alike.
 /// Retiring transport never cancels, retries or replaces a cleanup approval.
 fn cache_request(
-    mut child: Child,
+    child: Child,
     operation: crate::cache::Operation,
     requester: &std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
     limit: usize,
 ) -> Result<crate::cache::Response, crate::client::CacheError> {
+    exchange(
+        child,
+        &Request::Cache {
+            host: None,
+            operation,
+        },
+        Some(requester),
+        deadline,
+        limit,
+    )
+    .and_then(|answer| crate::client::decode_cache_response(&answer))
+}
+
+fn exchange(
+    mut child: Child,
+    request: &Request,
+    requester: Option<&std::os::unix::net::UnixStream>,
+    deadline: std::time::Instant,
+    limit: usize,
+) -> Result<Vec<u8>, crate::client::CacheError> {
     use crate::client::CacheError;
     use std::os::fd::AsRawFd as _;
 
@@ -146,11 +145,7 @@ fn cache_request(
                 ));
             }
         }
-        let request = Request::Cache {
-            host: None,
-            operation,
-        };
-        let mut request = serde_json::to_vec(&request).expect("requests serialize");
+        let mut request = serde_json::to_vec(request).expect("requests serialize");
         request.push(b'\n');
         let mut written = 0;
         let mut answer = Vec::new();
@@ -159,7 +154,7 @@ fn cache_request(
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Err(CacheError::Transport(
-                    "SSH cache session exceeded its deadline".into(),
+                    "SSH session exceeded its deadline".into(),
                 ));
             }
             let mut fds = [
@@ -183,7 +178,7 @@ fn cache_request(
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: requester.as_raw_fd(),
+                    fd: requester.map_or(-1, std::os::fd::AsRawFd::as_raw_fd),
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -202,7 +197,7 @@ fn cache_request(
             }
             if std::time::Instant::now() >= deadline {
                 return Err(CacheError::Transport(
-                    "SSH cache session exceeded its deadline".into(),
+                    "SSH session exceeded its deadline".into(),
                 ));
             }
             if fds[3].revents != 0 {
@@ -211,7 +206,7 @@ fn cache_request(
                 // consuming input from the requester's live Unix socket.
                 let received = unsafe {
                     libc::recv(
-                        requester.as_raw_fd(),
+                        requester.expect("a readable requester exists").as_raw_fd(),
                         (&mut byte as *mut u8).cast(),
                         1,
                         libc::MSG_PEEK | libc::MSG_DONTWAIT,
@@ -220,11 +215,11 @@ fn cache_request(
                 if received == 0
                     || fds[3].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
                 {
-                    return Err(CacheError::Transport("cache requester disconnected".into()));
+                    return Err(CacheError::Transport("requester disconnected".into()));
                 }
                 if received > 0 {
                     return Err(CacheError::Transport(
-                        "cache requester sent data after its request".into(),
+                        "requester sent data after its request".into(),
                     ));
                 }
                 let error = std::io::Error::last_os_error();
@@ -256,9 +251,7 @@ fn cache_request(
             if fds[0].revents != 0 {
                 match input.write(&request[written..]) {
                     Ok(0) => {
-                        return Err(CacheError::Transport(
-                            "could not send the cache request".into(),
-                        ));
+                        return Err(CacheError::Transport("could not send the request".into()));
                     }
                     Ok(count) => written += count,
                     Err(error)
@@ -291,7 +284,7 @@ fn cache_request(
                             )));
                         }
                         if end.is_some() {
-                            return crate::client::decode_cache_response(&answer);
+                            return Ok(answer);
                         }
                     }
                     Err(error)
@@ -347,39 +340,34 @@ fn failure(child: &mut Child, remote: &Remote, line: &str) -> String {
 }
 
 /// What `remote`'s daemon is doing.
-pub(crate) fn activity(home: &Path, remote: &Remote) -> Result<Activity, String> {
-    ask(home, remote, Connection::Status, &Request::Activity)
+pub(crate) fn activity(_home: &Path, remote: &Remote) -> Result<Activity, String> {
+    ask(remote, &Request::Activity, None)
 }
 
 /// The builds that failed on `remote` in the last `hours`.
-pub(crate) fn failures(home: &Path, remote: &Remote, hours: u64) -> Result<Failures, String> {
-    ask::<Result<Failures, String>>(
-        home,
-        remote,
-        Connection::Status,
-        &Request::Failures { hours, os: None },
-    )?
+pub(crate) fn failures(_home: &Path, remote: &Remote, hours: u64) -> Result<Failures, String> {
+    ask::<Result<Failures, String>>(remote, &Request::Failures { hours, os: None }, None)?
 }
 
 /// Pushes tree `revision` of `source`'s repository into `remote`'s mirror
 /// of it, and returns the mirror's project name.
 fn push(
-    home: &Path,
+    _home: &Path,
     remote: &Remote,
     source: &Source,
     revision: &Revision,
 ) -> Result<String, String> {
     let project = crate::slot::project_name(&source.repository);
     let mirror: Mirror = ask(
-        home,
         remote,
-        Connection::Builds,
         &Request::Mirror {
             project: project.clone(),
         },
+        None,
     )?;
     let ssh = std::iter::once("ssh".to_owned())
-        .chain(ssh_options(home, Connection::Builds))
+        .chain(ssh_options().into_iter().map(str::to_owned))
+        .chain(["-o".to_owned(), "ServerAliveCountMax=2".to_owned()])
         .collect::<Vec<_>>()
         .join(" ");
     let git = || {
@@ -444,7 +432,7 @@ pub(crate) fn build(
     mut pass: impl FnMut(&Message) -> bool,
 ) -> Result<(), String> {
     let project = push(home, remote, source, revision)?;
-    let mut child = serve(home, remote, Connection::Builds)?;
+    let mut child = serve(remote)?;
     send(
         &mut child,
         &Request::BuildRevision(RevisionRequest { project, ..request }),

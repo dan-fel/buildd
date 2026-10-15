@@ -148,19 +148,26 @@ fn test_compilation_args(args: &[String], nextest: bool) -> Vec<String> {
             continue;
         }
         if nextest {
-            match argument.as_str() {
-                "-E" | "--filterset" | "-P" | "--profile" | "--retries" | "--max-fail"
-                | "--run-ignored" | "--partition" => {
+            let (name, inline) = argument
+                .split_once('=')
+                .map_or((argument.as_str(), None), |(name, value)| {
+                    (name, Some(value))
+                });
+            if nextest_run_value(name) {
+                if inline.is_none() {
                     arguments.next();
-                    continue;
                 }
+                continue;
+            }
+            match name {
                 "--cargo-profile" => {
                     compiled.push("--profile".to_owned());
-                    if let Some(value) = arguments.next() {
-                        compiled.push(value.clone());
+                    if let Some(value) = inline.or_else(|| arguments.next().map(String::as_str)) {
+                        compiled.push(value.to_owned());
                     }
                     continue;
                 }
+                "--ignore-default-filter" => continue,
                 _ => {}
             }
         }
@@ -204,6 +211,28 @@ fn test_compilation_args(args: &[String], nextest: bool) -> Vec<String> {
         }
     }
     compiled
+}
+
+/// Nextest options whose value changes execution or reporting, not Cargo's
+/// compilation. Keep unknown options distinct until their meaning is known.
+fn nextest_run_value(name: &str) -> bool {
+    matches!(
+        name,
+        "-E" | "--filterset"
+            | "-P"
+            | "--profile"
+            | "--retries"
+            | "--max-fail"
+            | "--run-ignored"
+            | "--partition"
+            | "--stress-count"
+            | "--stress-duration"
+            | "--success-output"
+            | "--failure-output"
+            | "--status-level"
+            | "--final-status-level"
+            | "--no-tests"
+    )
 }
 
 /// A command and its arguments as the client gave them: Cargo's arguments,
@@ -295,23 +324,34 @@ impl Operation {
         let other_profile = |name: Option<&String>| name.is_some_and(|name| name != "default");
         let mut arguments = self.args.iter();
         while let Some(argument) = arguments.next() {
+            let name = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |(name, _)| name);
+            if matches!(
+                name,
+                "-E" | "--filterset"
+                    | "--run-ignored"
+                    | "--partition"
+                    | "--stress-count"
+                    | "--stress-duration"
+            ) {
+                // A stress run must execute even previously passing binaries.
+                return false;
+            }
             if let Some(name) = argument.strip_prefix("--profile=")
                 && name != "default"
             {
                 return false;
             }
             match argument.as_str() {
-                "--"
-                | "-E"
-                | "--filterset"
-                | "--run-ignored"
-                | "--partition"
-                | "--ignore-default-filter" => return false,
+                "--" | "-E" | "--filterset" | "--ignore-default-filter" => return false,
                 "-P" | "--profile" if other_profile(arguments.next()) => return false,
                 "-P" | "--profile" => {}
                 "-p" | "--package" | "--exclude" | "--bin" | "--example" | "--test" | "--bench"
-                | "-F" | "--features" | "--cargo-profile" | "--target" | "--retries"
-                | "--max-fail" | "--color" => {
+                | "-F" | "--features" | "--cargo-profile" | "--target" | "--color" => {
+                    arguments.next();
+                }
+                _ if nextest_run_value(name) && !argument.contains('=') => {
                     arguments.next();
                 }
                 _ if !argument.starts_with('-') => return false,
@@ -587,6 +627,11 @@ mod tests {
             &["-P", "scale"],
             &["--profile=scale"],
             &["--ignore-default-filter"],
+            &["--filterset=test(x)"],
+            &["--partition=count:1/2"],
+            &["--run-ignored=only"],
+            &["--stress-count", "20"],
+            &["--stress-duration=1m"],
         ] {
             assert!(!nextest(filtered).runs_every_test(), "{filtered:?}");
         }
@@ -621,6 +666,44 @@ mod tests {
         assert_eq!(
             of(Command::Nextest, &["-p", "x", "--", "--exact", "a"]),
             of(Command::Test, &["-p", "x"])
+        );
+        for execution in [
+            vec!["--profile", "full", "-E", "test(x)", "--stress-count", "20"],
+            vec![
+                "--profile=full",
+                "--filterset=test(x)",
+                "--stress-duration=1m",
+            ],
+            vec!["--retries=2", "--partition=count:1/2", "--run-ignored=only"],
+            vec![
+                "--success-output",
+                "never",
+                "--failure-output=immediate",
+                "--status-level",
+                "fail",
+                "--final-status-level=all",
+                "--no-tests=pass",
+            ],
+            vec!["--ignore-default-filter"],
+        ] {
+            let mut args = vec!["-p", "x"];
+            args.extend(execution);
+            assert_eq!(
+                of(Command::Nextest, &args),
+                of(Command::Test, &["-p", "x"]),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            of(Command::Nextest, &["-p", "x", "--cargo-profile=ci"]),
+            of(Command::Test, &["-p", "x", "--profile", "ci"])
+        );
+        assert!(
+            Operation {
+                command: Command::Nextest,
+                ..operation(&["--status-level", "fail", "--retries=2"])
+            }
+            .runs_every_test()
         );
     }
 

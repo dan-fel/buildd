@@ -2721,6 +2721,44 @@ mod tests {
     }
 
     #[test]
+    fn nextest_stress_runs_use_the_selected_packages_memory_history() {
+        let mut scheduler = checked_and_tested();
+        scheduler.memory = 14;
+        scheduler.slots[0].compilations[0].peak_memory = Some(5);
+        let run = &mut scheduler.slots[1].compilations[0];
+        run.peak_memory = Some(6);
+        run.compilation.args = vec!["-p".into(), "engine-server".into()];
+        let mut broad = run.clone();
+        broad.compilation.args = vec!["--workspace".into()];
+        broad.peak_memory = Some(15);
+        scheduler.slots[1].compilations.push(broad);
+        assert_eq!(starts(&submit(&mut scheduler, 3, "/a", "a2")).len(), 1);
+        let stress = submit_operation(
+            &mut scheduler,
+            4,
+            "/t",
+            "t1",
+            Command::Nextest,
+            &[
+                "-p",
+                "engine-server",
+                "--profile",
+                "full",
+                "-E",
+                "test(x)",
+                "--stress-count",
+                "20",
+            ],
+        );
+        assert_eq!(
+            starts(&stress).len(),
+            1,
+            "six plus five fits the budget: {stress:?}"
+        );
+        assert_eq!(scheduler.memory(), (14, 11));
+    }
+
+    #[test]
     fn a_build_that_would_not_fit_in_memory_waits_and_so_does_everything_behind_it() {
         let mut scheduler = checked_and_tested();
         scheduler.memory = 10;
