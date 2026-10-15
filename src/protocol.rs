@@ -25,6 +25,9 @@ pub enum Request {
         operation: crate::cache::Operation,
     },
     /// Build the current content of the worktree holding `directory`.
+    // A new sender must be rejected by an older daemon that cannot honor
+    // host constraints. Existing clients without that field still submit.
+    #[serde(rename = "schedule", alias = "build")]
     Build(BuildRequest),
     /// Build a tree another machine's daemon pushed into this daemon's
     /// mirror of a project; answered like [`Request::Build`].
@@ -44,6 +47,16 @@ pub enum Request {
     /// What each remote host's daemon does, asked in parallel: as slow as
     /// the slowest host, so apart from [`Request::Activity`].
     Remotes,
+    /// Configured hosts and the coordinator's persisted admission policy.
+    Hosts,
+    /// Change policy for new placements; accepted work keeps running.
+    SetHost { name: String, enabled: bool },
+    /// Read the local scheduler's resource estimate. Never forwards work.
+    Capacity {
+        project: String,
+        prefix: PathBuf,
+        operation: Operation,
+    },
     /// Sum up the builds that failed in the last `hours`, from the event
     /// file: on the remote host for `os` when that is not this machine's.
     /// Answered with one [`Failures`].
@@ -134,15 +147,32 @@ pub struct BuildRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rerun_all: bool,
     /// The OS to build on, as Rust names it (`linux`, `macos`): a remote
-    /// host's daemon builds when it is not this machine's. This machine's
-    /// when absent.
+    /// host or this machine can satisfy it. Any enabled OS when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// A configured host name, or `local`. Absent means any enabled host
+    /// matching `os`. Artifact exports without an OS or host stay local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Optional work, such as prewarming a branch: it waits behind every
     /// other build and starts only while another slot stays free. A build
     /// anyone else asks for is no longer optional.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
+}
+
+impl BuildRequest {
+    /// Whether policy and explicit constraints permit this destination.
+    #[must_use]
+    pub fn accepts_host(&self, host: &Host) -> bool {
+        host.enabled
+            && self.os.as_ref().is_none_or(|os| os == &host.os)
+            && self.host.as_ref().is_none_or(|name| name == &host.name)
+            && !(self.copy_to.is_some()
+                && self.os.is_none()
+                && self.host.is_none()
+                && host.name != "local")
+    }
 }
 
 /// A build of a tree pushed into a project's mirror.
@@ -172,6 +202,22 @@ pub struct RevisionRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Mirror {
     pub path: PathBuf,
+}
+
+/// One host's local admission information, freshly read by the router.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Capacity {
+    pub status: Status,
+    /// A historical peak for this compilation, zero when unknown.
+    pub peak_memory: u64,
+}
+
+/// A host in the coordinator's policy. Reachability is observed separately.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Host {
+    pub name: String,
+    pub os: String,
+    pub enabled: bool,
 }
 
 /// What the daemon tells a client about its build.
@@ -633,11 +679,12 @@ mod tests {
             rerun_all: false,
             optional: false,
             os: None,
+            host: None,
         });
         let text = serde_json::to_string(&request).unwrap();
         assert_eq!(
             text,
-            r#"{"type":"build","directory":"/work","operation":{"command":"check","args":["-p","a"]}}"#
+            r#"{"type":"schedule","directory":"/work","operation":{"command":"check","args":["-p","a"]}}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), request);
         assert_eq!(

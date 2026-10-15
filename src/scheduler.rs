@@ -1481,14 +1481,28 @@ impl<D: Distance> Scheduler<D> {
     /// command used; nothing when no build of it ran.
     fn memory_estimate(&self, job: &Job) -> u64 {
         let compilation = Compilation::of(job);
+        self.compilation_memory(&job.repository, &compilation)
+    }
+
+    /// The same history admission uses, without adding a queued job.
+    pub(crate) fn forecast_memory(
+        &self,
+        repository: &Path,
+        prefix: &Path,
+        operation: &Operation,
+    ) -> u64 {
+        self.compilation_memory(repository, &Compilation::new(prefix, operation))
+    }
+
+    fn compilation_memory(&self, repository: &Path, compilation: &Compilation) -> u64 {
         let runs = || {
             self.slots
                 .iter()
-                .filter(|slot| slot.repository == job.repository)
+                .filter(|slot| slot.repository == repository)
                 .flat_map(|slot| &slot.compilations)
         };
         runs()
-            .filter(|run| run.compilation == compilation && run.peak_memory.is_some())
+            .filter(|run| &run.compilation == compilation && run.peak_memory.is_some())
             .max_by_key(|run| run.at)
             .and_then(|run| run.peak_memory)
             .or_else(|| {

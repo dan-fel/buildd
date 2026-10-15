@@ -31,9 +31,11 @@ usage:
         --rustflags FLAGS  pass FLAGS to every rustc, as RUSTFLAGS would
         --rerun-all        nextest: also run test binaries that are unchanged
                            since they passed (they are skipped otherwise)
-        --os OS            build on OS (linux, macos): on the remote host
-                           config.toml names for it when it is not this one
-  buildd run [--json] [--copy-to DIR] [--os OS] -- COMMAND [ARGS...]
+        --os OS            use any enabled host running OS (linux, macos)
+        --host NAME        use this configured host, or local
+      Without a constraint, use an enabled host with available capacity.
+      Artifact exports without a host or OS constraint build locally.
+  buildd run [--json] [--copy-to DIR] [--os OS] [--host NAME] -- COMMAND [ARGS...]
       Run COMMAND, not Cargo, on the same snapshot of this worktree a build
       would compile, in a build slot, queued and cancelled like builds, and
       exit with its status. It runs in the slot's checkout, in the
@@ -47,6 +49,9 @@ usage:
       it once it succeeds. Withdrawing it stops its whole process group.
   buildd status
       Show the build slots and the queue.
+  buildd hosts [enable|disable NAME]
+      Show or persistently change host policy for new builds. Accepted work
+      continues. Host policy takes effect immediately, without a restart.
   buildd failures [--hours N] [--os OS]
       Sum up the builds that failed in the last N hours (24): the latest,
       the tests and errors that fail most often, trees whose outcome
@@ -76,7 +81,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let command = match name.as_str() {
-        "daemon" | "status" | "top" | "drain" | "undrain" | "serve" | "failures" => None,
+        "daemon" | "status" | "top" | "drain" | "undrain" | "serve" | "failures" | "hosts" => None,
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -106,6 +111,7 @@ fn main() -> ExitCode {
         }
         None if name == "serve" => serve(&home),
         None if name == "failures" => failures(&home, args.collect()),
+        None if name == "hosts" => hosts(&home, args.collect()),
         None => status(&home),
     });
     result.unwrap_or_else(|message| {
@@ -119,8 +125,34 @@ fn daemon(home: &Path) -> Result<ExitCode, String> {
     match buildd::daemon::run(home, config)? {}
 }
 
+fn hosts(home: &Path, args: Vec<String>) -> Result<ExitCode, String> {
+    let hosts = match args.as_slice() {
+        [] => client::hosts(connect(home)?)?,
+        [action, name] if action == "enable" || action == "disable" => {
+            client::set_host(connect(home)?, name.clone(), action == "enable")?
+        }
+        _ => return Err("usage: buildd hosts [enable|disable NAME]".into()),
+    };
+    for host in hosts {
+        println!(
+            "{} ({}) {}",
+            host.name,
+            host.os,
+            if host.enabled { "enabled" } else { "disabled" }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The names of buildd's own options of a build.
-const OPTIONS: [&str; 5] = ["--json", "--copy-to", "--rustflags", "--rerun-all", "--os"];
+const OPTIONS: [&str; 6] = [
+    "--json",
+    "--copy-to",
+    "--rustflags",
+    "--rerun-all",
+    "--os",
+    "--host",
+];
 
 /// buildd's own options of a build, which come before Cargo's arguments.
 #[derive(Debug, Default, PartialEq)]
@@ -130,6 +162,7 @@ struct Options {
     rustflags: Vec<String>,
     rerun_all: bool,
     os: Option<String>,
+    host: Option<String>,
 }
 
 impl Options {
@@ -162,6 +195,7 @@ impl Options {
                 "--rerun-all" if inline.is_none() => options.rerun_all = true,
                 "--copy-to" => options.copy_to = Some(value(&mut taken)?.into()),
                 "--os" => options.os = Some(value(&mut taken)?),
+                "--host" => options.host = Some(value(&mut taken)?),
                 "--rustflags" => {
                     options.rustflags = value(&mut taken)?
                         .split_whitespace()
@@ -174,7 +208,10 @@ impl Options {
         }
         args.drain(..taken);
         if let Some(copy_to) = options.copy_to.take() {
-            if copy_to.is_relative() && options.os.is_some() {
+            if copy_to.is_relative()
+                && (options.os.is_some()
+                    || options.host.as_deref().is_some_and(|host| host != "local"))
+            {
                 return Err(format!(
                     "with --os, --copy-to names a directory on the machine that builds: \
                      give it as an absolute path, not {}",
@@ -221,6 +258,7 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
         copy_to: options.copy_to,
         rerun_all: options.rerun_all,
         os: options.os,
+        host: options.host,
         optional: false,
     };
     let last = if options.json {
@@ -255,7 +293,9 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
 /// options: `-- COMMAND [ARGS...]`.
 fn run_arguments(options: &Options, args: Vec<String>) -> Result<Vec<String>, String> {
     if !options.rustflags.is_empty() || options.rerun_all {
-        return Err("run compiles and tests nothing: it takes --json, --copy-to and --os".into());
+        return Err(
+            "run compiles and tests nothing: it takes --json, --copy-to, --os and --host".into(),
+        );
     }
     match args.split_first() {
         Some((separator, command)) if separator == "--" && !command.is_empty() => {
@@ -670,6 +710,7 @@ mod tests {
                 rustflags: vec!["-C".into(), "force-frame-pointers=yes".into()],
                 rerun_all: false,
                 os: None,
+                host: None,
             }
         );
         assert_eq!(rest, ["--release", "--", "--json"]);
@@ -739,5 +780,12 @@ mod tests {
                 "{relative:?}"
             );
         }
+        let (options, _) = take(&["--host=air", "--os=macos", "--copy-to=/out"]);
+        assert_eq!(options.unwrap().host.as_deref(), Some("air"));
+        assert!(take(&["--host=air", "--copy-to=out"]).0.is_err());
+        assert_eq!(
+            take(&["--host=local", "--copy-to=out"]).0.unwrap().copy_to,
+            Some("/work/out".into())
+        );
     }
 }

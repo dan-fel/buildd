@@ -25,7 +25,7 @@ pub struct Config {
     /// Memory running builds may use together, in bytes, by their recorded
     /// peaks: a build that would not fit waits.
     pub memory: u64,
-    /// Other machines' daemons, for builds that must run on another OS.
+    /// Other machines eligible for automatic or explicit build placement.
     pub remotes: Vec<Remote>,
     /// Branches whose new commits are built before anyone asks.
     pub prewarm: Vec<Prewarm>,
@@ -149,17 +149,25 @@ impl Config {
                 path.display()
             ));
         }
-        if let Some(remote) = config
-            .remotes
-            .iter()
-            .find(|remote| remote.os == std::env::consts::OS)
-        {
-            return Err(format!(
-                "{}: remote {} builds for {}, this machine's own OS",
-                path.display(),
-                remote.name,
-                remote.os
-            ));
+        let mut names = std::collections::HashSet::new();
+        for remote in &config.remotes {
+            if remote.name.is_empty() || remote.name == "local" || !names.insert(&remote.name) {
+                return Err(format!(
+                    "{}: remote names must be unique, nonempty and different from local",
+                    path.display()
+                ));
+            }
+            if remote.ssh.is_empty()
+                || remote.ssh.starts_with('-')
+                || remote.command.is_empty()
+                || remote.os.is_empty()
+            {
+                return Err(format!(
+                    "{}: remote {} needs an SSH destination, OS and command",
+                    path.display(),
+                    remote.name
+                ));
+            }
         }
         if !(1..=config.jobs).contains(&config.test_jobs) {
             return Err(format!(
@@ -278,10 +286,16 @@ mod tests {
         ));
         assert_eq!(Config::load(&home.0).unwrap().remotes[0].name, "pc");
         write(&format!(
-            "[[remote]]\nname = \"self\"\nssh = \"me@here\"\nos = \"{}\"\ncommand = \"buildd serve\"\n",
+            "[[remote]]\nname = \"air\"\nssh = \"me@air\"\nos = \"{}\"\ncommand = \"buildd serve\"\n",
             std::env::consts::OS
         ));
-        assert!(Config::load(&home.0).is_err(), "a remote for this OS");
+        assert_eq!(Config::load(&home.0).unwrap().remotes[0].name, "air");
+        for name in ["", "local"] {
+            write(&format!(
+                "[[remote]]\nname = {name:?}\nssh = \"me@host\"\nos = \"macos\"\ncommand = \"buildd serve\"\n"
+            ));
+            assert!(Config::load(&home.0).is_err());
+        }
         write("slots = 3\n");
         assert_eq!(Config::load(&home.0).unwrap().disk, 60 << 30);
         write("disk_gib = 12\n");

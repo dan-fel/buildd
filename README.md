@@ -25,6 +25,8 @@ buildd check -p my-crate              # starts the daemon on first use
 buildd test -p my-crate -- some_test  # same arguments as cargo
 buildd nextest --workspace            # every test in its own process
 buildd test --os linux --workspace    # on a remote Linux host
+buildd test --host air -p my-crate    # require a particular host
+buildd hosts disable local           # steer new builds away from this machine
 buildd run --os linux -- ./image.sh   # any command, on the same snapshot
 buildd status                         # one-shot summary
 buildd top                            # live view; q quits
@@ -265,7 +267,7 @@ units. `git worktree list` shows buildd's worktree.
    ├── ssh 'buildd serve' ──────────────────▶ daemon: own slots, budget, config
    ◀── messages streamed back ─────────────── slot shows as  pc:<slot>
 
- status questions use a second SSH connection, so top never waits behind a push
+ each exchange owns its SSH connection; control requests have a 3 s deadline
 ```
 
 ```toml
@@ -277,8 +279,20 @@ os = "linux"
 command = "bash -lc 'buildd serve'"   # login shell: same tools as a terminal
 ```
 
-- The caller names the OS. buildd never picks one itself, since results
-  differ by OS. A request for an OS no host builds for is rejected.
+- Ordinary commands choose any enabled, reachable host, including remotes
+  running the same OS. Selection uses current slot/CPU load, memory estimates,
+  warm caches and in-flight placements. Equal builds stay together, and new
+  revisions from a worktree stay with their accepted work for supersession.
+  This ranks destinations; each host's scheduler still owns admission.
+- `--os linux` or `--os macos` constrains the platform; `--host pc`,
+  `--host air` or `--host local` constrains the machine. Both constraints can
+  be used together. Neither silently relaxes when its host is unavailable.
+  Draining hosts and hosts below their free-disk floor are excluded.
+- `buildd hosts` shows policy. `buildd hosts disable local` and
+  `buildd hosts enable local` change new placements immediately; accepted
+  work continues. Policy is stored atomically in `host-policy.json` in the
+  coordinator's home and survives restarts. Remote names must be unique;
+  `local` names this machine. Disabling every matching host rejects new work.
 - Products (executables, or a `run` command's outputs) stay on the machine
   that made them. With `--os`, `--copy-to DIR` names a directory on the
   remote host, so a script there uses exactly the binaries buildd built for
@@ -286,6 +300,12 @@ command = "bash -lc 'buildd serve'"   # login shell: same tools as a terminal
   and outside that host's buildd home. As here, they are copied out of the
   slot after success: the slot's target is never shared or pointed
   elsewhere.
+- Without `--host` or `--os`, `--copy-to` stays local, so installation scripts
+  export native executables to their local paths. With either constraint,
+  the destination is absolute and belongs to the selected building machine.
+- Estimates are historical, not hard RAM limits. A fresh host borrows known
+  compilation peaks from other eligible hosts; unknown builds have no measured
+  peak yet. Oversized work is excluded from automatic placement on smaller hosts.
 - The remote daemon is an ordinary daemon and knows nothing about who uses
   it.
 - `buildd drain` stops a daemon taking new builds (for example during a
@@ -335,7 +355,8 @@ buildd's own options come before Cargo's arguments:
 
 | option | effect |
 |---|---|
-| `--os OS` | build on a remote host for that OS |
+| `--os OS` | require a host running this OS |
+| `--host NAME` | require this configured host, or `local` |
 | `--copy-to DIR` | after success, copy the built executables (and `.dSYM`), or what `run` left in `$BUILDD_OUT`, into `DIR` on the machine that builds (see Remote hosts) |
 | `--rustflags FLAGS` | flags for every rustc (like `RUSTFLAGS`); part of the build's identity |
 | `--json` | print every daemon message as a JSON line, for programs |
@@ -361,9 +382,8 @@ logs/                every build's output (see Logs and failures)
 runs/                each running command's $BUILDD_OUT and Cargo target
 slots/               see Slots
 mirrors/<project>    repositories remote machines push into
+host-policy.json     persisted disabled destinations for new placements
 prewarm/<project>    buildd's worktree of each prewarmed repository
-ssh-<hash>           SSH connection for builds  ┐ kept open
-ssh-s-<hash>         SSH connection for status  ┘ 10 minutes
 ```
 
 The daemon reads `config.toml` when it starts: restart it after a change.
@@ -390,11 +410,16 @@ bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
 
 ## Protocol
 
-One JSON object per line over the Unix socket (`src/protocol.rs`): `build`
+One JSON object per line over the Unix socket (`src/protocol.rs`): `schedule`
 streams a build, `status` describes slots and queue, `activity` adds what
 `top` shows, `remotes` asks the remote hosts’ daemons, `failures` sums up what failed. Programs integrate through the library's `client` module,
 with `default-features = false`: the default `cli` feature adds the command and the terminal UI
 `top` draws with.
+
+The former `build` tag is accepted for existing clients; new clients send
+`schedule` so an older daemon rejects the request instead of silently ignoring
+its host constraint. `hosts` lists policy, `set_host` mutates it, and `capacity`
+reads a leaf scheduler's current resources and compilation memory estimate.
 
 ## Cache-owner protocol
 
@@ -515,6 +540,6 @@ outcomes, and refreshes after execution. Tests use owned temporary caches only.
 - Ignored files aren't snapshotted, so a build that needs a generated,
   ignored file fails.
 - A per-slot timeline in `top`.
-- `--os all` (every OS, one verdict) and `--os any` (whichever is free).
+- `--os all` (every OS, one verdict).
 
 Unix only.

@@ -676,6 +676,14 @@ struct RemoteHost {
 
 impl RemoteHost {
     fn start() -> Self {
+        Self::for_os(if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        })
+    }
+
+    fn for_os(os: &'static str) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
 
         let remote = Daemon::start(1);
@@ -690,11 +698,6 @@ impl RemoteHost {
         let mut paths = vec![commands.0.clone()];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         let path = std::env::join_paths(paths).unwrap();
-        let os = if std::env::consts::OS == "linux" {
-            "macos"
-        } else {
-            "linux"
-        };
         let serve = format!(
             "BUILDD_HOME='{}' '{}' serve",
             remote.home.0.display(),
@@ -717,6 +720,89 @@ impl RemoteHost {
     }
 }
 
+#[test]
+fn automatic_routing_honors_same_os_hosts_and_persistent_policy() {
+    let mut hosts = RemoteHost::for_os(std::env::consts::OS);
+    let repository = crate_repository(None);
+    client::set_host(hosts.local.connect(), "local".into(), false).unwrap();
+    let request = run_request(&repository.0, &["sh", "-c", "printf 'selected remote\\n'"]);
+    let messages = hosts.local.submit(request.clone());
+    assert!(outcome(&messages).success(), "{messages:?}");
+    assert!(
+        messages.iter().any(
+            |message| matches!(message, Message::Started {slot, ..} if slot.starts_with("far:"))
+        ),
+        "{messages:?}"
+    );
+    assert_eq!(hosts.remote.activity().totals.builds, 1);
+    let mut local = request.clone();
+    local.host = Some("local".into());
+    assert!(matches!(
+        hosts.local.submit(local).last(),
+        Some(Message::Rejected { .. })
+    ));
+    client::set_host(hosts.local.connect(), "far".into(), false).unwrap();
+    assert!(matches!(
+        hosts.local.submit(request.clone()).last(),
+        Some(Message::Rejected { .. })
+    ));
+    hosts.local.restart();
+    assert!(
+        client::hosts(hosts.local.connect())
+            .unwrap()
+            .iter()
+            .all(|host| !host.enabled)
+    );
+    client::set_host(hosts.local.connect(), "local".into(), true).unwrap();
+    assert!(outcome(&hosts.local.submit(request)).success());
+}
+
+#[test]
+fn withdrawing_during_upload_stops_git_and_its_ssh_child() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    let hosts = RemoteHost::start();
+    let repository = crate_repository(None);
+    let events = hosts._commands.0.join("upload-events");
+    let listener = std::os::unix::net::UnixListener::bind(&events).unwrap();
+    let fixture = hosts._commands.0.join("upload.py");
+    std::fs::write(&fixture, format!("import signal,socket\ns=socket.socket(socket.AF_UNIX)\ns.connect({events:?})\ns.sendall(b'R')\nsignal.pause()\n")).unwrap();
+    std::fs::write(hosts._commands.0.join("ssh"), format!("#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\ngit-receive-pack*) exec python3 '{fixture}' ;;\n*) exec sh -c \"$last\" ;;\nesac\n", fixture=fixture.display())).unwrap();
+    let mut stream = hosts.local.connect();
+    let mut request = run_request(&repository.0, &["true"]);
+    request.host = Some("far".into());
+    let mut bytes = serde_json::to_vec(&buildd::protocol::Request::Build(request)).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
+    let mut ready = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: the listener owns this live descriptor throughout poll.
+    assert_eq!(
+        unsafe { libc::poll(&raw mut ready, 1, 5000) },
+        1,
+        "upload reaches the fixture"
+    );
+    let (mut event, _) = listener.accept().unwrap();
+    event
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    event.read_exact(&mut [0]).unwrap();
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(
+        event.read(&mut [0]).unwrap(),
+        0,
+        "the upload's SSH child ends on withdrawal"
+    );
+    assert_eq!(
+        hosts.remote.activity().totals.builds,
+        0,
+        "withdrawn before submission"
+    );
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.process.kill();
@@ -737,6 +823,7 @@ fn request(directory: &Path, command: Command, args: &[&str]) -> BuildRequest {
         rerun_all: false,
         optional: false,
         os: None,
+        host: None,
     }
 }
 
@@ -1683,12 +1770,19 @@ fn a_build_nobody_waits_for_is_stopped_with_everything_it_started() {
 }
 
 #[test]
-fn below_the_disk_floor_idle_slots_give_up_what_builds_used_longest_ago() {
-    // No volume has this much free: every build ends below the floor.
-    let daemon = Daemon::configured("slots = 1\njobs = 4\nmin_free_gib = 1000000\n");
+fn below_the_disk_floor_idle_slots_are_evicted_and_new_placements_are_refused() {
+    let mut daemon = Daemon::start(1);
     let repository = crate_repository(None);
     let built = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&built).success(), "{built:#?}");
+    // Raising the floor models a volume becoming full after a build. Its
+    // idle output is reclaimed, and subsequent routing avoids the host.
+    std::fs::write(
+        daemon.home.0.join("config.toml"),
+        "slots = 1\njobs = 4\nmin_free_gib = 1000000\n",
+    )
+    .unwrap();
+    daemon.restart();
     wait_until("the measured slot gave up everything", || {
         daemon.activity().events.iter().any(|event| {
             matches!(
@@ -1705,9 +1799,11 @@ fn below_the_disk_floor_idle_slots_give_up_what_builds_used_longest_ago() {
     let status = daemon.status();
     assert!(status.free_disk.is_some_and(|free| free < status.min_free));
     assert!(status.undersized);
-    // The slot builds again, from scratch.
     let again = daemon.build(&repository.0, Command::Check, &[]);
-    assert!(outcome(&again).success(), "{again:#?}");
+    assert!(
+        matches!(again.last(), Some(Message::Rejected {reason}) if reason.contains("free disk floor")),
+        "{again:?}"
+    );
 }
 
 #[test]
@@ -1769,7 +1865,11 @@ fn a_restarted_daemon_keeps_its_slots_warm_and_drops_slots_beyond_its_count() {
         .path();
     std::fs::create_dir(project.join("1")).unwrap();
 
-    std::fs::write(daemon.home.0.join("config.toml"), "slots = 1\njobs = 4\n").unwrap();
+    std::fs::write(
+        daemon.home.0.join("config.toml"),
+        "slots = 1\njobs = 4\nmin_free_gib = 0\n",
+    )
+    .unwrap();
     daemon.restart();
     assert!(!project.join("1").exists(), "slot 1 is beyond one slot");
     let slots = daemon.status().slots;

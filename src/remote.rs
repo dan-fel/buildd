@@ -2,13 +2,13 @@
 //!
 //! The remote daemon knows nothing about this one. This daemon pushes the
 //! snapshot's commit, on the worktree's `HEAD`, into the remote's mirror of
-//! the project (`git push` over the same SSH connection, so only objects the
-//! mirror lacks travel),
+//! the project (`git push` sends only objects the mirror lacks),
 //! then asks it, through `buildd serve` on the other end, to build that
 //! tree, and passes its messages on. Closing the client closes the SSH
 //! session, which withdraws the build there as a closed socket does here.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -46,6 +46,7 @@ fn serve(remote: &Remote) -> Result<Child, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|error| format!("could not run ssh: {error}"))
 }
@@ -344,6 +345,31 @@ pub(crate) fn activity(_home: &Path, remote: &Remote) -> Result<Activity, String
     ask(remote, &Request::Activity, None)
 }
 
+pub(crate) fn capacity(
+    remote: &Remote,
+    project: String,
+    prefix: std::path::PathBuf,
+    operation: crate::cargo::Operation,
+) -> Result<crate::protocol::Capacity, String> {
+    let capacity = ask::<Result<crate::protocol::Capacity, String>>(
+        remote,
+        &Request::Capacity {
+            project,
+            prefix,
+            operation,
+        },
+        None,
+    )??;
+    if capacity.status.capacity == 0
+        || capacity.status.jobs == 0
+        || capacity.status.idle_jobs > capacity.status.jobs
+        || capacity.status.memory == 0
+    {
+        return Err(format!("{} sent invalid resource limits", remote.name));
+    }
+    Ok(capacity)
+}
+
 /// The builds that failed on `remote` in the last `hours`.
 pub(crate) fn failures(_home: &Path, remote: &Remote, hours: u64) -> Result<Failures, String> {
     ask::<Result<Failures, String>>(remote, &Request::Failures { hours, os: None }, None)?
@@ -352,10 +378,11 @@ pub(crate) fn failures(_home: &Path, remote: &Remote, hours: u64) -> Result<Fail
 /// Pushes tree `revision` of `source`'s repository into `remote`'s mirror
 /// of it, and returns the mirror's project name.
 fn push(
-    _home: &Path,
     remote: &Remote,
     source: &Source,
     revision: &Revision,
+    requester: &std::os::unix::net::UnixStream,
+    started: &impl Fn(&std::sync::Arc<std::sync::Mutex<Child>>),
 ) -> Result<String, String> {
     let project = crate::slot::project_name(&source.repository);
     let mirror: Mirror = ask(
@@ -363,7 +390,7 @@ fn push(
         &Request::Mirror {
             project: project.clone(),
         },
-        None,
+        Some(requester),
     )?;
     let ssh = std::iter::once("ssh".to_owned())
         .chain(ssh_options().into_iter().map(str::to_owned))
@@ -379,7 +406,9 @@ fn push(
         command
     };
     let destination = format!("{}:{}", remote.ssh, mirror.path.display());
-    push_snapshot(git, source, revision, &destination)?;
+    push_snapshot_with(git, source, revision, &destination, |command| {
+        run_git(command, started)
+    })?;
     Ok(project)
 }
 
@@ -390,11 +419,22 @@ fn push(
 /// The commit sits on the worktree's `HEAD`, so it shares history with what
 /// earlier pushes sent and git sends only the objects that changed since. A
 /// commit without a parent shares no history, and git sent its whole tree.
+#[cfg(test)]
 fn push_snapshot(
     git: impl Fn() -> Command,
     source: &Source,
     revision: &Revision,
     destination: &str,
+) -> Result<(), String> {
+    push_snapshot_with(git, source, revision, destination, git::run)
+}
+
+fn push_snapshot_with(
+    git: impl Fn() -> Command,
+    source: &Source,
+    revision: &Revision,
+    destination: &str,
+    run: impl Fn(Command) -> Result<String, String>,
 ) -> Result<(), String> {
     let parent = git::head_commit(&source.worktree)?;
     let commit = git::snapshot_commit(git(), revision, parent.as_deref())?;
@@ -402,7 +442,7 @@ fn push_snapshot(
     let mut push = git();
     push.args(["push", "--quiet", "--no-verify", destination])
         .arg(format!("{commit}:{reference}"));
-    let Err(failed) = git::run(push) else {
+    let Err(failed) = run(push) else {
         return Ok(());
     };
     // Two builds of one tree on one HEAD push its commit at once: the mirror
@@ -410,7 +450,7 @@ fn push_snapshot(
     // same commit. That push failed only in form.
     let mut listed = git();
     listed.args(["ls-remote", destination, &reference]);
-    let there = git::run(listed)?;
+    let there = run(listed)?;
     if there.split_whitespace().next() == Some(commit.as_str()) {
         Ok(())
     } else {
@@ -418,20 +458,61 @@ fn push_snapshot(
     }
 }
 
+/// The transfer process group belongs to this request as completely as the
+/// later SSH build session. Withdrawal kills git and its SSH/pack children.
+fn run_git(
+    mut command: Command,
+    started: &impl Fn(&std::sync::Arc<std::sync::Mutex<Child>>),
+) -> Result<String, String> {
+    let mut child = command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start git transfer: {error}"))?;
+    let mut output = child.stdout.take().expect("piped");
+    let mut errors = child.stderr.take().expect("piped");
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    started(&child);
+    let (stdout, stderr) = std::thread::scope(|scope| {
+        let errors = scope.spawn(|| {
+            let mut bytes = Vec::new();
+            errors.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let mut bytes = Vec::new();
+        let stdout = output.read_to_end(&mut bytes).map(|_| bytes);
+        (stdout, errors.join().expect("reading stderr cannot panic"))
+    });
+    let mut child = child.lock().expect("child cannot panic");
+    let status = child
+        .wait()
+        .map_err(|error| format!("could not wait for git transfer: {error}"))?;
+    let stdout = stdout.map_err(|error| format!("could not read git transfer: {error}"))?;
+    let stderr =
+        stderr.map_err(|error| format!("could not read git transfer diagnostics: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "git transfer failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    String::from_utf8(stdout).map_err(|_| "git transfer returned invalid UTF-8".into())
+}
+
 /// Builds tree `revision` of `source` on `remote` as `request` asks,
 /// passing each message to `pass` until the last one or until `pass` says
 /// the client is gone. `started` gets the SSH session once the build is
 /// asked for: killing it withdraws the build.
 pub(crate) fn build(
-    home: &Path,
     remote: &Remote,
     source: &Source,
     revision: &Revision,
     request: RevisionRequest,
-    started: impl FnOnce(&std::sync::Arc<std::sync::Mutex<Child>>),
+    requester: &std::os::unix::net::UnixStream,
+    started: impl Fn(&std::sync::Arc<std::sync::Mutex<Child>>),
     mut pass: impl FnMut(&Message) -> bool,
 ) -> Result<(), String> {
-    let project = push(home, remote, source, revision)?;
+    let project = push(remote, source, revision, requester, &started)?;
     let mut child = serve(remote)?;
     send(
         &mut child,

@@ -49,6 +49,26 @@ pub fn status(stream: UnixStream) -> Result<Status, String> {
     ask(stream, &Request::Status)
 }
 
+/// Configured build hosts and their current admission policy.
+///
+/// # Errors
+/// When transport fails or the daemon rejects the request.
+pub fn hosts(stream: UnixStream) -> Result<Vec<crate::protocol::Host>, String> {
+    ask::<Result<_, String>>(stream, &Request::Hosts)?
+}
+
+/// Persistently enable or disable a destination for new placements.
+///
+/// # Errors
+/// When the host is unknown, policy cannot be saved, or transport fails.
+pub fn set_host(
+    stream: UnixStream,
+    name: String,
+    enabled: bool,
+) -> Result<Vec<crate::protocol::Host>, String> {
+    ask::<Result<_, String>>(stream, &Request::SetHost { name, enabled })?
+}
+
 /// A cache request did not produce a service-issued response. None of these
 /// errors establishes whether an earlier cleanup executed; only its exact
 /// receipt can settle that question.

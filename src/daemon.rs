@@ -30,7 +30,7 @@ use crate::memory;
 use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
-    Activity, BuildReport, BuildRequest, EventKind, Failures, Message, Mirror, Outcome,
+    Activity, BuildReport, BuildRequest, Capacity, EventKind, Failures, Message, Mirror, Outcome,
     RemoteActivity, Request, RevisionRequest, Shortage, Status, Usage,
 };
 use crate::remote;
@@ -70,6 +70,12 @@ enum Event {
     },
     Status {
         reply: Sender<Status>,
+    },
+    Capacity {
+        repository: PathBuf,
+        prefix: PathBuf,
+        operation: Operation,
+        reply: Sender<Capacity>,
     },
     Activity {
         reply: Sender<Activity>,
@@ -196,6 +202,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         remotes: Arc::new(config.remotes.clone()),
         events: events.clone(),
         next_waiter: Arc::new(AtomicU64::new(0)),
+        router: Arc::new(Mutex::new(crate::routing::Router::load(home)?)),
     };
     std::thread::Builder::new()
         .name("buildd-accept".into())
@@ -272,6 +279,7 @@ struct Accepting {
     remotes: Arc<Vec<Remote>>,
     events: Sender<Event>,
     next_waiter: Arc<AtomicU64>,
+    router: Arc<Mutex<crate::routing::Router>>,
 }
 
 impl Accepting {
@@ -289,6 +297,7 @@ impl Accepting {
                 remotes: Arc::clone(&self.remotes),
                 events: self.events.clone(),
                 waiter: WaiterId(self.next_waiter.fetch_add(1, Ordering::Relaxed)),
+                router: Arc::clone(&self.router),
             };
             let spawned = std::thread::Builder::new()
                 .name("buildd-client".into())
@@ -306,6 +315,7 @@ struct Connection {
     remotes: Arc<Vec<Remote>>,
     events: Sender<Event>,
     waiter: WaiterId,
+    router: Arc<Mutex<crate::routing::Router>>,
 }
 
 impl Connection {
@@ -372,6 +382,33 @@ impl Connection {
             Ok(Request::Remotes) => {
                 let _ = write_line(&mut stream, &self.remote_activity());
             }
+            Ok(Request::Hosts) => {
+                let hosts = self
+                    .router
+                    .lock()
+                    .expect("router cannot panic")
+                    .hosts(&self.remotes);
+                let _ = write_line(&mut stream, &Ok::<_, String>(hosts));
+            }
+            Ok(Request::SetHost { name, enabled }) => {
+                let hosts = self
+                    .router
+                    .lock()
+                    .expect("router cannot panic")
+                    .set_enabled(&self.home, &self.remotes, &name, enabled);
+                let _ = write_line(&mut stream, &hosts);
+            }
+            Ok(Request::Capacity {
+                project,
+                prefix,
+                operation,
+            }) => {
+                let capacity = operation
+                    .validate()
+                    .and_then(|()| mirror_path(&self.home, &project))
+                    .and_then(|repository| self.capacity(repository, prefix, operation));
+                let _ = write_line(&mut stream, &capacity);
+            }
             Ok(Request::Failures { hours, os }) => {
                 let failures = match os {
                     Some(os) if os != std::env::consts::OS => self
@@ -401,14 +438,27 @@ impl Connection {
                     let _ = write_line(&mut stream, &Message::Rejected { reason });
                 }
             },
-            Ok(Request::Build(request)) => match request.os.as_deref() {
-                Some(os) if os != std::env::consts::OS => {
-                    self.build_remotely(stream, reader, request)
-                }
-                _ => self.build(stream, reader, request),
-            },
+            Ok(Request::Build(request)) => self.build(stream, reader, request),
             Ok(Request::BuildRevision(request)) => self.build_revision(stream, reader, request),
         }
+    }
+
+    fn capacity(
+        &self,
+        repository: PathBuf,
+        prefix: PathBuf,
+        operation: Operation,
+    ) -> Result<Capacity, String> {
+        let (reply, capacity) = crossbeam_channel::bounded(1);
+        self.events
+            .send(Event::Capacity {
+                repository,
+                prefix,
+                operation,
+                reply,
+            })
+            .map_err(|_| "daemon ended")?;
+        capacity.recv().map_err(|_| "daemon ended".to_owned())
     }
 
     /// The remote host that builds for `os`.
@@ -466,6 +516,14 @@ impl Connection {
         request: RevisionRequest,
     ) {
         let prepared = request.operation.validate().and_then(|()| {
+            if !self
+                .router
+                .lock()
+                .expect("router cannot panic")
+                .enabled("local")
+            {
+                return Err("local build host is disabled".into());
+            }
             if let Some(directory) = &request.copy_to {
                 copy_destination_here(directory, &self.home)?;
             }
@@ -516,31 +574,16 @@ impl Connection {
         self.submit(stream, reader, submission);
     }
 
-    /// Snapshots the worktree here and builds the tree on the remote host
-    /// for the requested OS.
+    /// Forwards the already captured tree to its selected host.
     fn build_remotely(
         self,
         mut stream: UnixStream,
-        mut reader: BufReader<UnixStream>,
+        reader: BufReader<UnixStream>,
         request: BuildRequest,
+        remote: &Remote,
+        source: Source,
+        revision: snapshot::Revision,
     ) {
-        let os = request.os.clone().expect("only builds for an OS go remote");
-        let prepared = request.operation.validate().and_then(|()| {
-            let remote = self.remote_for(&os)?;
-            if let Some(directory) = &request.copy_to {
-                copy_destination(directory)?;
-            }
-            let source = snapshot::resolve(&request.directory)?;
-            let revision = source.snapshot(&self.home.join("tmp"))?;
-            Ok((remote.clone(), source, revision))
-        });
-        let (remote, source, revision) = match prepared {
-            Ok(prepared) => prepared,
-            Err(reason) => {
-                let _ = write_line(&mut stream, &Message::Rejected { reason });
-                return;
-            }
-        };
         let label = request.label.or_else(|| {
             source
                 .worktree
@@ -573,23 +616,31 @@ impl Connection {
             }
         };
         let built = remote::build(
-            &self.home,
-            &remote,
+            remote,
             &source,
             &revision,
             revision_request,
+            &stream,
             |child| {
                 // The end of the client's stream withdraws the build there.
                 let child = Arc::clone(child);
+                let mut reader = reader
+                    .get_ref()
+                    .try_clone()
+                    .expect("client stream was cloned");
                 let _ = std::thread::Builder::new()
                     .name("buildd-client-watch".into())
                     .spawn(move || {
                         let mut buffer = [0; 256];
                         while matches!(reader.read(&mut buffer), Ok(read) if read > 0) {}
-                        let _ = child
-                            .lock()
-                            .expect("no thread panics holding the ssh child")
-                            .kill();
+                        let mut child = child.lock().expect("child cannot panic");
+                        if matches!(child.try_wait(), Ok(None)) {
+                            let pid = Pid::from_raw(
+                                i32::try_from(child.id()).expect("process ID fits i32"),
+                            )
+                            .expect("nonzero PID");
+                            let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+                        }
                     });
             },
             |message| write_line(&mut writer, message).is_ok(),
@@ -601,10 +652,9 @@ impl Connection {
     }
 
     fn build(self, mut stream: UnixStream, reader: BufReader<UnixStream>, request: BuildRequest) {
-        let copy_to = request.copy_to;
         let prepared = request.operation.validate().and_then(|()| {
-            if let Some(directory) = &copy_to {
-                copy_destination_here(directory, &self.home)?;
+            if let Some(directory) = &request.copy_to {
+                copy_destination(directory)?;
             }
             let source = snapshot::resolve(&request.directory)?;
             let revision = source.snapshot(&self.home.join("tmp"))?;
@@ -617,13 +667,96 @@ impl Connection {
                 return;
             }
         };
+        let hosts = self
+            .router
+            .lock()
+            .expect("router cannot panic")
+            .hosts(&self.remotes);
+        if let Some(name) = &request.host
+            && !hosts.iter().any(|host| host.name == *name)
+        {
+            let _ = write_line(
+                &mut stream,
+                &Message::Rejected {
+                    reason: format!("unknown build host {name}"),
+                },
+            );
+            return;
+        }
+        let project = slot::project_name(&source.repository);
+        let observations = std::thread::scope(|scope| {
+            let asked = hosts
+                .into_iter()
+                .filter(|host| request.accepts_host(host))
+                .map(|host| {
+                    let project = &project;
+                    let source = &source;
+                    let operation = &request.operation;
+                    let connection = &self;
+                    scope.spawn(move || {
+                        let capacity = if host.name == "local" {
+                            connection.capacity(
+                                source.repository.clone(),
+                                source.prefix.clone(),
+                                operation.clone(),
+                            )
+                        } else {
+                            let remote = connection
+                                .remotes
+                                .iter()
+                                .find(|remote| remote.name == host.name)
+                                .expect("configured host");
+                            remote::capacity(
+                                remote,
+                                project.clone(),
+                                source.prefix.clone(),
+                                operation.clone(),
+                            )
+                        };
+                        (host, capacity)
+                    })
+                })
+                .collect::<Vec<_>>();
+            asked
+                .into_iter()
+                .map(|asked| asked.join().expect("host probe cannot panic"))
+                .collect::<Vec<_>>()
+        });
+        let placement = match self.router.lock().expect("router cannot panic").place(
+            &source,
+            &revision,
+            &request,
+            &observations,
+        ) {
+            Ok(placement) => placement,
+            Err(reason) => {
+                let _ = write_line(&mut stream, &Message::Rejected { reason });
+                return;
+            }
+        };
+        if placement.host != "local" {
+            let remote = self
+                .remotes
+                .iter()
+                .find(|remote| remote.name == placement.host)
+                .expect("placed on configured host")
+                .clone();
+            self.build_remotely(stream, reader, request, &remote, source, revision);
+            return;
+        }
+        if let Some(directory) = &request.copy_to
+            && let Err(reason) = copy_destination_here(directory, &self.home)
+        {
+            let _ = write_line(&mut stream, &Message::Rejected { reason });
+            return;
+        }
         let submission = Submission {
             waiter: self.waiter,
             source,
             revision,
             operation: request.operation,
             label: request.label,
-            copy_to,
+            copy_to: request.copy_to,
             rerun_all: request.rerun_all,
             optional: request.optional,
         };
@@ -888,6 +1021,21 @@ impl Daemon {
                 }
                 Event::Status { reply } => {
                     let _ = reply.send(self.status());
+                    Vec::new()
+                }
+                Event::Capacity {
+                    repository,
+                    prefix,
+                    operation,
+                    reply,
+                } => {
+                    let peak_memory =
+                        self.scheduler
+                            .forecast_memory(&repository, &prefix, &operation);
+                    let _ = reply.send(Capacity {
+                        status: self.status(),
+                        peak_memory,
+                    });
                     Vec::new()
                 }
                 Event::Activity { reply } => {
