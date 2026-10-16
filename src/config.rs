@@ -19,9 +19,12 @@ pub struct Config {
     /// between builds, in bytes, plus what running builds add before their
     /// slots are measured.
     pub disk: u64,
-    /// Disk the volume holding the home keeps free, in bytes: below it,
-    /// idle slots give up what builds used longest ago.
+    /// Disk the volume holding the home keeps free, in bytes. Breaching
+    /// it stops running builds before their idle artifacts are reclaimed.
     pub min_free: u64,
+    /// Free space reserved for each running build's additional output,
+    /// beyond the volume's free-disk floor.
+    pub build_headroom: u64,
     /// Memory running builds may use together, in bytes, by their recorded
     /// peaks: a build that would not fit waits.
     pub memory: u64,
@@ -71,6 +74,7 @@ struct File {
     test_jobs: Option<usize>,
     disk_gib: Option<f64>,
     min_free_gib: Option<f64>,
+    build_headroom_gib: Option<f64>,
     memory_gib: Option<f64>,
     #[serde(default)]
     remote: Vec<Remote>,
@@ -79,11 +83,14 @@ struct File {
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+/// 2^64 bytes is exactly representable as f64, unlike u64::MAX.
+const MAX_GIB: f64 = 18_446_744_073_709_551_616.0 / GIB;
 
 impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
     /// two slots, one job per available CPU, half of them for a build's
-    /// tests, 20 GiB of build disk per slot, 15 GiB of free disk, and the
+    /// tests, 20 GiB of build disk per slot, 15 GiB of free disk, 10 GiB of
+    /// output headroom per running build, and the
     /// machine's memory less 6 GiB for builds.
     ///
     /// # Errors
@@ -99,19 +106,32 @@ impl Config {
         let slots = file.slots.unwrap_or(2);
         #[expect(clippy::cast_precision_loss, reason = "a slot count in GiB")]
         let disk_gib = file.disk_gib.unwrap_or(20.0 * slots as f64);
-        if !(disk_gib.is_finite() && disk_gib > 0.0) {
-            return Err(format!("{}: disk_gib must be positive", path.display()));
+        if !(disk_gib.is_finite() && (0.5 / GIB..MAX_GIB).contains(&disk_gib)) {
+            return Err(format!(
+                "{}: disk_gib must be finite, positive and fit in bytes",
+                path.display()
+            ));
         }
         #[expect(clippy::cast_precision_loss, reason = "memory in GiB")]
         let physical_gib = crate::memory::physical() as f64 / GIB;
         let memory_gib = file.memory_gib.unwrap_or((physical_gib - 6.0).max(1.0));
-        if !(memory_gib.is_finite() && memory_gib > 0.0) {
-            return Err(format!("{}: memory_gib must be positive", path.display()));
+        if !(memory_gib.is_finite() && (0.5 / GIB..MAX_GIB).contains(&memory_gib)) {
+            return Err(format!(
+                "{}: memory_gib must be finite, positive and fit in bytes",
+                path.display()
+            ));
         }
         let min_free_gib = file.min_free_gib.unwrap_or(15.0);
-        if !(min_free_gib.is_finite() && min_free_gib >= 0.0) {
+        if !(min_free_gib.is_finite() && (0.0..MAX_GIB).contains(&min_free_gib)) {
             return Err(format!(
-                "{}: min_free_gib must not be negative",
+                "{}: min_free_gib must be finite, non-negative and fit in bytes",
+                path.display()
+            ));
+        }
+        let build_headroom_gib = file.build_headroom_gib.unwrap_or(10.0);
+        if !(build_headroom_gib.is_finite() && (0.0..MAX_GIB).contains(&build_headroom_gib)) {
+            return Err(format!(
+                "{}: build_headroom_gib must be finite, non-negative and fit in bytes",
                 path.display()
             ));
         }
@@ -134,6 +154,12 @@ impl Config {
                 reason = "a non-negative, finite number of GiB rounds to bytes"
             )]
             min_free: (min_free_gib * GIB).round() as u64,
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a non-negative, finite number of GiB rounds to bytes"
+            )]
+            build_headroom: (build_headroom_gib * GIB).round() as u64,
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -242,6 +268,7 @@ mod tests {
         let write = |text: &str| std::fs::write(home.0.join("config.toml"), text).unwrap();
         assert_eq!(defaults.test_jobs, (defaults.jobs / 2).max(1));
         assert_eq!(defaults.min_free, 15 << 30);
+        assert_eq!(defaults.build_headroom, 10 << 30);
         assert!(defaults.memory >= 1 << 30);
         write("slots = 3\njobs = 6\ndisk_gib = 0.5\nmin_free_gib = 0\nmemory_gib = 8\n");
         let expected = Config {
@@ -250,6 +277,7 @@ mod tests {
             test_jobs: 3,
             disk: 1 << 29,
             min_free: 0,
+            build_headroom: 10 << 30,
             memory: 8 << 30,
             remotes: Vec::new(),
             prewarm: Vec::new(),
@@ -305,11 +333,20 @@ mod tests {
         for invalid in [
             "slots = 0\n",
             "disk_gib = 0\n",
+            "disk_gib = 1e-100\n",
+            "memory_gib = 1e-100\n",
             "slot_limit_gib = 12\n",
             "slot = 1\n",
             "jobs = 4\ntest_jobs = 5\n",
             "test_jobs = 0\n",
             "min_free_gib = -1\n",
+            "build_headroom_gib = -1\n",
+            "build_headroom_gib = nan\n",
+            "build_headroom_gib = inf\n",
+            "build_headroom_gib = 17179869184\n",
+            "disk_gib = 17179869184\n",
+            "memory_gib = 17179869184\n",
+            "min_free_gib = 17179869184\n",
             "memory_gib = 0\n",
         ] {
             write(invalid);

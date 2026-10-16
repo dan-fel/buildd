@@ -663,6 +663,7 @@ impl Daemon {
 
     fn configured_path(config: &str, path: Option<&std::ffi::OsStr>) -> Self {
         let home = TempDir::new();
+        let config = format!("build_headroom_gib = 0\n{config}");
         std::fs::write(home.0.join("config.toml"), config).unwrap();
         let mut command = Process::new(env!("CARGO_BIN_EXE_buildd"));
         command.arg("daemon").env("BUILDD_HOME", &home.0);
@@ -1909,17 +1910,68 @@ fn requests_outside_a_worktree_or_taking_over_the_slot_are_rejected() {
 }
 
 #[test]
-fn slots_over_the_disk_budget_give_up_what_they_hold_once_measured() {
-    // About 10 kB, less than any build leaves behind.
-    let daemon = Daemon::configured("slots = 1\njobs = 4\ndisk_gib = 0.00001\nmin_free_gib = 0\n");
+fn a_missing_original_repository_keeps_its_cache_accounted_and_can_be_restored() {
+    let mut daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    let first = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&first).success(), "{first:#?}");
+    let retained = TempDir::new();
+    let moved = retained.0.join("source");
+    std::fs::rename(&repository.0, &moved).unwrap();
+    daemon.restart();
+    wait_until("the unavailable repository's cache is inventoried", || {
+        let status = daemon.status();
+        status.slots.len() == 1
+            && status.slots[0].size.is_some_and(|bytes| bytes > 0)
+            && status.slots[0].chore.is_none()
+    });
+    let status = daemon.status();
+    assert_eq!(Some(status.disk_used), status.slots[0].size);
+    std::fs::rename(moved, &repository.0).unwrap();
+    let recovered = daemon.build(&repository.0, Command::Check, &[]);
+    assert!(outcome(&recovered).success(), "{recovered:#?}");
+    assert!(daemon.activity().events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::Finished {
+            compiled: 0,
+            fresh: 1..,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_restarted_daemon_meets_its_budget_by_retiring_old_cache_and_keeps_dependencies_warm() {
+    let mut daemon = Daemon::start(1);
     let repository = crate_repository(None);
     let messages = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&messages).success(), "{messages:#?}");
-    wait_until("the slot gave up its compiled units", || {
+    let project = std::fs::read_dir(daemon.home.0.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let old = project.join("0/target/debug/incremental/old-variant");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("cache.bin"), vec![7_u8; 2 * 1024 * 1024]).unwrap();
+    std::fs::File::open(&old)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .unwrap();
+    // 1 MiB holds the real tiny crate's warm output, but not the obsolete
+    // compiler state. Restarting must account for both before admission.
+    std::fs::write(
+        daemon.home.0.join("config.toml"),
+        "slots = 1\njobs = 4\ndisk_gib = 0.001\nmin_free_gib = 0\nbuild_headroom_gib = 0\n",
+    )
+    .unwrap();
+    daemon.restart();
+    wait_until("the slot retired obsolete cache", || {
         daemon.activity().events.iter().any(|event| {
             matches!(
                 &event.kind,
-                EventKind::Evicted { shortage, units: 1.., .. } if shortage.over_budget > 0
+                EventKind::Evicted { shortage, caches: 1, units: 0, .. } if shortage.over_budget > 0
             )
         })
     });
@@ -1927,11 +1979,22 @@ fn slots_over_the_disk_budget_give_up_what_they_hold_once_measured() {
         daemon.status().slots[0].chore.is_none()
     });
     let status = daemon.status();
-    // Directories and Cargo's own files stay.
-    assert!(status.disk_used < 100_000, "{status:?}");
+    assert!(status.disk_used <= status.disk_budget, "{status:?}");
     assert_eq!(status.slots[0].size, Some(status.disk_used));
+    assert!(!old.exists());
     let again = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&again).success(), "{again:#?}");
+    assert!(
+        daemon.activity().events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Finished {
+                compiled: 0,
+                fresh: 1..,
+                ..
+            }
+        )),
+        "the dependency output was reused"
+    );
 }
 
 #[test]

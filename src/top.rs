@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use buildd::cargo::{Command, Operation};
+use buildd::log::gib;
 use buildd::protocol::{
     Activity, Chore, EventKind, Outcome, Percentiles, Phase, QueuedBuild, RemoteActivity, Shortage,
     SlotStatus, Speed, Status,
@@ -351,6 +352,15 @@ fn host_lines(name: &str, os: &str, status: &Status) -> Vec<Line<'static>> {
         None => Span::from(" · free disk unknown").red(),
     };
     let mut lines = vec![Line::from(first), Line::from(vec![memory, disk, free])];
+    if let Some(wait) = &status.disk_wait {
+        lines.push(
+            Line::from(format!(
+                "  Disk admission: {wait}; {} output headroom per build",
+                gib(status.build_headroom),
+            ))
+            .yellow(),
+        );
+    }
     if let Some(needed) = status.queue.iter().find_map(|build| build.memory_needed) {
         let remaining = status.memory.saturating_sub(status.memory_in_use);
         lines.push(
@@ -856,9 +866,13 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
 /// What an eviction covered, briefly.
 fn shortage_text(shortage: Shortage) -> String {
     match (shortage.over_budget, shortage.under_floor) {
-        (0, under) => format!("{} under the floor", gib(under)),
+        (0, under) => format!("{} short of free-space reservations", gib(under)),
         (over, 0) => format!("{} over budget", gib(over)),
-        (over, under) => format!("{} over budget, {} under the floor", gib(over), gib(under)),
+        (over, under) => format!(
+            "{} over budget, {} short of free-space reservations",
+            gib(over),
+            gib(under)
+        ),
     }
 }
 
@@ -895,10 +909,6 @@ fn ago(at_ms: u64, now: SystemTime) -> String {
         60..3600 => format!("{}m", secs / 60),
         _ => format!("{}h{}m", secs / 3600, secs % 3600 / 60),
     }
-}
-
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", gib_number(bytes))
 }
 
 #[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
@@ -960,6 +970,8 @@ mod tests {
                 disk_used: 24 << 30,
                 free_disk: Some(10 << 30),
                 min_free: 15 << 30,
+                build_headroom: 0,
+                disk_wait: None,
                 undersized: false,
                 memory: 18 << 30,
                 memory_in_use: 14 << 30,

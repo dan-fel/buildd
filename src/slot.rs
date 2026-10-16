@@ -8,6 +8,7 @@
 //! every fingerprint in its target, never changes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write as _;
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -89,22 +90,33 @@ pub(crate) fn existing_slots(home: &Path) -> Result<Vec<ExistingSlot>, String> {
     }
     let mut existing = Vec::new();
     for project in read_directory(&slots)? {
-        let Ok(repository) = std::fs::read(project.join("repository")) else {
-            log!(
-                "{} names no repository; leaving it alone",
-                project.display()
-            );
+        let children = read_directory(&project)?;
+        let numbered = children
+            .into_iter()
+            .filter_map(|slot| {
+                let index = slot.file_name()?.to_str()?.parse::<usize>().ok()?;
+                Some((slot, index))
+            })
+            .collect::<Vec<_>>();
+        if numbered.is_empty() {
             continue;
-        };
+        }
+        let repository = std::fs::read(project.join("repository")).map_err(|error| {
+            format!(
+                "{}: cannot restore slots without their repository identity: {error}",
+                project.display()
+            )
+        })?;
         let repository = PathBuf::from(std::ffi::OsString::from_vec(repository));
-        for slot in read_directory(&project)? {
-            let Some(index) = slot
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.parse::<usize>().ok())
-            else {
-                continue;
-            };
+        if !repository.is_absolute()
+            || project.file_name() != Some(std::ffi::OsStr::new(&project_name(&repository)))
+        {
+            return Err(format!(
+                "{}: invalid repository identity or slot directory; refusing to retarget its artifacts",
+                project.join("repository").display()
+            ));
+        }
+        for (slot, index) in numbered {
             existing.push(ExistingSlot {
                 repository: repository.clone(),
                 index,
@@ -188,18 +200,21 @@ impl SlotDirectory {
             .parent()
             .expect("a slot lives in a project directory");
         std::fs::create_dir_all(project)
-            .and_then(|()| {
-                std::fs::write(
-                    project.join("repository"),
-                    repository.as_os_str().as_encoded_bytes(),
-                )
-            })
-            .map_err(|error| {
-                format!(
-                    "could not note the repository of {}: {error}",
-                    project.display()
-                )
-            })?;
+            .map_err(|error| format!("could not create {}: {error}", project.display()))?;
+        // The identity is immutable. Each slot stages independently so two
+        // first builds cannot race on one partial file. A full disk can only
+        // damage an unpublished partial, never the identity already in use.
+        write_identity(
+            &project.join("repository"),
+            &project.join(format!(
+                "repository.{}.partial",
+                self.0
+                    .file_name()
+                    .expect("a slot has an index")
+                    .to_string_lossy(),
+            )),
+            repository.as_os_str().as_encoded_bytes(),
+        )?;
         if !source.join(".git").exists() {
             std::fs::create_dir_all(&source)
                 .map_err(|error| format!("could not create {}: {error}", source.display()))?;
@@ -209,13 +224,12 @@ impl SlotDirectory {
         }
         let alternates = source.join(".git/objects/info/alternates");
         std::fs::create_dir_all(alternates.parent().expect("alternates has a parent"))
-            .and_then(|()| {
-                std::fs::write(
-                    &alternates,
-                    format!("{}\n", repository.join("objects").display()),
-                )
-            })
             .map_err(|error| format!("could not write {}: {error}", alternates.display()))?;
+        write_identity(
+            &alternates,
+            &alternates.with_extension("partial"),
+            format!("{}\n", repository.join("objects").display()).as_bytes(),
+        )?;
 
         let commit = git::snapshot_commit(git::command(&source), revision, None)?;
         let mut reset = git::command(&source);
@@ -247,6 +261,33 @@ impl SlotDirectory {
             shared: usage.shared,
         })
     }
+}
+
+/// Publishes an immutable identity only after the complete file reaches
+/// disk. Existing identities are checked, never rewritten or repaired by a
+/// build. Slot ownership excludes another writer of the same partial path.
+fn write_identity(path: &Path, partial: &Path, identity: &[u8]) -> Result<(), String> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == identity => return Ok(()),
+        Ok(_) => return Err(format!("{}: repository identity differs", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    }
+    let result = (|| {
+        let mut file = std::fs::File::create(partial)?;
+        file.write_all(identity)?;
+        file.sync_all()?;
+        std::fs::rename(partial, path)
+    })();
+    if result.is_err() {
+        // This slot owns the unpublished partial, including a failed write.
+        if let Err(error) = std::fs::remove_file(partial)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            log!("could not remove {}: {error}", partial.display());
+        }
+    }
+    result.map_err(|error| format!("could not publish {}: {error}", path.display()))
 }
 
 /// What a slot's target holds: everything eviction may remove, and the disk
@@ -1183,6 +1224,119 @@ mod tests {
         assert_eq!(existing.directory.tree(), Ok(tree));
         existing.directory.remove().unwrap();
         assert!(existing_slots(&home.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_first_identity_publication_does_not_leave_an_unowned_slot() {
+        let repository = repository();
+        let home = TempDir::new();
+        let scratch = TempDir::new();
+        let source = resolve(&repository.0).unwrap();
+        let tree = source.snapshot(&scratch.0).unwrap();
+        let slot = SlotDirectory::new(&home.0, &source.repository, 0);
+        let project = slot.path().parent().unwrap();
+        // A blocked staging path produces a real publication error without
+        // requiring a full filesystem. No numbered slot may precede identity.
+        std::fs::create_dir_all(project.join("repository.0.partial")).unwrap();
+        assert!(slot.materialize(&source.repository, &tree).is_err());
+        assert!(!slot.path().exists());
+        assert!(!project.join("repository").exists());
+        assert!(existing_slots(&home.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn established_slot_identities_are_not_rewritten_on_later_builds() {
+        let repository = repository();
+        let home = TempDir::new();
+        let scratch = TempDir::new();
+        let source = resolve(&repository.0).unwrap();
+        let tree = source.snapshot(&scratch.0).unwrap();
+        let slot = SlotDirectory::new(&home.0, &source.repository, 0);
+        slot.materialize(&source.repository, &tree).unwrap();
+        let identity = slot.path().parent().unwrap().join("repository");
+        let alternates = slot.source().join(".git/objects/info/alternates");
+        let before = [modified(&identity), modified(&alternates)];
+        // Established identities need no writable staging file. In
+        // particular they survive later builds when the volume is full.
+        std::fs::create_dir(identity.with_file_name("repository.0.partial")).unwrap();
+        std::fs::create_dir(alternates.with_extension("partial")).unwrap();
+        slot.materialize(&source.repository, &tree).unwrap();
+        assert_eq!([modified(&identity), modified(&alternates)], before);
+        assert_eq!(
+            std::fs::read(&identity).unwrap(),
+            source.repository.as_os_str().as_encoded_bytes()
+        );
+        assert_eq!(existing_slots(&home.0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_slot_identities_fail_without_retargeting_or_erasing_artifacts() {
+        let repository = repository();
+        let home = TempDir::new();
+        let scratch = TempDir::new();
+        let source = resolve(&repository.0).unwrap();
+        let tree = source.snapshot(&scratch.0).unwrap();
+        let slot = SlotDirectory::new(&home.0, &source.repository, 0);
+        slot.materialize(&source.repository, &tree).unwrap();
+        std::fs::create_dir(slot.target()).unwrap();
+        let artifact = slot.target().join("keep");
+        std::fs::write(&artifact, "compiled output").unwrap();
+        let identity = slot.path().parent().unwrap().join("repository");
+        for invalid in [b"".as_slice(), b".", b"/another/repository/.git"] {
+            std::fs::write(&identity, invalid).unwrap();
+            assert!(existing_slots(&home.0).unwrap_err().contains("identity"));
+            assert!(slot.materialize(&source.repository, &tree).is_err());
+            assert_eq!(std::fs::read(&identity).unwrap(), invalid);
+            assert_eq!(
+                std::fs::read_to_string(&artifact).unwrap(),
+                "compiled output"
+            );
+            assert_eq!(slot.tree(), Ok(tree.clone()));
+        }
+        std::fs::remove_file(identity).unwrap();
+        assert!(
+            existing_slots(&home.0)
+                .unwrap_err()
+                .contains("without their repository identity")
+        );
+        assert!(artifact.is_file());
+    }
+
+    #[test]
+    fn concurrent_first_builds_publish_one_complete_repository_identity() {
+        let repository = repository();
+        let home = TempDir::new();
+        let scratch = TempDir::new();
+        let source = resolve(&repository.0).unwrap();
+        let tree = source.snapshot(&scratch.0).unwrap();
+        std::thread::scope(|threads| {
+            let builds = (0..2)
+                .map(|index| {
+                    let slot = SlotDirectory::new(&home.0, &source.repository, index);
+                    let source = &source;
+                    let tree = &tree;
+                    threads.spawn(move || slot.materialize(&source.repository, tree).unwrap())
+                })
+                .collect::<Vec<_>>();
+            for build in builds {
+                build.join().unwrap();
+            }
+        });
+        let slots = existing_slots(&home.0).unwrap();
+        assert_eq!(slots.len(), 2);
+        for slot in slots {
+            assert_eq!(slot.repository, source.repository);
+            assert_eq!(slot.directory.tree(), Ok(tree.clone()));
+            assert!(
+                !slot
+                    .directory
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .join(format!("repository.{}.partial", slot.index))
+                    .exists()
+            );
+        }
     }
 
     #[test]

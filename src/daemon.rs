@@ -25,18 +25,18 @@ use crate::config::{self, Config, Remote};
 use crate::distance::{GitDistance, Workspace};
 use crate::failures;
 use crate::git;
-use crate::log::log;
+use crate::log::{gib, log};
 use crate::memory;
 use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
     Activity, BuildReport, BuildRequest, Capacity, EventKind, Failures, Message, Mirror, Outcome,
-    RemoteActivity, Request, RevisionRequest, Shortage, Status, TestMemory, Usage,
+    RemoteActivity, Request, RevisionRequest, Status, TestMemory, Usage,
 };
 use crate::remote;
 use crate::run::{self, RunDirectory};
 use crate::scheduler::{
-    Effect, JobId, Measurement, Removal, Scheduler, SlotKey, Start, Submission, WaiterId,
+    Effect, JobId, Measurement, Removal, Scheduler, SlotKey, Start, Stop, Submission, WaiterId,
 };
 use crate::slot::{self, Inventory, SlotDirectory, SlotRecord, slot_name};
 use crate::snapshot::{self, Source};
@@ -48,6 +48,8 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 /// the build's process group can hold the output open longer; its remaining
 /// output is abandoned.
 const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+/// Space can disappear without a build finishing or a client asking for it.
+const DISK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the scheduler thread hears about.
 enum Event {
@@ -206,12 +208,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .name("buildd-accept".into())
         .spawn(move || accepting.accept(&listener))
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
-    let mut scheduler = Scheduler::new(
-        config.slots,
-        config.memory,
-        config.test_jobs,
-        GitDistance::default(),
-    );
+    let mut scheduler = Scheduler::new(&config, GitDistance::default());
     restore_slots(home, &config, &mut scheduler)?;
     crate::prewarm::spawn(home, config.prewarm.clone());
     Daemon {
@@ -225,7 +222,6 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         waiters: HashMap::new(),
         runs: HashMap::new(),
         log: ActivityLog::new(SystemTime::now(), EventFile::new(home)),
-        disk_short: false,
         draining: false,
     }
     .drive(&received)
@@ -249,30 +245,25 @@ fn restore_slots(
             }
             continue;
         }
-        if !existing.repository.exists() {
-            log!(
-                "slot {name}: its repository {} is gone; leaving the slot alone",
-                existing.repository.display()
-            );
-            continue;
-        }
-        match existing.directory.tree() {
-            Ok(revision) => {
-                // What builds learned in it is knowledge, not the slot: its
-                // checkout and target come back without it.
-                let record = existing.directory.read_record().unwrap_or_else(|error| {
-                    log!("slot {name}: {error}; restoring it without its record");
-                    SlotRecord::default()
-                });
-                log!(
-                    "restored slot {name} with {} compilations",
-                    record.compilations.len()
-                );
-                scheduler.restore(existing.repository, existing.index, revision, record);
+        let revision = match existing.directory.tree() {
+            Ok(revision) => Some(revision),
+            Err(error) => {
+                log!("slot {name}: restoring cache with unavailable checkout: {error}");
+                None
             }
-            // A slot whose checkout never completed is rebuilt when needed.
-            Err(error) => log!("slot {name} not restored: {error}"),
-        }
+        };
+        // Cached artifacts still consume disk when their original repository
+        // has disappeared. Only checkout availability affects placement;
+        // every slot remains owned, inventoried and subject to retention.
+        let record = existing.directory.read_record().unwrap_or_else(|error| {
+            log!("slot {name}: {error}; restoring it without its record");
+            SlotRecord::default()
+        });
+        log!(
+            "restored slot {name} with {} compilations",
+            record.compilations.len()
+        );
+        scheduler.restore(existing.repository, existing.index, revision, record);
     }
     Ok(())
 }
@@ -945,15 +936,18 @@ struct Daemon {
     waiters: HashMap<WaiterId, Sender<Message>>,
     runs: HashMap<JobId, Arc<Run>>,
     log: ActivityLog,
-    /// Build disk was over its budget or free disk under its floor when last
-    /// looked at, and no idle slot had anything left to give up.
-    disk_short: bool,
     /// It takes no new builds.
     draining: bool,
 }
 
 impl Daemon {
     fn drive(mut self, received: &Receiver<Event>) -> ! {
+        self.scheduler
+            .observe_disk(slot::free_disk(&self.home).ok());
+        for effect in self.scheduler.maintain() {
+            self.apply(effect);
+        }
+        let mut next_disk = Instant::now() + DISK_INTERVAL;
         loop {
             self.cache.expire(Instant::now());
             let due = self
@@ -961,24 +955,29 @@ impl Daemon {
                 .next_measurement()
                 .into_iter()
                 .chain(self.cache.next_expiry())
-                .min();
-            let event = match due {
-                Some(due) => match received.recv_deadline(due) {
-                    Ok(event) => event,
-                    Err(RecvTimeoutError::Timeout) => {
-                        for effect in self.scheduler.measurement_due(Instant::now()) {
-                            self.apply(effect);
-                        }
-                        continue;
+                .chain(std::iter::once(next_disk))
+                .min()
+                .expect("the disk timer always sets a deadline");
+            let event = match received.recv_deadline(due) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => {
+                    for effect in self.scheduler.measurement_due(Instant::now()) {
+                        self.apply(effect);
                     }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        panic!("the daemon holds a sender of its own events")
+                    self.scheduler
+                        .observe_disk(slot::free_disk(&self.home).ok());
+                    for effect in self.scheduler.maintain() {
+                        self.apply(effect);
                     }
-                },
-                None => received
-                    .recv()
-                    .expect("the daemon holds a sender of its own events"),
+                    next_disk = Instant::now() + DISK_INTERVAL;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the daemon holds a sender of its own events")
+                }
             };
+            self.scheduler
+                .observe_disk(slot::free_disk(&self.home).ok());
             let effects = match event {
                 Event::Cache { operation, reply } => {
                     let (response, effects) =
@@ -1084,14 +1083,12 @@ impl Daemon {
                     for effect in effects {
                         self.apply(effect);
                     }
-                    self.keep_disk();
                     Vec::new()
                 }
                 Event::Evicted { results } => {
                     for effect in self.scheduler.evicted(results) {
                         self.apply(effect);
                     }
-                    self.keep_disk();
                     Vec::new()
                 }
                 Event::Measured {
@@ -1106,11 +1103,15 @@ impl Daemon {
                     for effect in self.scheduler.measured(key, inventory) {
                         self.apply(effect);
                     }
-                    self.keep_disk();
                     Vec::new()
                 }
             };
             for effect in effects {
+                self.apply(effect);
+            }
+            self.scheduler
+                .observe_disk(slot::free_disk(&self.home).ok());
+            for effect in self.scheduler.maintain() {
                 self.apply(effect);
             }
             if let Some(work) = self.cache.take_work() {
@@ -1133,8 +1134,10 @@ impl Daemon {
             capacity: self.config.slots,
             disk_budget: self.config.disk,
             disk_used: self.scheduler.disk_used(),
-            free_disk: slot::free_disk(&self.home).ok(),
+            free_disk: self.scheduler.disk_space(),
             min_free: self.config.min_free,
+            build_headroom: self.config.build_headroom,
+            disk_wait: self.scheduler.disk_wait().cloned(),
             undersized: self.scheduler.undersized(),
             memory,
             memory_in_use,
@@ -1160,8 +1163,6 @@ impl Daemon {
                 let directory = SlotDirectory::new(&self.home, &repository, slot);
                 if let Err(error) = directory.write_record(&record) {
                     log!("{error}");
-                    // A full disk is the likely reason.
-                    self.keep_disk();
                 }
             }
             Effect::Send { waiter, message } => {
@@ -1281,51 +1282,11 @@ impl Daemon {
                     let _ = self.events.send(Event::Evicted { results });
                 }
             }
-            Effect::Cancel { job } => {
+            Effect::Cancel { job, reason } => {
                 if let Some(run) = self.runs.get(&job) {
-                    run.cancel();
+                    run.cancel(reason);
                 }
             }
-        }
-    }
-
-    /// Keeps the slots' targets within their budget and free disk above its
-    /// floor: idle slots give up what builds used longest ago, one eviction
-    /// at a time. A shortage nothing idle can cover waits for the next look,
-    /// after a build or a measurement.
-    fn keep_disk(&mut self) {
-        let under_floor = match slot::free_disk(&self.home) {
-            Ok(free) => self.config.min_free.saturating_sub(free),
-            Err(error) => {
-                log!("{error}");
-                0
-            }
-        };
-        let shortage = Shortage {
-            over_budget: self.scheduler.disk_used().saturating_sub(self.config.disk),
-            under_floor,
-        };
-        if shortage.needed() == 0 {
-            if self.disk_short {
-                log!("disk: back within the budget and above the floor");
-                self.disk_short = false;
-            }
-            return;
-        }
-        match self.scheduler.evict(shortage) {
-            Some(effect) => self.apply(effect),
-            // Its end is the next look.
-            None if self.scheduler.evicting() => {}
-            None if !self.disk_short => {
-                log!(
-                    "disk: {} over the budget and {} under the floor, and no idle \
-                     slot has anything to give up",
-                    gib(shortage.over_budget),
-                    gib(shortage.under_floor)
-                );
-                self.disk_short = true;
-            }
-            None => {}
         }
     }
 }
@@ -1345,10 +1306,14 @@ fn log_eviction(kind: &EventKind, budget: u64, floor: u64) {
         panic!("only evictions are logged as evictions");
     };
     let why = match (shortage.over_budget, shortage.under_floor) {
-        (0, under) => format!("{} under the floor of {}", gib(under), gib(floor)),
+        (0, under) => format!(
+            "{} short of free-space reservations (floor {})",
+            gib(under),
+            gib(floor)
+        ),
         (over, 0) => format!("{} over the budget of {}", gib(over), gib(budget)),
         (over, under) => format!(
-            "{} over the budget of {} and {} under the floor of {}",
+            "{} over the budget of {} and {} short of free-space reservations (floor {})",
             gib(over),
             gib(budget),
             gib(under),
@@ -1365,7 +1330,7 @@ fn log_eviction(kind: &EventKind, budget: u64, floor: u64) {
         let remedy = if shortage.over_budget > 0 {
             "raise disk_gib or lower slots"
         } else {
-            "free disk on the volume or lower min_free_gib"
+            "free disk on the volume or reduce build concurrency"
         };
         log!(
             "disk: builds lost caches and units they used in the last ten minutes, so \
@@ -1380,7 +1345,7 @@ struct Run(Mutex<RunState>);
 
 #[derive(Default)]
 struct RunState {
-    cancelled: bool,
+    stopped: Option<Stop>,
     /// The process group of Cargo or the command, once it runs.
     group: Option<Pid>,
     /// Its leader has exited; its group id may be reused.
@@ -1408,15 +1373,22 @@ impl Run {
         self.lock().lease.as_ref().map_or(0, |lease| lease.in_use())
     }
 
-    /// Stops the build: `SIGTERM` to its process group now, `SIGKILL`
-    /// after a grace period.
-    fn cancel(self: &Arc<Self>) {
+    /// Client withdrawal sends `SIGTERM`, then `SIGKILL` after a grace
+    /// period. Resource failures stop writes immediately with `SIGKILL`.
+    fn cancel(self: &Arc<Self>, reason: Stop) {
         let mut state = self.lock();
-        state.cancelled = true;
+        if state.stopped.is_some() {
+            return;
+        }
+        let graceful = matches!(reason, Stop::Withdrawn);
+        state.stopped = Some(reason);
         let Some(group) = state.group.filter(|_| !state.exited) else {
             return;
         };
-        signal_group(group, Signal::TERM);
+        signal_group(group, if graceful { Signal::TERM } else { Signal::KILL });
+        if !graceful {
+            return;
+        }
         drop(state);
         let run = Arc::clone(self);
         let _ = std::thread::Builder::new()
@@ -1497,6 +1469,12 @@ struct Building {
 impl Building {
     fn build(self) {
         let (outcome, usage) = self.outcome();
+        let outcome = match self.run.lock().stopped.as_ref() {
+            Some(Stop::Failed(reason)) => Outcome::Failed {
+                reason: reason.clone(),
+            },
+            _ => outcome,
+        };
         let log = self
             .log
             .lock()
@@ -1738,8 +1716,11 @@ impl Building {
         let program = command.get_program().to_string_lossy().into_owned();
         let mut child = {
             let mut state = self.run.lock();
-            if state.cancelled {
-                return Err(format!("cancelled before {program} started"));
+            if let Some(reason) = &state.stopped {
+                return Err(match reason {
+                    Stop::Withdrawn => format!("cancelled before {program} started"),
+                    Stop::Failed(reason) => reason.clone(),
+                });
             }
             let child = command
                 .spawn()
@@ -1959,11 +1940,6 @@ fn log_line(log: &Mutex<Option<BuildLog>>, line: &str, stream: fn(&mut BuildLog,
     }
 }
 
-#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
-}
-
 /// The unit of `ru_maxrss`: bytes on macOS, kilobytes elsewhere.
 #[cfg(target_os = "macos")]
 const MAX_RSS_UNIT: u64 = 1;
@@ -2031,6 +2007,26 @@ mod tests {
                     .is_some_and(|extension| extension == "pack")
             })
             .count()
+    }
+
+    #[test]
+    fn a_resource_stop_kills_the_process_group_and_preserves_the_failure_reason() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let run = Arc::new(Run::default());
+        run.lock().group = Some(Pid::from_child(&child));
+        run.cancel(Stop::Failed("free disk floor breached".into()));
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        run.lock().exited = true;
+        run.cancel(Stop::Withdrawn);
+        assert_eq!(
+            run.lock().stopped,
+            Some(Stop::Failed("free disk floor breached".into()))
+        );
     }
 
     #[test]

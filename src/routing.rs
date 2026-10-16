@@ -116,7 +116,7 @@ impl Router {
                 && capacity
                     .status
                     .free_disk
-                    .is_none_or(|free| free >= capacity.status.min_free)
+                    .is_some_and(|free| free >= capacity.status.min_free)
         };
         let matching = |placement: &&Arc<Placement>| {
             placement.source.repository == source.repository
@@ -158,7 +158,20 @@ impl Router {
                     let starts = load < status.capacity
                         && status.idle_jobs > 0
                         && status.queue.is_empty()
-                        && status.memory_in_use.saturating_add(peak) <= status.memory;
+                        && status.memory_in_use.saturating_add(peak) <= status.memory
+                        && status.disk_wait.is_none()
+                        && status.free_disk.is_some_and(|free| {
+                            let running = status
+                                .slots
+                                .iter()
+                                .filter(|slot| slot.build.is_some())
+                                .count();
+                            let builds =
+                                u64::try_from(running + 1).expect("the slot count fits u64");
+                            free >= status
+                                .min_free
+                                .saturating_add(status.build_headroom.saturating_mul(builds))
+                        });
                     let warm = status
                         .slots
                         .iter()
@@ -179,6 +192,9 @@ impl Router {
                             Err(reason) => format!("{}: {reason}", host.name),
                             Ok(capacity) if capacity.status.draining => {
                                 format!("{}: draining", host.name)
+                            }
+                            Ok(capacity) if capacity.status.free_disk.is_none() => {
+                                format!("{}: free disk unavailable", host.name)
                             }
                             Ok(capacity)
                                 if capacity
@@ -273,6 +289,8 @@ mod tests {
                     disk_used: 0,
                     free_disk: Some(30),
                     min_free: 15,
+                    build_headroom: 0,
+                    disk_wait: None,
                     undersized: false,
                     slots: Vec::new(),
                     queue: Vec::new(),
@@ -280,6 +298,46 @@ mod tests {
                 },
             }),
         )
+    }
+
+    #[test]
+    fn placement_prefers_ready_disk_capacity_and_refuses_unknown_free_space() {
+        let home = TempDir::new();
+        let mut router = Router::load(&home.0).unwrap();
+        let mut hosts = [host("local", "linux", 12), host("pc", "linux", 12)];
+        // Both hosts have the same CPU/memory load. The first cannot cover
+        // the next build's output reservation, so the second can start sooner.
+        hosts[0].1.as_mut().unwrap().status.build_headroom = 20;
+        assert_eq!(
+            router
+                .place(&source("/a"), &revision("a"), &request(), &hosts)
+                .unwrap()
+                .host,
+            "pc"
+        );
+        let local = &mut hosts[0].1.as_mut().unwrap().status;
+        local.build_headroom = 0;
+        local.disk_wait = Some(crate::protocol::DiskWait::Measuring);
+        assert_eq!(
+            router
+                .place(&source("/a"), &revision("b"), &request(), &hosts)
+                .unwrap()
+                .host,
+            "pc"
+        );
+        hosts[0].1.as_mut().unwrap().status.free_disk = None;
+        assert_eq!(
+            router
+                .place(&source("/a"), &revision("c"), &request(), &hosts)
+                .unwrap()
+                .host,
+            "pc"
+        );
+        hosts[1].1.as_mut().unwrap().status.free_disk = None;
+        let error = router
+            .place(&source("/a"), &revision("d"), &request(), &hosts)
+            .unwrap_err();
+        assert!(error.contains("free disk unavailable"), "{error}");
     }
 
     #[test]

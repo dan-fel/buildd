@@ -448,6 +448,8 @@ mod tests {
             disk_used: 0,
             free_disk: None,
             min_free: 0,
+            build_headroom: 0,
+            disk_wait: None,
             undersized: false,
             memory: 1,
             memory_in_use: 0,

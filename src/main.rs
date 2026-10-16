@@ -8,6 +8,7 @@ use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use buildd::cargo::{Command, Operation};
+use buildd::log::gib;
 use buildd::protocol::{BuildRequest, Chore, Failures, Message, Outcome, Status};
 use buildd::{client, config};
 use serde::Deserialize;
@@ -513,6 +514,8 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         disk_used,
         free_disk,
         min_free,
+        build_headroom,
+        disk_wait,
         undersized,
         memory,
         memory_in_use,
@@ -546,6 +549,12 @@ fn status(home: &Path) -> Result<ExitCode, String> {
             ""
         }
     );
+    if let Some(wait) = disk_wait {
+        println!(
+            "disk admission: {wait} ({} headroom per build)",
+            gib(build_headroom)
+        );
+    }
     for slot in slots {
         let worktree = slot.worktree.map_or_else(String::new, |worktree| {
             format!(" for {}", worktree.display())
@@ -592,11 +601,6 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         );
     }
     Ok(ExitCode::SUCCESS)
-}
-
-#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
 }
 
 fn seconds(millis: u64) -> String {

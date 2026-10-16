@@ -2195,7 +2195,19 @@ mod tests {
                 std::fs::write(target.join(path), [7_u8; 8192]).unwrap();
             }
             std::fs::write(home.0.join("keep.log"), "logs").unwrap();
-            let mut scheduler = Scheduler::new(1, u64::MAX, 2, EqualDistance);
+            let config = crate::config::Config {
+                slots: 1,
+                jobs: 4,
+                test_jobs: 2,
+                memory: u64::MAX,
+                disk: u64::MAX,
+                min_free: 0,
+                build_headroom: 0,
+                remotes: Vec::new(),
+                prewarm: Vec::new(),
+            };
+            let mut scheduler = Scheduler::new(&config, EqualDistance);
+            scheduler.observe_disk(Some(u64::MAX));
             let revision = Revision::of_tree("1234");
             let compilation = crate::cargo::Compilation::new(
                 Path::new(""),
@@ -2208,7 +2220,7 @@ mod tests {
             scheduler.restore(
                 repository,
                 0,
-                revision.clone(),
+                Some(revision.clone()),
                 SlotRecord {
                     units: [(
                         "debug/aaaaaaaaaaaaaaaa".to_owned(),
@@ -2923,7 +2935,7 @@ mod tests {
             fixture.scheduler.restore(
                 fixture.home.0.join(format!("project-{index}/.git")),
                 0,
-                Revision::of_tree("1234"),
+                Some(Revision::of_tree("1234")),
                 SlotRecord::default(),
             );
         }
@@ -3033,7 +3045,7 @@ mod tests {
         fixture.scheduler.restore(
             repository,
             0,
-            Revision::of_tree("5678"),
+            Some(Revision::of_tree("5678")),
             SlotRecord::default(),
         );
         let profile = "p".repeat(180);
@@ -3241,7 +3253,7 @@ mod tests {
         fixture.scheduler.restore(
             repository,
             0,
-            Revision::of_tree("5678"),
+            Some(Revision::of_tree("5678")),
             SlotRecord::default(),
         );
         let profile = "p".repeat(180);
@@ -3342,7 +3354,7 @@ mod tests {
         fixture.scheduler.restore(
             repository,
             0,
-            Revision::of_tree("5678"),
+            Some(Revision::of_tree("5678")),
             SlotRecord::default(),
         );
         let external = fixture.home.0.join("external-links");

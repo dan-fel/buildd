@@ -333,6 +333,12 @@ pub struct Status {
     pub free_disk: Option<u64>,
     #[serde(default)]
     pub min_free: u64,
+    /// Free space reserved for additional output per running build.
+    #[serde(default)]
+    pub build_headroom: u64,
+    /// Disk maintenance or space is holding build admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_wait: Option<DiskWait>,
     /// The latest eviction took caches or compiled units builds used in the
     /// last ten minutes: the budget or free disk is below what builds use,
     /// so they compile from scratch.
@@ -382,6 +388,48 @@ pub enum Chore {
     Evicting,
     /// Its target is reserved for a cache inventory or approved cleanup.
     Cache,
+}
+
+/// Why disk admission is waiting. No running slot is reclaimed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiskWait {
+    Measuring,
+    /// Cache-owner work holds an inventory needed for disk admission.
+    Protected,
+    MaintenanceFailed {
+        slot: String,
+        reason: String,
+    },
+    Evicting,
+    /// The cache budget cannot yet be met by idle artifacts.
+    Budget,
+    /// The floor and output reservations require this much free space.
+    Headroom {
+        required: u64,
+    },
+    /// Reading the volume's free space failed. Admission fails closed.
+    Unavailable,
+}
+
+impl std::fmt::Display for DiskWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Measuring => f.write_str("measuring build artifacts"),
+            Self::Protected => f.write_str("waiting for protected artifact inventories"),
+            Self::MaintenanceFailed { slot, reason } => {
+                write!(f, "artifact maintenance failed for {slot}: {reason}")
+            }
+            Self::Evicting => f.write_str("reclaiming idle build artifacts"),
+            Self::Budget => f.write_str("cache disk budget exceeded"),
+            Self::Headroom { required } => write!(
+                f,
+                "need {} free for the disk floor and build output",
+                crate::log::gib(*required)
+            ),
+            Self::Unavailable => f.write_str("free disk could not be read"),
+        }
+    }
 }
 
 /// A slot's latest finished build.
@@ -640,6 +688,7 @@ pub enum EventKind {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Shortage {
     pub over_budget: u64,
+    /// Shortfall against the volume floor plus build output reservations.
     pub under_floor: u64,
 }
 

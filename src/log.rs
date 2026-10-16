@@ -42,6 +42,13 @@ pub fn local_time(at: SystemTime) -> String {
     )
 }
 
+/// A byte count in GiB for logs and status displays.
+#[must_use]
+#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
+pub fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

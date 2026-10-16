@@ -135,21 +135,44 @@ memory   a queued build starts when
 disk     a slot quiet for 2 s is measured: what its target holds, and what
          removing each part frees (it stays true until the slot's next build)
 
-         Σ targets > disk_gib  or  free < min_free_gib
+         before starting any build, including queued work:
+         Σ targets > disk_gib  or
+         free < min_free_gib + build_headroom_gib × (running + 1)
            → idle slots give up what builds used longest ago, across all
              slots: compiled units (with their examples), incremental
              caches, files tests left in target/tmp
+
+         pressure measures dirty idle slots immediately; maintenance owns
+         them before queued work can take them again. Restored targets are
+         measured before reuse. Unknown free space or a failed inventory
+         holds admission; failed inventories are checked again after 2 s.
+
+         free space is checked on scheduler events and a 1 s timer:
+         below min_free_gib → stop running process groups with a disk-space
+         failure, then reclaim their artifacts only after they have exited
 ```
 
 **Sizing.** `disk_gib` must hold the working set of the builds the slots
 serve. Below that, eviction deletes caches still in use and builds start
 cold; `status` and `top` flag the budget as too small. Fewer, larger slots
-win. Builds of a few crates need 12–15 GiB per slot. Full-workspace `test`
-plus `clippy --all-targets` need about 30 GiB.
+win. Size the budget from the measured working set, including the profiles
+and feature variants actually used. Unreclaimable files above the budget
+hold admission rather than silently increasing the allowance.
 
 The free-disk floor applies even below `disk_gib`: increasing the cache allowance
 does not create free space. Keep enough space for the warm targets and the output
-of running builds, or move the buildd home to a larger volume. Tests in separate
+of running builds, or move the buildd home to a larger volume.
+`build_headroom_gib` defaults to 10 GiB per running build, on top of the
+15 GiB volume floor. It reserves growth capacity, rather than imposing a
+filesystem quota; a build that consumes the floor is stopped. This protects
+the volume while keeping recent compiler state and expensive dependencies
+warm instead of clearing whole targets. Slot repository identities are
+published atomically once and checked on reuse; invalid identities stop
+restoration instead of excluding or retargeting cached artifacts.
+Caches whose original repository or checkout is unavailable remain owned
+and counted; restoring that repository lets the slot rebuild its checkout
+and reuse the artifacts it still holds.
+Tests in separate
 process groups, including nextest's children, count toward the memory peaks.
 Filtered test runs retain the largest measured peak of their compilation; they
 cannot replace a broader run's reservation with their smaller footprint.
@@ -383,6 +406,7 @@ parallelism away from the daemon (`--target-dir`, `--manifest-path`,
 ```text
 config.toml          slots = 2, jobs = <CPUs>, test_jobs = jobs / 2,
                      disk_gib = 20 × slots, min_free_gib = 15,
+                     build_headroom_gib = 10,
                      memory_gib = <physical> - 6, [[remote]] hosts
 sock                 the daemon's socket
 daemon.log           output of a daemon a client started
