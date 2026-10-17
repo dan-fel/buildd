@@ -101,9 +101,8 @@ impl Router {
         let peak = eligible
             .iter()
             .filter_map(|(_, capacity)| capacity.as_ref().ok())
-            .map(|capacity| capacity.peak_memory)
-            .max()
-            .unwrap_or(0);
+            .filter_map(|capacity| capacity.peak_memory)
+            .max();
         let live = self
             .placements
             .iter()
@@ -112,7 +111,7 @@ impl Router {
         let usable = |host: &Host, capacity: &Capacity| {
             constrained(host)
                 && !capacity.status.draining
-                && peak <= capacity.status.memory
+                && peak.is_none_or(|peak| peak <= capacity.status.memory)
                 && capacity
                     .status
                     .free_disk
@@ -155,10 +154,12 @@ impl Router {
                         .filter(|placement| placement.host == host.name)
                         .count();
                     let load = observed.max(assigned);
+                    let reserved = peak.unwrap_or(status.memory);
                     let starts = load < status.capacity
                         && status.idle_jobs > 0
                         && status.queue.is_empty()
-                        && status.memory_in_use.saturating_add(peak) <= status.memory
+                        && (peak.is_some() || load == 0)
+                        && status.memory_in_use.saturating_add(reserved) <= status.memory
                         && status.disk_wait.is_none()
                         && status.free_disk.is_some_and(|free| {
                             let running = status
@@ -204,10 +205,13 @@ impl Router {
                             {
                                 format!("{}: below free disk floor", host.name)
                             }
-                            Ok(capacity) => format!(
-                                "{}: estimated peak {peak} bytes exceeds memory budget {}",
-                                host.name, capacity.status.memory
-                            ),
+                            Ok(capacity) => {
+                                let peak = peak.expect("unknown memory cannot disqualify a host");
+                                format!(
+                                    "{}: estimated peak {peak} bytes exceeds memory budget {}",
+                                    host.name, capacity.status.memory
+                                )
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join("; ");
@@ -278,7 +282,7 @@ mod tests {
                 enabled: true,
             },
             Ok(Capacity {
-                peak_memory: 2,
+                peak_memory: Some(2),
                 status: Status {
                     jobs: 2,
                     idle_jobs: 2,
@@ -427,6 +431,24 @@ mod tests {
     }
 
     #[test]
+    fn unknown_memory_can_learn_and_prefers_a_host_without_an_existing_assignment() {
+        let home = TempDir::new();
+        let mut router = Router::load(&home.0).unwrap();
+        let mut hosts = [host("local", "linux", 12), host("pc", "linux", 12)];
+        let existing = router
+            .place(&source("/busy"), &revision("busy"), &request(), &hosts)
+            .unwrap();
+        assert_eq!(existing.host, "local");
+        for (_, capacity) in &mut hosts {
+            capacity.as_mut().unwrap().peak_memory = None;
+        }
+        let unknown = router
+            .place(&source("/new"), &revision("new"), &request(), &hosts)
+            .unwrap();
+        assert_eq!(unknown.host, "pc");
+    }
+
+    #[test]
     fn known_large_builds_avoid_small_hosts_and_exports_default_to_local() {
         let home = TempDir::new();
         let mut router = Router::load(&home.0).unwrap();
@@ -435,7 +457,7 @@ mod tests {
             host("pc", "linux", 24),
             host("air", "macos", 3),
         ];
-        hosts[1].1.as_mut().unwrap().peak_memory = 15;
+        hosts[1].1.as_mut().unwrap().peak_memory = Some(15);
         hosts[1].1.as_mut().unwrap().status.idle_jobs = 0;
         assert_eq!(
             router
@@ -444,7 +466,7 @@ mod tests {
                 .host,
             "pc"
         );
-        hosts[1].1.as_mut().unwrap().peak_memory = 2;
+        hosts[1].1.as_mut().unwrap().peak_memory = Some(2);
         let mut request = request();
         request.copy_to = Some("/out".into());
         assert_eq!(

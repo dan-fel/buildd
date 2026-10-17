@@ -208,8 +208,9 @@ pub struct Mirror {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Capacity {
     pub status: Status,
-    /// A historical peak for this compilation, zero when unknown.
-    pub peak_memory: u64,
+    /// A measured peak of this exact compilation. An unmeasured request
+    /// learns its peak while holding an exclusive memory reservation.
+    pub peak_memory: Option<u64>,
 }
 
 /// A host in the coordinator's policy. Reachability is observed separately.

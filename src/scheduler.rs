@@ -243,8 +243,8 @@ enum State {
         /// Cargo succeeded and its executables are being copied out.
         copying: bool,
         cancelled: bool,
-        /// The memory admission charged it: its expected peak.
-        memory: u64,
+        /// Measured reservation, or exclusive admission while learning a peak.
+        memory: Option<u64>,
     },
 }
 
@@ -327,8 +327,8 @@ impl Slot {
         build_ms: u64,
         usage: Option<Usage>,
     ) {
-        // A build that used no units says nothing about what it needs.
-        if units.is_empty() {
+        // Resource measurements remain useful when a command compiles nothing.
+        if units.is_empty() && usage.is_none() {
             return;
         }
         let at = now();
@@ -340,7 +340,9 @@ impl Slot {
             Some(index) => {
                 let mut run = self.compilations.remove(index);
                 if succeeded {
-                    run.units.clear();
+                    if !units.is_empty() {
+                        run.units.clear();
+                    }
                     run.build_ms = Some(build_ms);
                 }
                 if let Some(usage) = usage {
@@ -891,7 +893,7 @@ impl<D: Distance> Scheduler<D> {
         }
         *testing_at = Some(Instant::now());
         if let Some(peak) = test_memory {
-            *memory = peak;
+            *memory = Some(peak);
         }
         self.start_ready()
     }
@@ -1465,10 +1467,19 @@ impl<D: Distance> Scheduler<D> {
             }
             // A build that does not fit waits, and so does everything behind
             // it: smaller builds slipping past would keep it waiting for good.
+            // An unmeasured build learns alone, reserving the whole budget.
             // With nothing running, it runs whatever it needs.
             let memory = self.memory_estimate(&self.jobs[&id]);
-            if in_use > 0 && in_use.saturating_add(memory) > self.memory {
-                self.jobs.get_mut(&id).expect("queued above").memory_needed = Some(memory);
+            let running = self.jobs.values().any(|job| !job.queued());
+            let exclusive = self
+                .jobs
+                .values()
+                .any(|job| matches!(job.state, State::Running { memory: None, .. }));
+            let reserved = memory.unwrap_or(self.memory);
+            if running
+                && (exclusive || memory.is_none() || in_use.saturating_add(reserved) > self.memory)
+            {
+                self.jobs.get_mut(&id).expect("queued above").memory_needed = Some(reserved);
                 break;
             }
             // All callers, including exits, measurements and cache releases,
@@ -1495,7 +1506,7 @@ impl<D: Distance> Scheduler<D> {
                     continue;
                 }
             };
-            in_use += memory;
+            in_use += reserved;
             self.clock += 1;
             let job = &self.jobs[&id];
             // A command of the client's own compiles nothing: it is never a
@@ -1684,7 +1695,7 @@ impl<D: Distance> Scheduler<D> {
         self.jobs
             .values()
             .filter_map(|job| match job.state {
-                State::Running { memory, .. } => Some(memory),
+                State::Running { memory, .. } => Some(memory.unwrap_or(self.memory)),
                 State::Queued => None,
             })
             .sum()
@@ -1696,9 +1707,9 @@ impl<D: Distance> Scheduler<D> {
         (self.memory, self.memory_in_use())
     }
 
-    /// Largest recorded peak of this compilation, or of its command when
-    /// the compilation is unknown. Filters cannot lower a broader run's peak.
-    fn memory_estimate(&self, job: &Job) -> u64 {
+    /// Largest recorded peak of this exact compilation. Execution filters
+    /// cannot lower a broader run's peak; another package selection is unknown.
+    fn memory_estimate(&self, job: &Job) -> Option<u64> {
         let compilation = Compilation::of(job);
         self.compilation_memory(&job.repository, &compilation)
     }
@@ -1709,28 +1720,18 @@ impl<D: Distance> Scheduler<D> {
         repository: &Path,
         prefix: &Path,
         operation: &Operation,
-    ) -> u64 {
+    ) -> Option<u64> {
         self.compilation_memory(repository, &Compilation::new(prefix, operation))
     }
 
-    fn compilation_memory(&self, repository: &Path, compilation: &Compilation) -> u64 {
-        let runs = || {
-            self.slots
-                .iter()
-                .filter(|slot| slot.repository == repository)
-                .flat_map(|slot| &slot.compilations)
-        };
-        runs()
-            .filter(|run| &run.compilation == compilation && run.peak_memory.is_some())
+    fn compilation_memory(&self, repository: &Path, compilation: &Compilation) -> Option<u64> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.repository == repository)
+            .flat_map(|slot| &slot.compilations)
+            .filter(|run| &run.compilation == compilation)
             .filter_map(|run| run.peak_memory)
             .max()
-            .or_else(|| {
-                runs()
-                    .filter(|run| run.compilation.command == compilation.command)
-                    .filter_map(|run| run.peak_memory)
-                    .max()
-            })
-            .unwrap_or(0)
     }
 
     /// How long a build of `job` is expected to take: the latest successful
@@ -2013,6 +2014,7 @@ fn needed<'a>(
         .iter()
         .filter(|slot| slot.repository == repository)
         .flat_map(|slot| &slot.compilations)
+        .filter(|run| !run.units.is_empty())
     {
         let kept = latest.entry(&run.compilation).or_insert(run);
         if run.at > kept.at {
@@ -2050,6 +2052,7 @@ mod tests {
     use super::*;
     use crate::cargo::Command;
     use crate::slot::{Evictable, Inventory, Kind};
+    use std::collections::BTreeSet;
 
     /// Distances from a table; trees not in it are equal or 10 apart.
     #[derive(Default)]
@@ -2084,6 +2087,30 @@ mod tests {
         let mut scheduler = Scheduler::new(&config, Table::default());
         scheduler.observe_disk(Some(u64::MAX));
         scheduler
+    }
+
+    /// Restored measurements for tests of concurrent placement/disk policy.
+    /// No compiled units are assumed: only this command's peak is known.
+    fn known_check_memory(scheduler: &mut Scheduler<Table>, repository: &str) {
+        scheduler.restore(
+            repository.into(),
+            0,
+            None,
+            SlotRecord {
+                compilations: vec![CompilationRun {
+                    compilation: Compilation::new(Path::new(""), &check()),
+                    at: now(),
+                    units: BTreeSet::new(),
+                    build_ms: None,
+                    peak_memory: Some(1),
+                    test_memory: None,
+                }],
+                ..SlotRecord::default()
+            },
+        );
+        let key = SlotKey(scheduler.slots.len() - 1);
+        scheduler.measure(key.0);
+        scheduler.measured(key, Ok(Inventory::default()));
     }
 
     fn source(worktree: &str) -> Source {
@@ -2170,6 +2197,7 @@ mod tests {
     #[test]
     fn optional_work_waits_behind_other_builds_and_leaves_a_slot_free() {
         let mut scheduler = scheduler(3);
+        known_check_memory(&mut scheduler, "/repo/.git");
         let [(running, ..)] = starts(&submit(&mut scheduler, 1, "/a", "a1"))[..] else {
             panic!("a build starts in an idle slot");
         };
@@ -2201,6 +2229,9 @@ mod tests {
     #[test]
     fn cache_exclusion_counts_against_optional_work_and_release_starts_it() {
         let mut scheduler = scheduler(3);
+        for repository in ["/repo/.git", "/b1/.git", "/p1/.git"] {
+            known_check_memory(&mut scheduler, repository);
+        }
         let [(running, ..)] = starts(&submit(&mut scheduler, 1, "/a", "a1"))[..] else {
             panic!("the first build starts");
         };
@@ -2668,6 +2699,7 @@ mod tests {
     #[test]
     fn a_build_takes_the_idle_slot_whose_tree_is_closest() {
         let mut scheduler = scheduler(2);
+        known_check_memory(&mut scheduler, "/repo/.git");
         // Two concurrent builds create two slots.
         let a = submit(&mut scheduler, 1, "/a", "a1");
         let b = submit(&mut scheduler, 2, "/b", "b1");
@@ -2694,6 +2726,7 @@ mod tests {
     #[test]
     fn slots_grow_only_while_every_slot_runs_a_build() {
         let mut scheduler = scheduler(2);
+        known_check_memory(&mut scheduler, "/repo/.git");
         assert_eq!(run(&mut scheduler, 1, "/a", "a1"), 0);
         assert_eq!(run(&mut scheduler, 2, "/b", "b1"), 0);
 
@@ -2833,6 +2866,7 @@ mod tests {
     #[test]
     fn output_headroom_is_reserved_per_running_build_and_rechecked_for_queued_work() {
         let mut scheduler = scheduler(2);
+        known_check_memory(&mut scheduler, "/repo/.git");
         scheduler.min_free = 5;
         scheduler.build_headroom = 10;
         scheduler.observe_disk(Some(24));
@@ -2949,6 +2983,7 @@ mod tests {
     #[test]
     fn breaching_the_disk_floor_stops_running_groups_before_their_artifacts_are_reclaimed() {
         let mut scheduler = scheduler(2);
+        known_check_memory(&mut scheduler, "/repo/.git");
         scheduler.min_free = 5;
         scheduler.build_headroom = 10;
         scheduler.observe_disk(Some(25));
@@ -2993,6 +3028,8 @@ mod tests {
     #[test]
     fn an_idle_slot_is_measured_after_a_quiet_period_and_waited_for_meanwhile() {
         let mut scheduler = scheduler(2);
+        known_check_memory(&mut scheduler, "/repo/.git");
+        known_check_memory(&mut scheduler, "/other/.git");
         run(&mut scheduler, 0, "/a", "baseline");
         measure_all(&mut scheduler, 1);
         let first = submit(&mut scheduler, 1, "/a", "a1");
@@ -3079,18 +3116,52 @@ mod tests {
     /// using 12 others.
     fn checked_and_tested() -> Scheduler<Table> {
         let mut scheduler = scheduler(2);
-        let a = submit(&mut scheduler, 1, "/a", "a1");
-        let b = submit_operation(&mut scheduler, 2, "/b", "b1", Command::Test, &[]);
-        let [(job_a, 0, _)] = starts(&a)[..] else {
-            panic!("{a:?}")
-        };
-        let [(job_b, 1, _)] = starts(&b)[..] else {
-            panic!("{b:?}")
-        };
-        used(&mut scheduler, job_a, &units("c", 12));
-        used(&mut scheduler, job_b, &units("t", 12));
-        scheduler.exited(job_a, &ok(), None, BuildReport::default());
-        scheduler.exited(job_b, &ok(), None, BuildReport::default());
+        for (index, worktree, tree, command, stem) in [
+            (0, "/a", "a1", Command::Check, "c"),
+            (1, "/b", "b1", Command::Test, "t"),
+        ] {
+            let held = units(stem, 12);
+            let at = now();
+            scheduler.restore(
+                "/repo/.git".into(),
+                index,
+                Some(revision(tree)),
+                SlotRecord {
+                    worktree: Some(worktree.into()),
+                    compilations: vec![CompilationRun {
+                        compilation: Compilation::new(
+                            Path::new(""),
+                            &Operation {
+                                command,
+                                args: Vec::new(),
+                                rustflags: Vec::new(),
+                            },
+                        ),
+                        at,
+                        units: held.iter().cloned().collect(),
+                        build_ms: Some(0),
+                        peak_memory: Some(1),
+                        test_memory: None,
+                    }],
+                    units: held
+                        .into_iter()
+                        .enumerate()
+                        .map(|(place, unit)| {
+                            (
+                                unit,
+                                LastUse {
+                                    at,
+                                    after: 11 - u32::try_from(place).unwrap(),
+                                },
+                            )
+                        })
+                        .collect(),
+                    passed: Vec::new(),
+                },
+            );
+            scheduler.slots[index].used = u64::try_from(index + 1).unwrap();
+        }
+        scheduler.clock = 2;
         scheduler
     }
 
@@ -3304,6 +3375,190 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_package_selection_does_not_inherit_a_workspace_peak() {
+        let mut scheduler = scheduler(2);
+        scheduler.memory = 10;
+        let broad = submit_operation(
+            &mut scheduler,
+            1,
+            "/a",
+            "a1",
+            Command::Test,
+            &["--workspace"],
+        );
+        let [(job, ..)] = starts(&broad)[..] else {
+            panic!("{broad:?}")
+        };
+        used(&mut scheduler, job, &units("b", 1));
+        scheduler.exited(
+            job,
+            &ok(),
+            Some(Usage {
+                cpu_ms: 1,
+                peak_memory: 20,
+                test_memory: None,
+            }),
+            BuildReport::default(),
+        );
+        measure_all(&mut scheduler, 1);
+        let operation = Operation {
+            command: Command::Nextest,
+            args: vec!["-p".into(), "small".into()],
+            rustflags: Vec::new(),
+        };
+        assert_eq!(
+            scheduler.forecast_memory(Path::new("/repo/.git"), Path::new(""), &operation),
+            None
+        );
+        let scoped = submit_operation(
+            &mut scheduler,
+            2,
+            "/b",
+            "b1",
+            Command::Nextest,
+            &["-p", "small"],
+        );
+        assert_eq!(starts(&scoped).len(), 1, "{scoped:?}");
+        assert_eq!(
+            scheduler.memory(),
+            (10, 10),
+            "unknown reserves the whole budget"
+        );
+    }
+
+    #[test]
+    fn learning_is_exclusive_even_with_a_measured_zero_peak_and_then_uses_its_measurement() {
+        let mut scheduler = scheduler(2);
+        scheduler.memory = 10;
+        let first = submit(&mut scheduler, 1, "/a", "a1");
+        let [(job, ..)] = starts(&first)[..] else {
+            panic!("{first:?}")
+        };
+        used(&mut scheduler, job, &units("c", 1));
+        let zero = Usage {
+            cpu_ms: 1,
+            peak_memory: 0,
+            test_memory: None,
+        };
+        scheduler.exited(job, &ok(), Some(zero), BuildReport::default());
+        measure_all(&mut scheduler, 1);
+        let known = submit(&mut scheduler, 2, "/a", "a2");
+        let [(known, ..)] = starts(&known)[..] else {
+            panic!("{known:?}")
+        };
+        assert!(
+            starts(&submit_operation(
+                &mut scheduler,
+                3,
+                "/b",
+                "b1",
+                Command::Test,
+                &[]
+            ))
+            .is_empty()
+        );
+        let learning = complete_measurements(&mut scheduler, Vec::new());
+        assert!(starts(&learning).is_empty());
+        let effects = scheduler.exited(known, &ok(), Some(zero), BuildReport::default());
+        let effects = complete_measurements(&mut scheduler, effects);
+        let [(learning, ..)] = starts(&effects)[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(scheduler.memory(), (10, 10));
+        assert!(
+            starts(&submit(&mut scheduler, 4, "/a", "a3")).is_empty(),
+            "zero-byte knowledge cannot share an exclusive reservation"
+        );
+        used(&mut scheduler, learning, &units("t", 1));
+        let effects = scheduler.exited(
+            learning,
+            &ok(),
+            Some(Usage {
+                cpu_ms: 1,
+                peak_memory: 2,
+                test_memory: None,
+            }),
+            BuildReport::default(),
+        );
+        let effects = complete_measurements(&mut scheduler, effects);
+        assert_eq!(starts(&effects).len(), 1, "{effects:?}");
+        let measured = submit_operation(&mut scheduler, 5, "/b", "b2", Command::Test, &[]);
+        let measured = complete_measurements(&mut scheduler, measured);
+        assert_eq!(starts(&measured).len(), 1, "{measured:?}");
+        assert_eq!(scheduler.memory(), (10, 2));
+    }
+
+    #[test]
+    fn resource_only_observations_persist_without_inventing_or_erasing_compile_units() {
+        let mut scheduler = scheduler(1);
+        let effects = submit_operation(&mut scheduler, 1, "/a", "a1", Command::Run, &["make"]);
+        let [(job, ..)] = starts(&effects)[..] else {
+            panic!("{effects:?}")
+        };
+        scheduler.exited(
+            job,
+            &ok(),
+            Some(Usage {
+                cpu_ms: 1,
+                peak_memory: 3,
+                test_memory: None,
+            }),
+            BuildReport::default(),
+        );
+        let operation = Operation {
+            command: Command::Run,
+            args: vec!["make".into()],
+            rustflags: Vec::new(),
+        };
+        assert_eq!(
+            scheduler.forecast_memory(Path::new("/repo/.git"), Path::new(""), &operation),
+            Some(3)
+        );
+        assert!(
+            !needed(
+                &scheduler.slots,
+                Path::new("/repo/.git"),
+                &Compilation::new(Path::new(""), &operation)
+            )
+            .1
+        );
+        let slot = &mut scheduler.slots[0];
+        let compilation = Compilation::new(Path::new(""), &check());
+        slot.ran(
+            compilation.clone(),
+            units("c", 2),
+            true,
+            1,
+            Some(Usage {
+                cpu_ms: 1,
+                peak_memory: 4,
+                test_memory: None,
+            }),
+        );
+        slot.ran(
+            compilation.clone(),
+            Vec::new(),
+            true,
+            1,
+            Some(Usage {
+                cpu_ms: 1,
+                peak_memory: 5,
+                test_memory: None,
+            }),
+        );
+        let record = persisted(&[slot.persist()])[0].1.clone();
+        let mut restored = self::scheduler(1);
+        restored.restore("/repo/.git".into(), 0, Some(revision("a1")), record);
+        assert_eq!(
+            restored.forecast_memory(Path::new("/repo/.git"), Path::new(""), &check()),
+            Some(5)
+        );
+        let (held, known) = needed(&restored.slots, Path::new("/repo/.git"), &compilation);
+        assert!(known);
+        assert_eq!(held, units("c", 2).iter().map(String::as_str).collect());
+    }
+
+    #[test]
     fn nextest_stress_runs_use_the_selected_packages_memory_history() {
         let mut scheduler = checked_and_tested();
         measure_all(&mut scheduler, 1);
@@ -3474,7 +3729,7 @@ mod tests {
                     rustflags: Vec::new(),
                 }
             ),
-            8
+            Some(8)
         );
         assert_eq!(
             restored.slots[0].compilations[0]
@@ -4032,7 +4287,7 @@ mod tests {
                 at: 1,
                 units: units("c", 12).into_iter().collect(),
                 build_ms: None,
-                peak_memory: None,
+                peak_memory: Some(1),
                 test_memory: None,
             }],
             units: units("c", 12)

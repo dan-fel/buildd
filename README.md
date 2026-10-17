@@ -130,6 +130,8 @@ memory   a queued build starts when
          peak = summed RSS of its process tree and group, recorded per compilation
          testing releases the compilation reservation once a measured test-phase
          peak at the same test_jobs is known; unknown phases keep the full peak
+         an unmeasured compilation reserves the whole budget and learns alone;
+         a different package selection never inherits an unrelated run's peak
          a build that doesn't fit holds the queue, so big builds aren't starved
 
 disk     a slot quiet for 2 s is measured: what its target holds, and what
@@ -176,6 +178,11 @@ Tests in separate
 process groups, including nextest's children, count toward the memory peaks.
 Filtered test runs retain the largest measured peak of their compilation; they
 cannot replace a broader run's reservation with their smaller footprint.
+Memory admission uses exact compilation history, including directory, package
+selection, features and compiler flags. Unmeasured requests are reported as
+unknown and learn with an exclusive reservation; their first run can exceed
+that estimate because the memory budget is not an OS memory limit. Commands
+that compile nothing still retain their measured resource usage.
 
 ## Tests
 

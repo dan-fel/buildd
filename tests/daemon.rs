@@ -1588,6 +1588,30 @@ fn two_package_workspace() -> TempDir {
 }
 
 #[test]
+fn a_scoped_build_learns_its_peak_without_inheriting_an_oversized_workspace_run() {
+    let daemon = Daemon::configured("slots = 1\njobs = 4\nmin_free_gib = 0\nmemory_gib = 0.001\n");
+    let repository = two_package_workspace();
+    // An unmeasured request learns alone. This real Cargo invocation uses
+    // more than the tiny fixture's shared-memory admission budget.
+    let broad = daemon.build(&repository.0, Command::Test, &["--workspace", "--no-run"]);
+    assert!(outcome(&broad).success(), "{broad:#?}");
+    let refused = daemon.build(&repository.0, Command::Test, &["--workspace", "--no-run"]);
+    assert!(
+        matches!(refused.last(), Some(Message::Rejected { reason }) if reason.contains("exceeds memory budget")),
+        "{refused:#?}"
+    );
+    // The exact package selection has no measurement. A router must not
+    // mistake the unrelated workspace peak for evidence it cannot run.
+    let scoped = daemon.build(&repository.0, Command::Test, &["-p", "a", "--no-run"]);
+    assert!(outcome(&scoped).success(), "{scoped:#?}");
+    let refused = daemon.build(&repository.0, Command::Test, &["-p", "a", "--no-run"]);
+    assert!(
+        matches!(refused.last(), Some(Message::Rejected { reason }) if reason.contains("exceeds memory budget")),
+        "the scoped peak is now measured: {refused:#?}"
+    );
+}
+
+#[test]
 fn test_binaries_that_passed_unchanged_are_skipped_until_their_package_changes() {
     let daemon = Daemon::start(1);
     let repository = two_package_workspace();
@@ -2014,7 +2038,7 @@ fn a_restarted_daemon_keeps_its_slots_warm_and_drops_slots_beyond_its_count() {
 
     std::fs::write(
         daemon.home.0.join("config.toml"),
-        "slots = 1\njobs = 4\nmin_free_gib = 0\n",
+        "slots = 1\njobs = 4\nmin_free_gib = 0\nbuild_headroom_gib = 0\n",
     )
     .unwrap();
     daemon.restart();
