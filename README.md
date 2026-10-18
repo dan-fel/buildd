@@ -447,13 +447,29 @@ restart the daemon from that app. Linux has no such scan.
 
 `bench/load.py` runs many simulated sessions against one workspace, through
 buildd or with plain Cargo and one target per worktree. It reports time to
-finish, latency, queue time and peak disk.
+finish the fixed workload, median/p95 request latency, results per minute,
+queue time and peak disk. Buildd's structured events count actual completed jobs,
+shared requests, failures and individual job memory peaks separately from client
+results. A failed or incomplete workload exits nonzero and is marked invalid.
+
+Compare the same pinned source, package mix, session count, seed and think times.
+Use `--think 0-0` to measure a continuously waiting workload. Each invocation
+requires fresh worktrees and an empty daemon home; reports include these cold-cache
+conditions and the resolved source commit. Use repeated runs with reversed order
+to check variation. A cold-cache result does not establish warm-cache throughput.
+For scheduling, minimize completion time for this fixed workload, while checking
+tail latency and failures. A changing live workload's jobs/minute is descriptive,
+not a capacity measurement. CPU utilization alone does not measure useful results.
 
 ```sh
 bench/load.py --repository ~/src/project --base HEAD --workdir /tmp/load \
   --mode buildd --buildd-home ~/Library/Caches/buildd-load --sessions 15 \
   --crates crate-a,crate-b --think 45-120 --report load.json
 ```
+
+`--memory-gib` and `--unmeasured-memory-gib` let the same benchmark compare
+exclusive learning with bounded reservations without changing the live daemon.
+Keep both runs' CPU and disk budgets equal.
 
 ## Protocol
 

@@ -15,10 +15,11 @@ times, peak and final build disk, and failures, as text and as JSON.
 """
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import random
-import re
 import shutil
 import statistics
 import subprocess
@@ -26,8 +27,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-
-BUILDD_TIMES = re.compile(r"after (\d+\.\d) s in the build and (\d+\.\d) s in the queue")
 
 
 def git(directory, *args):
@@ -62,7 +61,28 @@ def library_roots(worktree):
 
 def percentile(values, fraction):
     ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
+    return ordered[max(0, math.ceil(fraction * len(ordered)) - 1)]
+
+
+def latency_summary(values):
+    if not values:
+        return None
+    return {
+        "median": round(statistics.median(values), 3),
+        "p95": round(percentile(values, 0.95), 3),
+        "max": round(max(values), 3),
+    }
+
+
+def build_events(home):
+    # Reading the structured events avoids parsing rounded, human-facing CLI
+    # output and counts one shared build once, however many clients it served.
+    events = []
+    for name in ("events.jsonl.1", "events.jsonl"):
+        path = home / name
+        if path.exists():
+            events.extend(json.loads(line)["kind"] for line in path.read_text().splitlines())
+    return events
 
 
 def main():
@@ -81,23 +101,38 @@ def main():
     parser.add_argument("--slots", type=int, default=2)
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
     parser.add_argument("--disk-gib", type=float, help="build disk all slots share (20 GiB per slot)")
+    parser.add_argument("--memory-gib", type=float, help="memory admission budget")
+    parser.add_argument("--unmeasured-memory-gib", type=float, help="reservation per unmeasured build; omitted learns alone")
     parser.add_argument("--report", type=Path, required=True)
     options = parser.parse_args()
     if options.mode == "buildd" and options.buildd_home is None:
         parser.error("--mode buildd needs --buildd-home")
+    if options.mode == "buildd":
+        executable = shutil.which(options.buildd)
+        if executable is None:
+            parser.error(f"buildd executable not found: {options.buildd}")
+        options.buildd = str(Path(executable).resolve())
+    options.repository = options.repository.resolve()
+    if options.sessions < 1 or options.iterations < 1:
+        parser.error("sessions and iterations must be positive")
     think_min, think_max = (float(part) for part in options.think.split("-"))
+    if not (0 <= think_min <= think_max and math.isfinite(think_max)):
+        parser.error("think times must be finite, non-negative and ordered")
     crates = options.crates.split(",")
+    base = git(options.repository, "rev-parse", f"{options.base}^{{commit}}").strip()
 
-    # Worktrees at BASE, with no edits from an earlier run.
+    # Every run has fresh worktrees and caches. Refuse existing data rather than
+    # resetting somebody's checkout or mixing results with earlier daemon events.
+    for index in range(options.sessions):
+        if (options.workdir / f"s{index + 1:02}").exists():
+            parser.error("workdir contains an existing session; use a fresh directory")
+    if options.mode == "buildd" and options.buildd_home.exists() and any(options.buildd_home.iterdir()):
+        parser.error("buildd-home must be empty; use a fresh directory")
     options.workdir.mkdir(parents=True, exist_ok=True)
     worktrees = []
     for index in range(options.sessions):
         worktree = (options.workdir / f"s{index + 1:02}").resolve()
-        if not worktree.exists():
-            git(options.repository, "worktree", "add", "-q", "--detach", str(worktree), options.base)
-        git(worktree, "checkout", "-q", "--detach", options.base)
-        git(worktree, "reset", "-q", "--hard", options.base)
-        git(worktree, "clean", "-q", "-fd")
+        git(options.repository, "worktree", "add", "-q", "--detach", str(worktree), base)
         worktrees.append(worktree)
     roots = library_roots(worktrees[0])
     for crate in crates:
@@ -111,9 +146,11 @@ def main():
         home = options.buildd_home.resolve()
         home.mkdir(parents=True, exist_ok=True)
         disk_gib = options.disk_gib if options.disk_gib is not None else 20 * options.slots
-        (home / "config.toml").write_text(
-            f"slots = {options.slots}\njobs = {options.jobs}\ndisk_gib = {disk_gib}\n"
-        )
+        config = f"slots = {options.slots}\njobs = {options.jobs}\ndisk_gib = {disk_gib}\n"
+        for name in ("memory_gib", "unmeasured_memory_gib"):
+            if (value := getattr(options, name)) is not None:
+                config += f"{name} = {value}\n"
+        (home / "config.toml").write_text(config)
         environment["BUILDD_HOME"] = str(home)
         log = open(home / "daemon.log", "a")
         daemon = subprocess.Popen([options.buildd, "daemon"], env=environment, stdout=log, stderr=log)
@@ -148,67 +185,93 @@ def main():
                 source.write(f"\n#[allow(dead_code)]\nfn buildd_load_probe_{probe}() -> u32 {{\n    {probe}\n}}\n")
             for operation in (["check", "-p", crate], ["test", "-p", crate, "--no-run"]):
                 command = [options.buildd, *operation] if options.mode == "buildd" else ["cargo", *operation]
-                started = time.time()
+                started = time.monotonic()
                 completed = subprocess.run(command, cwd=worktree, env=session_environment, capture_output=True, text=True)
-                wall = time.time() - started
-                times = BUILDD_TIMES.search(completed.stderr)
+                wall = time.monotonic() - started
                 with lock:
                     results.append({
                         "session": index + 1,
                         "crate": crate,
                         "iteration": iteration,
                         "operation": operation[0],
-                        "started": started,
+                        "started_s": started - began,
                         "wall": wall,
                         "exit": completed.returncode,
-                        "build": float(times.group(1)) if times else None,
-                        "queue": float(times.group(2)) if times else None,
                         "error": completed.stderr[-2000:] if completed.returncode else None,
                     })
 
     sampler = threading.Thread(target=sample_disk)
     sampler.start()
-    began = time.time()
+    began = time.monotonic()
     threads = [threading.Thread(target=session, args=(index, worktree)) for index, worktree in enumerate(worktrees)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    elapsed = time.time() - began
+    elapsed = time.monotonic() - began
     done.set()
     sampler.join()
     if daemon is not None:
         status = subprocess.run([options.buildd, "status"], env=environment, capture_output=True, text=True).stdout
         daemon.terminate()
         daemon.wait()
+        log.close()
+        events = build_events(home)
     else:
         status = ""
+        events = []
     final_disk = disk_kib(disk_paths)
 
     walls = [result["wall"] for result in results]
+    finished = [event for event in events if event["type"] == "finished"]
+    completed = [event for event in finished if event["outcome"]["kind"] == "exited"]
+    failed = sum(result["exit"] != 0 for result in results)
+    expected = options.sessions * options.iterations * 2
+    requested = [event for event in events if event["type"] == "requested"]
+    shared = sum(event["shared"] for event in requested)
+    events_complete = len(requested) == len(results) == len(finished) + shared
     summary = {
         "mode": options.mode,
+        "source_commit": base,
+        "crates": crates,
+        "seed": options.seed,
+        "think_s": [think_min, think_max],
+        "initial_build_cache": "empty (OS and download caches retained)",
+        "jobs": options.jobs if options.mode == "buildd" else None,
         "sessions": options.sessions,
         "iterations": options.iterations,
         "slots": options.slots if options.mode == "buildd" else None,
         "requests": len(results),
-        "failures": sum(1 for result in results if result["exit"] != 0),
-        "elapsed_s": round(elapsed, 1),
-        "latency_s": {
-            "median": round(statistics.median(walls), 1),
-            "p90": round(percentile(walls, 0.9), 1),
-            "max": round(max(walls), 1),
-        },
+        "expected_requests": expected,
+        "failures": failed,
+        "valid": len(results) == expected and failed == 0 and (options.mode != "buildd" or events_complete),
+        "elapsed_s": round(elapsed, 3),
+        "successful_results_per_minute": round((len(results) - failed) * 60 / elapsed, 3),
+        "latency_s": latency_summary(walls),
         "latency_by_operation_s": {
-            operation: round(statistics.median([r["wall"] for r in results if r["operation"] == operation]), 1)
+            operation: latency_summary([r["wall"] for r in results if r["operation"] == operation])
             for operation in ("check", "test")
         },
-        "queue_total_s": round(sum(r["queue"] or 0 for r in results), 1) if options.mode == "buildd" else None,
-        "peak_disk_gib": round(max(kib for _, kib in disk_samples) / 2**20, 1) if disk_samples else None,
+        "daemon": {
+            "binary_sha256": hashlib.sha256(Path(options.buildd).read_bytes()).hexdigest(),
+            "config": config,
+            "events_complete": events_complete,
+            "completed_jobs": len(completed),
+            "completed_jobs_per_minute": round(len(completed) * 60 / elapsed, 3),
+            "failed_jobs": sum(event["outcome"]["code"] != 0 for event in completed),
+            "interrupted_jobs": len(finished) - len(completed),
+            "shared_requests": shared,
+            "queue_s": latency_summary([event["queued_ms"] / 1000 for event in finished]),
+            "largest_job_peak_gib": max(
+                (event["usage"]["peak_memory"] / 2**30 for event in finished if event["usage"] is not None),
+                default=None,
+            ),
+        } if options.mode == "buildd" else None,
+        "peak_disk_gib": round(max(final_disk, max((kib for _, kib in disk_samples), default=0)) / 2**20, 1),
         "final_disk_gib": round(final_disk / 2**20, 1),
         "status": status,
     }
-    options.report.write_text(json.dumps({"summary": summary, "results": results, "disk": disk_samples}, indent=1))
+    options.report.write_text(json.dumps({"summary": summary, "results": results, "disk": disk_samples, "events": events}, indent=1))
     for key, value in summary.items():
         if key != "status":
             print(f"{key:24} {value}")
@@ -217,7 +280,8 @@ def main():
     for result in results:
         if result["exit"] != 0:
             print(f"FAILED session {result['session']} {result['operation']} -p {result['crate']}:\n{result['error']}")
+    return 0 if summary["valid"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
