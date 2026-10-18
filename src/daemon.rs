@@ -209,7 +209,7 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
         .spawn(move || accepting.accept(&listener))
         .map_err(|error| format!("could not start accepting clients: {error}"))?;
     let mut scheduler = Scheduler::new(&config, GitDistance::default());
-    restore_slots(home, &config, &mut scheduler)?;
+    restore_slots(home, &mut scheduler)?;
     crate::prewarm::spawn(home, config.prewarm.clone());
     Daemon {
         home: home.to_owned(),
@@ -228,23 +228,11 @@ pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
 }
 
 /// Takes back the slots an earlier daemon left in `home`: their checkouts,
-/// targets and records stay warm across restarts. Slots beyond the
-/// configured count, left from a larger configuration, are removed: no
-/// build would use them again.
-fn restore_slots(
-    home: &Path,
-    config: &Config,
-    scheduler: &mut Scheduler<GitDistance>,
-) -> Result<(), String> {
+/// targets and records stay warm across restarts. The concurrency limit
+/// bounds running work, not the caches available for placement and retention.
+fn restore_slots(home: &Path, scheduler: &mut Scheduler<GitDistance>) -> Result<(), String> {
     for existing in slot::existing_slots(home)? {
         let name = slot_name(&existing.repository, existing.index);
-        if existing.index >= config.slots {
-            match existing.directory.remove() {
-                Ok(()) => log!("removed slot {name}: beyond {} slots", config.slots),
-                Err(error) => log!("could not remove slot {name}: {error}"),
-            }
-            continue;
-        }
         let revision = match existing.directory.tree() {
             Ok(revision) => Some(revision),
             Err(error) => {

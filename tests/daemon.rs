@@ -2087,42 +2087,110 @@ fn a_restarted_daemon_meets_its_budget_by_retiring_old_cache_and_keeps_dependenc
 }
 
 #[test]
-fn a_restarted_daemon_keeps_its_slots_warm_and_drops_slots_beyond_its_count() {
-    let mut daemon = Daemon::start(2);
+fn reducing_concurrency_preserves_and_reuses_every_cache() {
+    let mut daemon = Daemon::configured(
+        "slots = 2\njobs = 4\nmin_free_gib = 0\nmemory_gib = 2\nunmeasured_memory_gib = 1\n",
+    );
     let repository = crate_repository(None);
+    let gates = TempDir::new();
+    let gate = gates.0.join("hold-first-slot");
+    assert!(
+        Process::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (ready, started) = std::sync::mpsc::channel();
+    let stream = daemon.connect();
+    let request = run_request(
+        &repository.0,
+        &[
+            "sh",
+            "-c",
+            "echo ready; read -r line < \"$1\"",
+            "sh",
+            gate.to_str().unwrap(),
+        ],
+    );
+    let holder = std::thread::spawn(move || {
+        let mut messages = Vec::new();
+        client::build(stream, request, |message| {
+            if matches!(message, Message::Stdout { line } if line == "ready") {
+                ready.send(()).unwrap();
+            }
+            messages.push(message.clone());
+        })
+        .unwrap();
+        messages
+    });
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Build real artifacts in slot 1 while slot 0 is occupied. They must
+    // remain at this exact checkout path when only one build may run.
     let first = daemon.build(&repository.0, Command::Check, &[]);
+    std::fs::write(gate, "continue\n").unwrap();
+    let held = holder.join().unwrap();
+    assert!(outcome(&held).success(), "{held:#?}");
     assert!(outcome(&first).success(), "{first:#?}");
-    // A slot beyond a smaller configuration, as a larger one left it.
+    assert!(
+        first.iter().any(
+            |message| matches!(message, Message::Started { slot, .. } if slot.ends_with("/1"))
+        )
+    );
     let project = std::fs::read_dir(daemon.home.0.join("slots"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
         .path();
-    std::fs::create_dir(project.join("1")).unwrap();
-
+    let record = std::fs::read(project.join("1/record.json")).unwrap();
     std::fs::write(
         daemon.home.0.join("config.toml"),
         "slots = 1\njobs = 4\nmin_free_gib = 0\nbuild_headroom_gib = 0\n",
     )
     .unwrap();
     daemon.restart();
-    assert!(!project.join("1").exists(), "slot 1 is beyond one slot");
-    let slots = daemon.status().slots;
-    assert_eq!(slots.len(), 1, "slot 0 is back before any build");
-    assert_eq!(slots[0].worktree.as_deref(), Some(repository.0.as_path()));
-
+    assert_eq!(
+        std::fs::read(project.join("1/record.json")).unwrap(),
+        record
+    );
+    wait_until("both retained caches are inventoried", || {
+        let status = daemon.status();
+        status.slots.len() == 2
+            && status
+                .slots
+                .iter()
+                .all(|slot| slot.size.is_some() && slot.chore.is_none())
+    });
+    let status = daemon.status();
+    assert_eq!(status.capacity, 1);
+    assert_eq!(
+        status.disk_used,
+        status
+            .slots
+            .iter()
+            .map(|slot| slot.size.unwrap())
+            .sum::<u64>()
+    );
+    assert!(status.disk_used > 0);
     let again = daemon.build(&repository.0, Command::Check, &[]);
     assert!(outcome(&again).success(), "{again:#?}");
-    let warm = daemon
-        .activity()
-        .events
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::Started { warm, .. } => Some(*warm),
-            _ => None,
-        });
-    assert_eq!(warm, Some(true));
+    assert!(
+        again.iter().any(
+            |message| matches!(message, Message::Started { slot, .. } if slot.ends_with("/1"))
+        )
+    );
+    assert!(
+        daemon.activity().events.iter().any(|event| matches!(
+            event.kind,
+            EventKind::Finished {
+                compiled: 0,
+                fresh: 1..,
+                ..
+            }
+        )),
+        "the retained cache is reused without recompiling"
+    );
 }
 
 #[test]

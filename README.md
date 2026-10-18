@@ -102,8 +102,10 @@ slots/<repo>-<hash>/<n>/
 - The path never changes, so incremental state stays valid. (A target shared
   between paths can make Cargo take stale artifacts for fresh ones.)
 - A slot is created only when builds run concurrently, up to `slots` per
-  repository.
-- A restarted daemon takes its slots back, still warm.
+  repository. This limit controls concurrent work; lowering it preserves
+  existing caches, including their original paths and compilation history.
+- A restarted daemon takes all its slots back, still warm. Every cache stays
+  eligible for reuse and counts toward the shared disk budget.
 
 ## CPU: one job budget
 

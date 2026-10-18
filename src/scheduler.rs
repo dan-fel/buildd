@@ -617,10 +617,6 @@ impl<D: Distance> Scheduler<D> {
         record: SlotRecord,
     ) {
         assert!(
-            index < self.capacity,
-            "only slots within capacity are restored"
-        );
-        assert!(
             !self
                 .slots
                 .iter()
@@ -4359,16 +4355,17 @@ mod tests {
             Some(revision("x1")),
             SlotRecord::default(),
         );
-        scheduler.restore("/repo/.git".into(), 2, Some(revision("y1")), record);
+        // A larger earlier configuration left a cache above today's limit.
+        scheduler.restore("/repo/.git".into(), 7, Some(revision("y1")), record);
         let (slots, _) = scheduler.status(|_| 0);
         assert_eq!(slots.len(), 2);
         assert!(slots.iter().all(|slot| slot.size.is_none()));
         measure_all(&mut scheduler, 1);
-        // Slot 2 holds what `check` needs, so it wins over slot 0, which is
+        // Slot 7 holds what `check` needs, so it wins over slot 0, which is
         // closer.
         scheduler.distance.0.insert(("x1".into(), "a2".into()), 1);
         let first = submit(&mut scheduler, 1, "/work/a", "a2");
-        assert!(matches!(starts(&first)[..], [(_, 2, _)]));
+        assert!(matches!(starts(&first)[..], [(_, 7, _)]));
         assert!(matches!(
             reports(&first)[..],
             [
@@ -4381,6 +4378,12 @@ mod tests {
         // Both restored slots are busy: the new one takes the free index 1.
         let third = submit(&mut scheduler, 3, "/work/c", "c1");
         assert!(matches!(starts(&third)[..], [(_, 1, _)]));
+        let fourth = submit(&mut scheduler, 4, "/work/d", "d1");
+        assert!(
+            starts(&fourth).is_empty(),
+            "the concurrency limit still applies"
+        );
+        assert_eq!(scheduler.status(|_| 0).1.len(), 1);
     }
 
     #[test]

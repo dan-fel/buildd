@@ -185,11 +185,6 @@ impl SlotDirectory {
             .map_err(|error| format!("could not write {}: {error}", path.display()))
     }
 
-    /// Removes the slot: its checkout, target and record.
-    pub(crate) fn remove(&self) -> Result<(), String> {
-        remove_tree(&self.0)
-    }
-
     /// Makes the checkout hold exactly `revision`: files that differ are
     /// written, files the tree lacks are removed, and every other file keeps
     /// its modification time.
@@ -1222,8 +1217,6 @@ mod tests {
         assert_eq!(existing.index, 1);
         assert_eq!(existing.directory.read_record(), Ok(record));
         assert_eq!(existing.directory.tree(), Ok(tree));
-        existing.directory.remove().unwrap();
-        assert!(existing_slots(&home.0).unwrap().is_empty());
     }
 
     #[test]

@@ -7,8 +7,8 @@ use serde::Deserialize;
 /// The daemon's limits, from `config.toml` in its home.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
-    /// Builds that run at once. Each repository gets at most this many slot
-    /// directories.
+    /// Builds that run at once. New slot directories are created up to this
+    /// count per repository; caches from a larger earlier limit are retained.
     pub slots: usize,
     /// Compiler jobs shared by all running builds.
     pub jobs: usize,
