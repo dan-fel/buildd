@@ -126,11 +126,12 @@ slots/<repo>-<hash>/<n>/
 
 ```text
 memory   a queued build starts when
-           Σ peaks of running builds + its own peak ≤ memory_gib
+           Σ reservations of running builds + its own reservation ≤ memory_gib
          peak = summed RSS of its process tree and group, recorded per compilation
          testing releases the compilation reservation once a measured test-phase
          peak at the same test_jobs is known; unknown phases keep the full peak
-         an unmeasured compilation reserves the whole budget and learns alone;
+         an unmeasured compilation uses unmeasured_memory_gib when configured,
+         otherwise it reserves the whole budget and learns alone;
          a different package selection never inherits an unrelated run's peak
          a build that doesn't fit holds the queue, so big builds aren't starved
 
@@ -179,10 +180,16 @@ process groups, including nextest's children, count toward the memory peaks.
 Filtered test runs retain the largest measured peak of their compilation; they
 cannot replace a broader run's reservation with their smaller footprint.
 Memory admission uses exact compilation history, including directory, package
-selection, features and compiler flags. Unmeasured requests are reported as
-unknown and learn with an exclusive reservation; their first run can exceed
-that estimate because the memory budget is not an OS memory limit. Commands
-that compile nothing still retain their measured resource usage.
+selection, features and compiler flags. Unknown peaks stay unknown until measured.
+By default, an unmeasured compilation learns alone. Hosts with ample headroom can
+set `unmeasured_memory_gib` to reserve a bounded share for each unfamiliar build:
+with `memory_gib = 448` and `unmeasured_memory_gib = 224`, two can learn together.
+Choose this reservation from representative cold builds with margin, and monitor
+memory pressure when raising concurrency. A measured peak replaces this reservation
+even when it is larger. Neither setting is an OS memory limit; an underestimated
+build can exceed its reservation. `status` and `top` label these as reservations,
+not measured usage. Commands that compile nothing still retain their measured
+resource usage.
 
 ## Tests
 

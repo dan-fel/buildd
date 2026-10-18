@@ -154,11 +154,16 @@ impl Router {
                         .filter(|placement| placement.host == host.name)
                         .count();
                     let load = observed.max(assigned);
-                    let reserved = peak.unwrap_or(status.memory);
+                    let reserved = capacity
+                        .peak_memory
+                        .or(status.unmeasured_memory)
+                        .unwrap_or(status.memory);
                     let starts = load < status.capacity
                         && status.idle_jobs > 0
                         && status.queue.is_empty()
-                        && (peak.is_some() || load == 0)
+                        && (capacity.peak_memory.is_some()
+                            || status.unmeasured_memory.is_some()
+                            || load == 0)
                         && status.memory_in_use.saturating_add(reserved) <= status.memory
                         && status.disk_wait.is_none()
                         && status.free_disk.is_some_and(|free| {
@@ -289,6 +294,7 @@ mod tests {
                     capacity: 1,
                     memory,
                     memory_in_use: 0,
+                    unmeasured_memory: None,
                     disk_budget: 20,
                     disk_used: 0,
                     free_disk: Some(30),
@@ -446,6 +452,38 @@ mod tests {
             .place(&source("/new"), &revision("new"), &request(), &hosts)
             .unwrap();
         assert_eq!(unknown.host, "pc");
+    }
+
+    #[test]
+    fn routing_uses_each_hosts_unknown_reservation_even_when_another_host_measured_the_build() {
+        let home = TempDir::new();
+        let mut router = Router::load(&home.0).unwrap();
+        let mut hosts = [host("local", "linux", 12), host("pc", "linux", 12)];
+        for (_, capacity) in &mut hosts {
+            capacity.as_mut().unwrap().status.capacity = 2;
+        }
+        let local = hosts[0].1.as_mut().unwrap();
+        local.peak_memory = None;
+        local.status.memory_in_use = 7;
+        local.status.unmeasured_memory = Some(6);
+        assert_eq!(
+            router
+                .place(&source("/a"), &revision("a"), &request(), &hosts)
+                .unwrap()
+                .host,
+            "pc",
+            "the other host's 2-byte peak cannot replace this host's reservation"
+        );
+        hosts[0].1.as_mut().unwrap().status.unmeasured_memory = Some(5);
+        hosts[1].1.as_mut().unwrap().status.idle_jobs = 0;
+        assert_eq!(
+            router
+                .place(&source("/b"), &revision("b"), &request(), &hosts)
+                .unwrap()
+                .host,
+            "local",
+            "an unmeasured build can share this host's remaining capacity"
+        );
     }
 
     #[test]

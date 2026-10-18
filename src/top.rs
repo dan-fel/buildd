@@ -322,7 +322,7 @@ fn host_lines(name: &str, os: &str, status: &Status) -> Vec<Line<'static>> {
         first.push(Span::from(" · draining").yellow());
     }
     let memory = Span::from(format!(
-        "  peak estimate {:.1}/{}",
+        "  memory reserved {:.1}/{}",
         gib_number(status.memory_in_use),
         gib(status.memory),
     ));
@@ -352,6 +352,12 @@ fn host_lines(name: &str, os: &str, status: &Status) -> Vec<Line<'static>> {
         None => Span::from(" · free disk unknown").red(),
     };
     let mut lines = vec![Line::from(first), Line::from(vec![memory, disk, free])];
+    if let Some(reserved) = status.unmeasured_memory {
+        lines.push(Line::from(format!(
+            "  Unmeasured builds: {} reserved each",
+            gib(reserved)
+        )));
+    }
     if let Some(wait) = &status.disk_wait {
         lines.push(
             Line::from(format!(
@@ -975,6 +981,7 @@ mod tests {
                 undersized: false,
                 memory: 18 << 30,
                 memory_in_use: 14 << 30,
+                unmeasured_memory: None,
                 draining: false,
                 slots: vec![
                     SlotStatus {
@@ -1170,7 +1177,7 @@ mod tests {
             (120, 60),
         );
         for expected in [
-            "peak estimate 14.0/18.0 GiB",
+            "memory reserved 14.0/18.0 GiB",
             "disk 10.0 GiB free (below 15.0 GiB floor)",
             "check · app-ui",
             "testing · 4.2 s · 4 jobs",
@@ -1258,7 +1265,7 @@ mod tests {
         println!("{text}");
         for expected in [
             "100 idle caches",
-            "peak estimate 15.0/10.0 GiB",
+            "memory reserved 15.0/10.0 GiB",
             "Memory queue: next build needs 6.0 GiB; budget remaining 0.0 GiB",
             "pc app-c716/0",
             "testing · 4.2 s · 4 jobs",

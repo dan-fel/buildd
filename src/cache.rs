@@ -2200,6 +2200,7 @@ mod tests {
                 jobs: 4,
                 test_jobs: 2,
                 memory: u64::MAX,
+                unmeasured_memory: None,
                 disk: u64::MAX,
                 min_free: 0,
                 build_headroom: 0,

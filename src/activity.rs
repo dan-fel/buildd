@@ -453,6 +453,7 @@ mod tests {
             undersized: false,
             memory: 1,
             memory_in_use: 0,
+            unmeasured_memory: None,
             slots: Vec::new(),
             queue: Vec::new(),
             draining: false,

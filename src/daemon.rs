@@ -1141,6 +1141,7 @@ impl Daemon {
             undersized: self.scheduler.undersized(),
             memory,
             memory_in_use,
+            unmeasured_memory: self.config.unmeasured_memory,
             draining: self.draining,
             slots,
             queue,

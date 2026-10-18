@@ -243,7 +243,7 @@ enum State {
         /// Cargo succeeded and its executables are being copied out.
         copying: bool,
         cancelled: bool,
-        /// Measured reservation, or exclusive admission while learning a peak.
+        /// Measured peak, or None while learning under the host's reservation.
         memory: Option<u64>,
     },
 }
@@ -465,6 +465,8 @@ pub(crate) struct Scheduler<D> {
     capacity: usize,
     /// Memory running builds may use together, by their expected peaks.
     memory: u64,
+    /// Explicit reservation for unknown peaks; None learns alone.
+    unmeasured_memory: Option<u64>,
     /// Test peaks are reusable only at the same test concurrency.
     test_jobs: usize,
     distance: D,
@@ -565,6 +567,7 @@ impl<D: Distance> Scheduler<D> {
         Self {
             capacity: config.slots,
             memory: config.memory,
+            unmeasured_memory: config.unmeasured_memory,
             test_jobs: config.test_jobs,
             distance,
             built_worktrees: HashSet::new(),
@@ -1467,18 +1470,19 @@ impl<D: Distance> Scheduler<D> {
             }
             // A build that does not fit waits, and so does everything behind
             // it: smaller builds slipping past would keep it waiting for good.
-            // An unmeasured build learns alone, reserving the whole budget.
+            // An unmeasured build uses the host's explicit reservation, or
+            // learns alone when the host has not sized unfamiliar builds.
             // With nothing running, it runs whatever it needs.
             let memory = self.memory_estimate(&self.jobs[&id]);
             let running = self.jobs.values().any(|job| !job.queued());
-            let exclusive = self
-                .jobs
-                .values()
-                .any(|job| matches!(job.state, State::Running { memory: None, .. }));
-            let reserved = memory.unwrap_or(self.memory);
-            if running
-                && (exclusive || memory.is_none() || in_use.saturating_add(reserved) > self.memory)
-            {
+            let exclusive = self.unmeasured_memory.is_none()
+                && (memory.is_none()
+                    || self
+                        .jobs
+                        .values()
+                        .any(|job| matches!(job.state, State::Running { memory: None, .. })));
+            let reserved = memory.or(self.unmeasured_memory).unwrap_or(self.memory);
+            if running && (exclusive || in_use.saturating_add(reserved) > self.memory) {
                 self.jobs.get_mut(&id).expect("queued above").memory_needed = Some(reserved);
                 break;
             }
@@ -1690,12 +1694,14 @@ impl<D: Distance> Scheduler<D> {
         queued.into_iter().map(|(.., id)| id).collect()
     }
 
-    /// What the running builds are expected to use at their peaks.
+    /// The running builds' measured peaks or configured reservations.
     fn memory_in_use(&self) -> u64 {
         self.jobs
             .values()
             .filter_map(|job| match job.state {
-                State::Running { memory, .. } => Some(memory.unwrap_or(self.memory)),
+                State::Running { memory, .. } => {
+                    Some(memory.or(self.unmeasured_memory).unwrap_or(self.memory))
+                }
                 State::Queued => None,
             })
             .sum()
@@ -2078,6 +2084,7 @@ mod tests {
             jobs: 4,
             test_jobs: 2,
             memory: u64::MAX,
+            unmeasured_memory: None,
             disk: u64::MAX,
             min_free: 0,
             build_headroom: 0,
@@ -3423,6 +3430,56 @@ mod tests {
             scheduler.memory(),
             (10, 10),
             "unknown reserves the whole budget"
+        );
+    }
+
+    #[test]
+    fn configured_unknown_reservations_share_capacity_and_yield_to_measured_peaks() {
+        let mut scheduler = scheduler(4);
+        scheduler.memory = 10;
+        scheduler.unmeasured_memory = Some(5);
+        let first = submit(&mut scheduler, 1, "/a", "a1");
+        let [(a, ..)] = starts(&first)[..] else {
+            panic!("{first:?}")
+        };
+        let second = submit_operation(&mut scheduler, 2, "/b", "b1", Command::Test, &[]);
+        let [(b, ..)] = starts(&second)[..] else {
+            panic!("{second:?}")
+        };
+        assert_eq!(scheduler.memory(), (10, 10));
+        let third = submit_operation(&mut scheduler, 3, "/c", "c1", Command::Build, &[]);
+        assert!(
+            starts(&third).is_empty(),
+            "two reservations fill the budget"
+        );
+        assert_eq!(scheduler.status(|_| 0).1[0].memory_needed, Some(5));
+
+        // Learning never publishes the configured reservation as a measured peak.
+        assert_eq!(
+            scheduler.forecast_memory(Path::new("/repo/.git"), Path::new(""), &check()),
+            None
+        );
+        let observed = Usage {
+            cpu_ms: 1,
+            peak_memory: 7,
+            test_memory: None,
+        };
+        let finished = scheduler.exited(a, &ok(), Some(observed), BuildReport::default());
+        let finished = complete_measurements(&mut scheduler, finished);
+        assert_eq!(
+            starts(&finished).len(),
+            1,
+            "released reservation admits the third build"
+        );
+        assert_eq!(scheduler.memory(), (10, 10));
+        let measured = submit(&mut scheduler, 4, "/a", "a2");
+        assert!(starts(&measured).is_empty());
+        assert_eq!(scheduler.status(|_| 0).1[0].memory_needed, Some(7));
+        let finished = scheduler.exited(b, &ok(), None, BuildReport::default());
+        let finished = complete_measurements(&mut scheduler, finished);
+        assert!(
+            starts(&finished).is_empty(),
+            "7 measured + 5 unknown does not fit"
         );
     }
 

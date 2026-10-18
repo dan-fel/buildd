@@ -209,7 +209,7 @@ pub struct Mirror {
 pub struct Capacity {
     pub status: Status,
     /// A measured peak of this exact compilation. An unmeasured request
-    /// learns its peak while holding an exclusive memory reservation.
+    /// uses the host's configured reservation, exclusive by default.
     pub peak_memory: Option<u64>,
 }
 
@@ -345,12 +345,15 @@ pub struct Status {
     /// so they compile from scratch.
     #[serde(default)]
     pub undersized: bool,
-    /// Memory running builds may use together, in bytes, and what the
-    /// running builds are expected to use at their peaks.
+    /// Memory admission budget, in bytes, and the running builds' reservations
+    /// (measured peaks, or the host's policy for unmeasured compilations).
     #[serde(default)]
     pub memory: u64,
     #[serde(default)]
     pub memory_in_use: u64,
+    /// Reservation for each unmeasured compilation; None learns exclusively.
+    #[serde(default)]
+    pub unmeasured_memory: Option<u64>,
     pub slots: Vec<SlotStatus>,
     /// Waiting builds, next first.
     pub queue: Vec<QueuedBuild>,

@@ -1588,6 +1588,71 @@ fn two_package_workspace() -> TempDir {
 }
 
 #[test]
+fn unmeasured_commands_can_run_together_under_a_configured_reservation() {
+    let daemon = Daemon::configured(
+        "slots = 2\njobs = 4\nmin_free_gib = 0\nmemory_gib = 2\nunmeasured_memory_gib = 1\n",
+    );
+    let repository = crate_repository(None);
+    let gates = TempDir::new();
+    let (ready, started) = std::sync::mpsc::channel();
+    let mut clients = Vec::new();
+    for name in ["a", "b"] {
+        let gate = gates.0.join(name);
+        assert!(
+            Process::new("mkfifo")
+                .arg(&gate)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let stream = daemon.connect();
+        let request = run_request(
+            &repository.0,
+            &[
+                "sh",
+                "-c",
+                "echo ready; read -r line < \"$1\"",
+                "sh",
+                gate.to_str().unwrap(),
+            ],
+        );
+        let ready = ready.clone();
+        clients.push(std::thread::spawn(move || {
+            let mut messages = Vec::new();
+            client::build(stream, request, |message| {
+                if matches!(message, Message::Stdout { line } if line == "ready") {
+                    ready.send(()).unwrap();
+                }
+                messages.push(message.clone());
+            })
+            .unwrap();
+            messages
+        }));
+    }
+    // The commands block on FIFOs, so both must have started before either
+    // can finish. Release them even on failure before checking the result.
+    let first = started.recv_timeout(Duration::from_secs(10));
+    let second = started.recv_timeout(Duration::from_secs(10));
+    let status = daemon.status();
+    std::thread::scope(|scope| {
+        for name in ["a", "b"] {
+            let gate = gates.0.join(name);
+            scope.spawn(move || std::fs::write(gate, "continue\n").unwrap());
+        }
+    });
+    for client in clients {
+        let messages = client.join().unwrap();
+        assert!(outcome(&messages).success(), "{messages:?}");
+    }
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "both start before either finishes: {status:?}"
+    );
+    assert_eq!(status.unmeasured_memory, Some(1 << 30));
+    assert_eq!(status.memory_in_use, 2 << 30);
+}
+
+#[test]
 fn a_scoped_build_learns_its_peak_without_inheriting_an_oversized_workspace_run() {
     let daemon = Daemon::configured("slots = 1\njobs = 4\nmin_free_gib = 0\nmemory_gib = 0.001\n");
     let repository = two_package_workspace();

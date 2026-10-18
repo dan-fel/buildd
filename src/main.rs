@@ -519,6 +519,7 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         undersized,
         memory,
         memory_in_use,
+        unmeasured_memory,
         slots,
         queue,
         draining,
@@ -532,7 +533,7 @@ fn status(home: &Path) -> Result<ExitCode, String> {
     );
     println!(
         "{capacity} slots, build disk: {} of {}{}, jobs: {idle_jobs} of {jobs} idle, \
-         memory: {} of {}, disk: {disk} (floor {}){}",
+         memory reserved: {} of {}, disk: {disk} (floor {}){}",
         gib(disk_used),
         gib(disk_budget),
         if undersized {
@@ -549,6 +550,12 @@ fn status(home: &Path) -> Result<ExitCode, String> {
             ""
         }
     );
+    if let Some(reserved) = unmeasured_memory {
+        println!(
+            "unmeasured builds: {} reserved each (not a measured peak)",
+            gib(reserved)
+        );
+    }
     if let Some(wait) = disk_wait {
         println!(
             "disk admission: {wait} ({} headroom per build)",

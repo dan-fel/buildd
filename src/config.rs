@@ -28,6 +28,10 @@ pub struct Config {
     /// Memory running builds may use together, in bytes, by their recorded
     /// peaks: a build that would not fit waits.
     pub memory: u64,
+    /// Reservation for an unmeasured compilation. None learns exclusively,
+    /// reserving the whole budget. This is admission policy, not a measured
+    /// peak or a process memory limit.
+    pub unmeasured_memory: Option<u64>,
     /// Other machines eligible for automatic or explicit build placement.
     pub remotes: Vec<Remote>,
     /// Branches whose new commits are built before anyone asks.
@@ -76,6 +80,7 @@ struct File {
     min_free_gib: Option<f64>,
     build_headroom_gib: Option<f64>,
     memory_gib: Option<f64>,
+    unmeasured_memory_gib: Option<f64>,
     #[serde(default)]
     remote: Vec<Remote>,
     #[serde(default)]
@@ -122,6 +127,15 @@ impl Config {
             ));
         }
         let min_free_gib = file.min_free_gib.unwrap_or(15.0);
+        if file
+            .unmeasured_memory_gib
+            .is_some_and(|gib| !gib.is_finite() || gib < 0.5 / GIB || gib > memory_gib)
+        {
+            return Err(format!(
+                "{}: unmeasured_memory_gib must be finite, positive and no greater than memory_gib",
+                path.display()
+            ));
+        }
         if !(min_free_gib.is_finite() && (0.0..MAX_GIB).contains(&min_free_gib)) {
             return Err(format!(
                 "{}: min_free_gib must be finite, non-negative and fit in bytes",
@@ -166,6 +180,14 @@ impl Config {
                 reason = "a positive, finite number of GiB rounds to bytes"
             )]
             memory: (memory_gib * GIB).round() as u64,
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a positive, finite reservation no larger than the memory budget"
+            )]
+            unmeasured_memory: file
+                .unmeasured_memory_gib
+                .map(|gib| (gib * GIB).round() as u64),
             remotes: file.remote,
             prewarm: file.prewarm,
         };
@@ -279,10 +301,16 @@ mod tests {
             min_free: 0,
             build_headroom: 10 << 30,
             memory: 8 << 30,
+            unmeasured_memory: None,
             remotes: Vec::new(),
             prewarm: Vec::new(),
         };
         assert_eq!(Config::load(&home.0).unwrap(), expected);
+        write("memory_gib = 8\nunmeasured_memory_gib = 2\n");
+        assert_eq!(
+            Config::load(&home.0).unwrap().unmeasured_memory,
+            Some(2 << 30)
+        );
         write(
             "[[prewarm]]\nrepository = \"/work/app\"\nbranch = \"main\"\nos = \"linux\"\n\
              builds = [[\"test\", \"--workspace\", \"--no-run\"]]\n",
@@ -348,6 +376,11 @@ mod tests {
             "memory_gib = 17179869184\n",
             "min_free_gib = 17179869184\n",
             "memory_gib = 0\n",
+            "unmeasured_memory_gib = 0\n",
+            "unmeasured_memory_gib = 1e-100\n",
+            "unmeasured_memory_gib = nan\n",
+            "unmeasured_memory_gib = inf\n",
+            "memory_gib = 8\nunmeasured_memory_gib = 9\n",
         ] {
             write(invalid);
             assert!(Config::load(&home.0).is_err(), "{invalid}");
