@@ -7,7 +7,9 @@ use std::path::Path;
 use crate::config;
 use serde::de::DeserializeOwned;
 
-use crate::protocol::{Activity, BuildRequest, Failures, Message, RemoteActivity, Request, Status};
+use crate::protocol::{
+    Activity, BuildRequest, Failures, Message, Plan, RemoteActivity, Request, Status,
+};
 
 /// Connects to the daemon of `home`.
 ///
@@ -47,6 +49,16 @@ pub fn build(
 /// When the connection fails or the daemon breaks the protocol.
 pub fn status(stream: UnixStream) -> Result<Status, String> {
     ask(stream, &Request::Status)
+}
+
+/// Explain the current placement options without submitting a build.
+/// The source snapshot is captured just as for [`build`]; no slot is reserved.
+///
+/// # Errors
+/// When input or snapshotting fails, transport fails, or the daemon rejects
+/// the planning request. Unavailable hosts remain in the returned plan.
+pub fn plan(stream: UnixStream, request: BuildRequest) -> Result<Plan, String> {
+    ask::<Result<Plan, String>>(stream, &Request::Plan(request))?
 }
 
 /// Configured build hosts and their current admission policy.
@@ -191,6 +203,9 @@ fn ask<T: DeserializeOwned>(mut stream: UnixStream, request: &Request) -> Result
     BufReader::new(stream)
         .read_line(&mut line)
         .map_err(|error| format!("lost the daemon: {error}"))?;
+    if let Ok(Message::Rejected { reason }) = serde_json::from_str(&line) {
+        return Err(reason);
+    }
     serde_json::from_str(&line)
         .map_err(|error| format!("the daemon sent an invalid answer: {error}"))
 }

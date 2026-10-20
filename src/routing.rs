@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 
 use crate::cargo::Operation;
 use crate::config::Remote;
-use crate::protocol::{BuildRequest, Capacity, Host};
+use crate::protocol::{BuildRequest, Capacity, Forecast, Host, HostPlan, Plan};
 use crate::snapshot::{Revision, Source};
 
 pub(crate) struct Router {
@@ -25,6 +25,16 @@ pub(crate) struct Placement {
     operation: Operation,
     copy_to: Option<PathBuf>,
     rerun_all: bool,
+}
+
+impl Placement {
+    fn matches(&self, source: &Source, request: &BuildRequest) -> bool {
+        self.source.repository == source.repository
+            && self.source.prefix == source.prefix
+            && self.operation == request.operation
+            && self.copy_to == request.copy_to
+            && self.rerun_all == request.rerun_all
+    }
 }
 
 impl Router {
@@ -93,6 +103,41 @@ impl Router {
         request: &BuildRequest,
         observations: &[(Host, Result<Capacity, String>)],
     ) -> Result<Arc<Placement>, String> {
+        let host = self.recommend(source, revision, request, observations)?;
+        if let Some(placement) =
+            self.placements
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|placement| {
+                    placement.host == host
+                        && placement.matches(source, request)
+                        && placement.revision == *revision
+                })
+        {
+            return Ok(placement);
+        }
+        let placement = Arc::new(Placement {
+            host,
+            source: source.clone(),
+            revision: revision.clone(),
+            operation: request.operation.clone(),
+            copy_to: request.copy_to.clone(),
+            rerun_all: request.rerun_all,
+        });
+        self.placements
+            .retain(|placement| placement.strong_count() > 0);
+        self.placements.push(Arc::downgrade(&placement));
+        Ok(placement)
+    }
+
+    /// The exact host choice used by submission, without registering a placement.
+    fn recommend(
+        &self,
+        source: &Source,
+        revision: &Revision,
+        request: &BuildRequest,
+        observations: &[(Host, Result<Capacity, String>)],
+    ) -> Result<String, String> {
         let constrained = |host: &Host| request.accepts_host(host) && self.enabled(&host.name);
         let eligible = observations
             .iter()
@@ -109,20 +154,11 @@ impl Router {
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
         let usable = |host: &Host, capacity: &Capacity| {
-            constrained(host)
-                && !capacity.status.draining
-                && peak.is_none_or(|peak| peak <= capacity.status.memory)
-                && capacity
-                    .status
-                    .free_disk
-                    .is_some_and(|free| free >= capacity.status.min_free)
+            self.exclusion(host, request, Some(capacity), peak)
+                .is_none()
         };
         let matching = |placement: &&Arc<Placement>| {
-            placement.source.repository == source.repository
-                && placement.source.prefix == source.prefix
-                && placement.operation == request.operation
-                && placement.copy_to == request.copy_to
-                && placement.rerun_all == request.rerun_all
+            placement.matches(source, request)
                 && (placement.revision == *revision || placement.source.worktree == source.worktree)
                 && eligible.iter().any(|(host, capacity)| {
                     host.name == placement.host
@@ -133,7 +169,7 @@ impl Router {
         };
         let host = if let Some(placement) = live.iter().find(matching) {
             if placement.revision == *revision {
-                return Ok(Arc::clone(placement));
+                return Ok(placement.host.clone());
             }
             placement.host.clone()
         } else {
@@ -142,81 +178,24 @@ impl Router {
                 .filter_map(|(host, result)| result.as_ref().ok().map(|capacity| (host, capacity)))
                 .filter(|(host, capacity)| usable(host, capacity))
                 .min_by_key(|(host, capacity)| {
-                    let status = &capacity.status;
-                    let observed = status
-                        .slots
-                        .iter()
-                        .filter(|slot| slot.build.is_some() || slot.chore.is_some())
-                        .count()
-                        + status.queue.len();
                     let assigned = live
                         .iter()
                         .filter(|placement| placement.host == host.name)
                         .count();
-                    let load = observed.max(assigned);
-                    let reserved = capacity
-                        .peak_memory
-                        .or(status.unmeasured_memory)
-                        .unwrap_or(status.memory);
-                    let starts = load < status.capacity
-                        && status.idle_jobs > 0
-                        && status.queue.is_empty()
-                        && (capacity.peak_memory.is_some()
-                            || status.unmeasured_memory.is_some()
-                            || load == 0)
-                        && status.memory_in_use.saturating_add(reserved) <= status.memory
-                        && status.disk_wait.is_none()
-                        && status.free_disk.is_some_and(|free| {
-                            let running = status
-                                .slots
-                                .iter()
-                                .filter(|slot| slot.build.is_some())
-                                .count();
-                            let builds =
-                                u64::try_from(running + 1).expect("the slot count fits u64");
-                            free >= status
-                                .min_free
-                                .saturating_add(status.build_headroom.saturating_mul(builds))
-                        });
-                    let warm = status
-                        .slots
-                        .iter()
-                        .any(|slot| slot.worktree.as_ref() == Some(&source.worktree));
-                    (
-                        !starts,
-                        load * 1024 / status.capacity,
-                        !warm,
-                        std::cmp::Reverse(status.memory),
-                        host.name.clone(),
-                    )
+                    rank(source, host, capacity, assigned)
                 })
                 .map(|(host, _)| host.name.clone())
                 .ok_or_else(|| {
                     let details = eligible
                         .iter()
-                        .map(|(host, result)| match result {
-                            Err(reason) => format!("{}: {reason}", host.name),
-                            Ok(capacity) if capacity.status.draining => {
-                                format!("{}: draining", host.name)
-                            }
-                            Ok(capacity) if capacity.status.free_disk.is_none() => {
-                                format!("{}: free disk unavailable", host.name)
-                            }
-                            Ok(capacity)
-                                if capacity
-                                    .status
-                                    .free_disk
-                                    .is_some_and(|free| free < capacity.status.min_free) =>
-                            {
-                                format!("{}: below free disk floor", host.name)
-                            }
-                            Ok(capacity) => {
-                                let peak = peak.expect("unknown memory cannot disqualify a host");
-                                format!(
-                                    "{}: estimated peak {peak} bytes exceeds memory budget {}",
-                                    host.name, capacity.status.memory
-                                )
-                            }
+                        .map(|(host, result)| {
+                            let reason = match result {
+                                Err(reason) => reason.clone(),
+                                Ok(capacity) => self
+                                    .exclusion(host, request, Some(capacity), peak)
+                                    .expect("an unusable host has an exclusion"),
+                            };
+                            format!("{}: {reason}", host.name)
                         })
                         .collect::<Vec<_>>()
                         .join("; ");
@@ -230,19 +209,182 @@ impl Router {
                     )
                 })?
         };
-        let placement = Arc::new(Placement {
-            host,
-            source: source.clone(),
-            revision: revision.clone(),
-            operation: request.operation.clone(),
-            copy_to: request.copy_to.clone(),
-            rerun_all: request.rerun_all,
-        });
-        self.placements
-            .retain(|placement| placement.strong_count() > 0);
-        self.placements.push(Arc::downgrade(&placement));
-        Ok(placement)
+        Ok(host)
     }
+
+    fn exclusion(
+        &self,
+        host: &Host,
+        request: &BuildRequest,
+        capacity: Option<&Capacity>,
+        peak: Option<u64>,
+    ) -> Option<String> {
+        if !host.enabled || !self.enabled(&host.name) {
+            return Some("host is disabled".into());
+        }
+        if !request.accepts_host(host) {
+            return Some("excluded by the request's host, OS or artifact destination".into());
+        }
+        let capacity = capacity?;
+        let status = &capacity.status;
+        if status.draining {
+            Some("host is draining".into())
+        } else if status.free_disk.is_none() {
+            Some("free disk unavailable".into())
+        } else if status.free_disk.is_some_and(|free| free < status.min_free) {
+            Some("below free disk floor".into())
+        } else if peak.is_some_and(|peak| peak > status.memory) {
+            Some(format!(
+                "estimated peak {} bytes exceeds memory budget {}",
+                peak.unwrap(),
+                status.memory
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn plan(
+        &self,
+        source: &Source,
+        revision: Revision,
+        request: &BuildRequest,
+        observations: Vec<(Host, Result<Forecast, String>)>,
+    ) -> Plan {
+        let capacities = observations
+            .iter()
+            .map(|(host, forecast)| {
+                (
+                    host.clone(),
+                    forecast
+                        .as_ref()
+                        .map(|forecast| forecast.capacity.clone())
+                        .map_err(Clone::clone),
+                )
+            })
+            .collect::<Vec<_>>();
+        let peak = capacities
+            .iter()
+            .filter(|(host, _)| request.accepts_host(host) && self.enabled(&host.name))
+            .filter_map(|(_, capacity)| capacity.as_ref().ok()?.peak_memory)
+            .max();
+        let recommendation = self.recommend(source, &revision, request, &capacities);
+        let live = self
+            .placements
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        let mut hosts = observations
+            .into_iter()
+            .map(|(host, forecast)| {
+                let exclusion = self
+                    .exclusion(
+                        &host,
+                        request,
+                        forecast.as_ref().ok().map(|forecast| &forecast.capacity),
+                        peak,
+                    )
+                    .or_else(|| forecast.as_ref().err().cloned());
+                HostPlan {
+                    transfer_ms: (host.name == "local").then_some(0),
+                    host,
+                    forecast: forecast.ok(),
+                    exclusion,
+                }
+            })
+            .collect::<Vec<_>>();
+        hosts.sort_by_cached_key(|plan| {
+            let assigned = live
+                .iter()
+                .filter(|placement| placement.host == plan.host.name)
+                .count();
+            let rank = plan
+                .forecast
+                .as_ref()
+                .map(|forecast| rank(source, &plan.host, &forecast.capacity, assigned));
+            (
+                plan.exclusion.is_some(),
+                recommendation
+                    .as_ref()
+                    .ok()
+                    .is_none_or(|name| name != &plan.host.name),
+                rank,
+                plan.host.name.clone(),
+            )
+        });
+        let (recommended_host, reason) = match recommendation {
+            Ok(host) => {
+                let existing = live.iter().any(|placement| {
+                    placement.host == host
+                        && placement.matches(source, request)
+                        && (placement.revision == revision
+                            || placement.source.worktree == source.worktree)
+                });
+                let reason = if existing {
+                    "keeps equal or superseding work with its accepted placement"
+                } else {
+                    "current automatic routing order: immediate capacity, load, worktree affinity, memory budget"
+                };
+                (Some(host), reason.into())
+            }
+            Err(reason) => (None, reason),
+        };
+        Plan {
+            revision,
+            recommended_host,
+            reason,
+            hosts,
+        }
+    }
+}
+
+/// One ordering for host admission and its observational plan. These are
+/// scheduling factors, not a prediction of end-to-end completion time.
+fn rank(
+    source: &Source,
+    host: &Host,
+    capacity: &Capacity,
+    assigned: usize,
+) -> (bool, usize, bool, std::cmp::Reverse<u64>, String) {
+    let status = &capacity.status;
+    let observed = status
+        .slots
+        .iter()
+        .filter(|slot| slot.build.is_some() || slot.chore.is_some())
+        .count()
+        + status.queue.len();
+    let load = observed.max(assigned);
+    let reserved = capacity
+        .peak_memory
+        .or(status.unmeasured_memory)
+        .unwrap_or(status.memory);
+    let starts = load < status.capacity
+        && status.idle_jobs > 0
+        && status.queue.is_empty()
+        && (capacity.peak_memory.is_some() || status.unmeasured_memory.is_some() || load == 0)
+        && status.memory_in_use.saturating_add(reserved) <= status.memory
+        && status.disk_wait.is_none()
+        && status.free_disk.is_some_and(|free| {
+            let running = status
+                .slots
+                .iter()
+                .filter(|slot| slot.build.is_some())
+                .count() as u64;
+            free >= status
+                .min_free
+                .saturating_add(status.build_headroom.saturating_mul(running + 1))
+        });
+    let warm = status
+        .slots
+        .iter()
+        .any(|slot| slot.worktree.as_ref() == Some(&source.worktree));
+    (
+        !starts,
+        load * 1024 / status.capacity,
+        !warm,
+        std::cmp::Reverse(status.memory),
+        host.name.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -308,6 +450,119 @@ mod tests {
                 },
             }),
         )
+    }
+
+    fn forecasts(
+        observations: &[(Host, Result<Capacity, String>)],
+    ) -> Vec<(Host, Result<Forecast, String>)> {
+        observations
+            .iter()
+            .map(|(host, capacity)| {
+                (
+                    host.clone(),
+                    capacity.clone().map(|capacity| Forecast {
+                        capacity,
+                        recommended_slot: None,
+                        shared_slot: None,
+                        historical_build_ms: None,
+                        queue_ms: Some(0),
+                        slots: Vec::new(),
+                        notes: Vec::new(),
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plans_share_routing_order_without_registering_placements() {
+        let home = TempDir::new();
+        let mut router = Router::load(&home.0).unwrap();
+        let hosts = [host("local", "linux", 12), host("pc", "linux", 24)];
+        let plan = router.plan(&source("/a"), revision("a"), &request(), forecasts(&hosts));
+        assert!(router.placements.is_empty());
+        assert_eq!(plan.recommended_host.as_deref(), Some("pc"));
+        assert_eq!(plan.hosts[0].host.name, "pc");
+        assert_eq!(plan.hosts[0].transfer_ms, None);
+        let placed = router
+            .place(&source("/a"), &revision("a"), &request(), &hosts)
+            .unwrap();
+        assert_eq!(plan.recommended_host.as_ref(), Some(&placed.host));
+        let same = router.plan(
+            &source("/different"),
+            revision("a"),
+            &request(),
+            forecasts(&hosts),
+        );
+        assert_eq!(same.recommended_host.as_ref(), Some(&placed.host));
+        assert!(same.reason.contains("accepted placement"));
+        assert_eq!(same.hosts[0].host.name, placed.host);
+        assert_eq!(router.placements.len(), 1);
+        let superseding = router.plan(
+            &source("/a"),
+            revision("new"),
+            &request(),
+            forecasts(&hosts),
+        );
+        assert_eq!(superseding.recommended_host.as_ref(), Some(&placed.host));
+    }
+
+    #[test]
+    fn plans_explain_constraints_offline_hosts_and_resource_exclusions() {
+        let home = TempDir::new();
+        let router = Router::load(&home.0).unwrap();
+        let mut hosts = [
+            host("local", "macos", 1),
+            host("pc", "linux", 24),
+            host("offline", "linux", 12),
+        ];
+        hosts[2].1 = Err("connection timed out".into());
+        let plan = router.plan(&source("/a"), revision("a"), &request(), forecasts(&hosts));
+        assert_eq!(plan.recommended_host.as_deref(), Some("pc"));
+        assert!(
+            plan.hosts
+                .iter()
+                .find(|host| host.host.name == "local")
+                .unwrap()
+                .exclusion
+                .as_ref()
+                .unwrap()
+                .contains("memory budget")
+        );
+        assert!(
+            plan.hosts
+                .iter()
+                .find(|host| host.host.name == "offline")
+                .unwrap()
+                .exclusion
+                .as_ref()
+                .unwrap()
+                .contains("timed out")
+        );
+        let mut constrained = request();
+        constrained.host = Some("offline".into());
+        let plan = router.plan(
+            &source("/a"),
+            revision("a"),
+            &constrained,
+            forecasts(&hosts),
+        );
+        assert!(plan.recommended_host.is_none());
+        assert!(plan.hosts.iter().all(|host| host.exclusion.is_some()));
+    }
+
+    #[test]
+    fn submission_reassesses_policy_after_a_plan() {
+        let home = TempDir::new();
+        let mut router = Router::load(&home.0).unwrap();
+        let hosts = [host("local", "linux", 24), host("pc", "linux", 12)];
+        let plan = router.plan(&source("/a"), revision("a"), &request(), forecasts(&hosts));
+        assert_eq!(plan.recommended_host.as_deref(), Some("local"));
+        router.set_enabled(&home.0, &[], "local", false).unwrap();
+        let placed = router
+            .place(&source("/a"), &revision("a"), &request(), &hosts)
+            .unwrap();
+        assert_eq!(placed.host, "pc");
     }
 
     #[test]

@@ -1,5 +1,180 @@
 //! The daemon end to end: a real daemon process, git repositories and Cargo.
 
+mod planning_end_to_end {
+    use super::*;
+
+    #[test]
+    fn exact_worktree_plans_leave_the_index_queue_and_slots_untouched() {
+        let daemon = Daemon::start(1);
+        let repository = crate_repository(None);
+        std::fs::write(
+            repository.0.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        git(&repository.0, &["add", "src/lib.rs"]);
+        std::fs::write(
+            repository.0.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 9 }\n",
+        )
+        .unwrap();
+        let staged = git(&repository.0, &["diff", "--cached"]);
+        let unstaged = git(&repository.0, &["diff"]);
+        let input = request(&repository.0, Command::Check, &[]);
+        let plan = client::plan(daemon.connect(), input.clone()).unwrap();
+        assert_eq!(plan.recommended_host.as_deref(), Some("local"));
+        let forecast = plan.hosts[0].forecast.as_ref().unwrap();
+        assert!(forecast.slots[0].new);
+        assert_eq!(forecast.queue_ms, Some(0));
+        assert!(forecast.historical_build_ms.is_none());
+        assert!(forecast.slots[0].compile_ms.is_none());
+        assert!(daemon.status().slots.is_empty());
+        assert!(daemon.status().queue.is_empty());
+        assert_eq!(daemon.activity().totals.builds, 0);
+        assert_eq!(git(&repository.0, &["diff", "--cached"]), staged);
+        assert_eq!(git(&repository.0, &["diff"]), unstaged);
+
+        let output = Process::new(env!("CARGO_BIN_EXE_buildd"))
+            .args(["plan", "check", "--json"])
+            .current_dir(&repository.0)
+            .env("BUILDD_HOME", &daemon.home.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: buildd::protocol::Plan = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json.revision, plan.revision);
+        assert_eq!(daemon.activity().totals.builds, 0);
+        let output = Process::new(env!("CARGO_BIN_EXE_buildd"))
+            .args(["plan", "check"])
+            .current_dir(&repository.0)
+            .env("BUILDD_HOME", &daemon.home.0)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("observation only; no reservation"));
+        assert!(text.contains("unknown"));
+        let output = Process::new(env!("CARGO_BIN_EXE_buildd"))
+            .args(["plan", "run", "--json", "--", "touch", "should-not-run"])
+            .current_dir(&repository.0)
+            .env("BUILDD_HOME", &daemon.home.0)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!repository.0.join("should-not-run").exists());
+        assert!(daemon.status().slots.is_empty());
+
+        let messages = daemon.submit(input.clone());
+        assert!(outcome(&messages).success(), "{messages:?}");
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::Started { revision, .. } if revision == &plan.revision)));
+        let warm = client::plan(daemon.connect(), input).unwrap();
+        let forecast = warm.hosts[0].forecast.as_ref().unwrap();
+        assert!(!forecast.slots[0].new);
+        assert!(forecast.slots[0].exact_history);
+        assert!(forecast.historical_build_ms.is_some());
+        assert_eq!(daemon.activity().totals.builds, 1);
+    }
+
+    #[test]
+    fn remote_plans_do_not_create_mirrors_or_upload_source() {
+        let hosts = RemoteHost::start();
+        let repository = crate_repository(None);
+        let mut input = request(&repository.0, Command::Check, &[]);
+        input.os = Some(hosts.os.into());
+        let plan = client::plan(hosts.local.connect(), input.clone()).unwrap();
+        assert_eq!(plan.recommended_host.as_deref(), Some("far"));
+        let remote = plan
+            .hosts
+            .iter()
+            .find(|host| host.host.name == "far")
+            .unwrap();
+        assert!(remote.exclusion.is_none());
+        assert!(remote.transfer_ms.is_none());
+        let forecast = remote.forecast.as_ref().unwrap();
+        assert!(forecast.slots[0].new);
+        assert!(forecast.slots[0].compile_ms.is_none());
+        assert!(hosts.local.status().slots.is_empty());
+        assert!(hosts.remote.status().slots.is_empty());
+        assert!(!hosts.remote.home.0.join("mirrors").exists());
+        assert_eq!(hosts.remote.activity().totals.builds, 0);
+
+        let built = hosts.local.submit(input.clone());
+        assert!(outcome(&built).success(), "{built:?}");
+        let same = client::plan(hosts.local.connect(), input.clone()).unwrap();
+        let forecast = same.hosts[0].forecast.as_ref().unwrap();
+        assert!(forecast.slots[0].exact_history);
+        assert_eq!(forecast.slots[0].source_work, Some(0));
+        let mirrors = std::fs::read_dir(hosts.remote.home.0.join("mirrors"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(mirrors.len(), 1);
+        let references = git(&mirrors[0], &["show-ref"]);
+        std::fs::write(
+            repository.0.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 10 }\n",
+        )
+        .unwrap();
+        let changed = client::plan(hosts.local.connect(), input).unwrap();
+        assert_ne!(changed.revision, same.revision);
+        let forecast = changed.hosts[0].forecast.as_ref().unwrap();
+        assert!(forecast.slots[0].source_work.is_none());
+        assert!(forecast.slots[0].compile_ms.is_none());
+        assert_eq!(git(&mirrors[0], &["show-ref"]), references);
+        assert_eq!(hosts.remote.activity().totals.builds, 1);
+    }
+
+    #[test]
+    fn planning_refuses_invalid_input_and_explains_unavailable_hosts() {
+        let daemon = Daemon::start(1);
+        let repository = crate_repository(None);
+        let invalid = request(&repository.0, Command::Check, &["--target-dir", "/other"]);
+        assert!(client::plan(daemon.connect(), invalid).is_err());
+        let mut unknown = request(&repository.0, Command::Check, &[]);
+        unknown.host = Some("missing".into());
+        assert!(
+            client::plan(daemon.connect(), unknown)
+                .unwrap_err()
+                .contains("unknown build host")
+        );
+        client::drain(daemon.connect(), true).unwrap();
+        let plan = client::plan(
+            daemon.connect(),
+            request(&repository.0, Command::Check, &[]),
+        )
+        .unwrap();
+        assert!(plan.recommended_host.is_none());
+        assert!(
+            plan.hosts[0]
+                .exclusion
+                .as_ref()
+                .unwrap()
+                .contains("draining")
+        );
+        assert!(daemon.status().slots.is_empty());
+        client::drain(daemon.connect(), false).unwrap();
+        client::set_host(daemon.connect(), "local".into(), false).unwrap();
+        let plan = client::plan(
+            daemon.connect(),
+            request(&repository.0, Command::Check, &[]),
+        )
+        .unwrap();
+        assert!(plan.recommended_host.is_none());
+        assert!(
+            plan.hosts[0]
+                .exclusion
+                .as_ref()
+                .unwrap()
+                .contains("disabled")
+        );
+    }
+}
+
 #[test]
 fn cache_capabilities_and_foreign_owner_round_trip() {
     use buildd::cache::{Operation, Refusal, Response};

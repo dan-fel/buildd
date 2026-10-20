@@ -30,8 +30,8 @@ use crate::memory;
 use crate::passed::{self, PassedBinary};
 use crate::products::{self, Product};
 use crate::protocol::{
-    Activity, BuildReport, BuildRequest, Capacity, EventKind, Failures, Message, Mirror, Outcome,
-    RemoteActivity, Request, RevisionRequest, Status, TestMemory, Usage,
+    Activity, BuildReport, BuildRequest, Capacity, EventKind, Failures, Forecast, Message, Mirror,
+    Outcome, Plan, RemoteActivity, Request, RevisionRequest, Status, TestMemory, Usage,
 };
 use crate::remote;
 use crate::run::{self, RunDirectory};
@@ -76,6 +76,10 @@ enum Event {
         prefix: PathBuf,
         operation: Operation,
         reply: Sender<Capacity>,
+    },
+    Forecast {
+        submission: Submission,
+        reply: Sender<Forecast>,
     },
     Activity {
         reply: Sender<Activity>,
@@ -422,6 +426,43 @@ impl Connection {
             },
             Ok(Request::Build(request)) => self.build(stream, reader, request),
             Ok(Request::BuildRevision(request)) => self.build_revision(stream, reader, request),
+            Ok(Request::Plan(request)) => {
+                let plan = self.plan(&request, &stream);
+                let _ = write_line(&mut stream, &plan);
+            }
+            Ok(Request::PlanRevision(request)) => {
+                let forecast = request.operation.validate().and_then(|()| {
+                    check_prefix(&request.prefix)?;
+                    if !self
+                        .router
+                        .lock()
+                        .expect("router cannot panic")
+                        .enabled("local")
+                    {
+                        return Err("local build host is disabled".into());
+                    }
+                    if let Some(directory) = &request.copy_to {
+                        copy_destination_here(directory, &self.home)?;
+                    }
+                    let repository = mirror_path(&self.home, &request.project)?;
+                    self.forecast(Submission {
+                        waiter: self.waiter,
+                        source: Source {
+                            repository,
+                            worktree: request.worktree,
+                            prefix: request.prefix,
+                            index: PathBuf::new(),
+                        },
+                        revision: request.revision,
+                        operation: request.operation,
+                        label: request.label,
+                        copy_to: request.copy_to,
+                        rerun_all: request.rerun_all,
+                        optional: request.optional,
+                    })
+                });
+                let _ = write_line(&mut stream, &forecast);
+            }
         }
     }
 
@@ -441,6 +482,105 @@ impl Connection {
             })
             .map_err(|_| "daemon ended")?;
         capacity.recv().map_err(|_| "daemon ended".to_owned())
+    }
+
+    fn forecast(&self, submission: Submission) -> Result<Forecast, String> {
+        let (reply, forecast) = crossbeam_channel::bounded(1);
+        self.events
+            .send(Event::Forecast { submission, reply })
+            .map_err(|_| "daemon ended")?;
+        forecast.recv().map_err(|_| "daemon ended".to_owned())
+    }
+
+    fn capture(&self, request: &BuildRequest) -> Result<(Source, snapshot::Revision), String> {
+        request.operation.validate()?;
+        if let Some(directory) = &request.copy_to {
+            copy_destination(directory)?;
+        }
+        let source = snapshot::resolve(&request.directory)?;
+        let revision = source.snapshot(&self.home.join("tmp"))?;
+        Ok((source, revision))
+    }
+
+    fn plan(&self, request: &BuildRequest, requester: &UnixStream) -> Result<Plan, String> {
+        let (source, revision) = self.capture(request)?;
+        let hosts = self
+            .router
+            .lock()
+            .expect("router cannot panic")
+            .hosts(&self.remotes);
+        if let Some(name) = &request.host
+            && !hosts.iter().any(|host| host.name == *name)
+        {
+            return Err(format!("unknown build host {name}"));
+        }
+        let project = slot::project_name(&source.repository);
+        let observations = std::thread::scope(|scope| {
+            let asked = hosts
+                .into_iter()
+                .map(|host| {
+                    let source = &source;
+                    let revision = &revision;
+                    let project = &project;
+                    scope.spawn(move || {
+                        let forecast = if !request.accepts_host(&host) {
+                            Err("excluded by host policy or request constraints".into())
+                        } else if host.name == "local" {
+                            request
+                                .copy_to
+                                .as_ref()
+                                .map_or(Ok(()), |directory| {
+                                    copy_destination_here(directory, &self.home)
+                                })
+                                .and_then(|()| {
+                                    self.forecast(Submission {
+                                        waiter: self.waiter,
+                                        source: source.clone(),
+                                        revision: revision.clone(),
+                                        operation: request.operation.clone(),
+                                        label: request.label.clone(),
+                                        copy_to: request.copy_to.clone(),
+                                        rerun_all: request.rerun_all,
+                                        optional: request.optional,
+                                    })
+                                })
+                        } else {
+                            let remote = self
+                                .remotes
+                                .iter()
+                                .find(|remote| remote.name == host.name)
+                                .expect("configured host");
+                            remote::forecast(
+                                remote,
+                                RevisionRequest {
+                                    project: project.clone(),
+                                    revision: revision.clone(),
+                                    worktree: source.worktree.clone(),
+                                    prefix: source.prefix.clone(),
+                                    operation: request.operation.clone(),
+                                    label: request.label.clone(),
+                                    copy_to: request.copy_to.clone(),
+                                    rerun_all: request.rerun_all,
+                                    optional: request.optional,
+                                },
+                                requester,
+                            )
+                        };
+                        (host, forecast)
+                    })
+                })
+                .collect::<Vec<_>>();
+            asked
+                .into_iter()
+                .map(|asked| asked.join().expect("host probe cannot panic"))
+                .collect()
+        });
+        Ok(self.router.lock().expect("router cannot panic").plan(
+            &source,
+            revision,
+            request,
+            observations,
+        ))
     }
 
     /// The remote host that builds for `os`.
@@ -510,17 +650,7 @@ impl Connection {
                 copy_destination_here(directory, &self.home)?;
             }
             let repository = existing_mirror(&self.home, &request.project)?;
-            if request.prefix.is_absolute()
-                || request
-                    .prefix
-                    .components()
-                    .any(|part| part == std::path::Component::ParentDir)
-            {
-                return Err(format!(
-                    "the directory to build in is outside the tree: {}",
-                    request.prefix.display()
-                ));
-            }
+            check_prefix(&request.prefix)?;
             let mut exists = git::command(&repository);
             exists
                 .arg("--git-dir")
@@ -634,14 +764,7 @@ impl Connection {
     }
 
     fn build(self, mut stream: UnixStream, reader: BufReader<UnixStream>, request: BuildRequest) {
-        let prepared = request.operation.validate().and_then(|()| {
-            if let Some(directory) = &request.copy_to {
-                copy_destination(directory)?;
-            }
-            let source = snapshot::resolve(&request.directory)?;
-            let revision = source.snapshot(&self.home.join("tmp"))?;
-            Ok((source, revision))
-        });
+        let prepared = self.capture(&request);
         let (source, revision) = match prepared {
             Ok(prepared) => prepared,
             Err(reason) => {
@@ -842,6 +965,20 @@ fn mirror_path(home: &Path, project: &str) -> Result<PathBuf, String> {
     Ok(home.join("mirrors").join(project))
 }
 
+fn check_prefix(prefix: &Path) -> Result<(), String> {
+    if prefix.is_absolute()
+        || prefix
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "the directory to build in is outside the tree: {}",
+            prefix.display()
+        ));
+    }
+    Ok(())
+}
+
 /// `project`'s mirror, which must exist.
 fn existing_mirror(home: &Path, project: &str) -> Result<PathBuf, String> {
     let path = mirror_path(home, project)?;
@@ -1026,6 +1163,18 @@ impl Daemon {
                         status: self.status(),
                         peak_memory,
                     });
+                    Vec::new()
+                }
+                Event::Forecast { submission, reply } => {
+                    let capacity = Capacity {
+                        peak_memory: self.scheduler.forecast_memory(
+                            &submission.source.repository,
+                            &submission.source.prefix,
+                            &submission.operation,
+                        ),
+                        status: self.status(),
+                    };
+                    let _ = reply.send(self.scheduler.forecast(&submission, capacity));
                     Vec::new()
                 }
                 Event::Activity { reply } => {

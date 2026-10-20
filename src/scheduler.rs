@@ -56,8 +56,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cargo::{Compilation, Operation};
 use crate::passed::PassedBinary;
 use crate::protocol::{
-    BuildReport, Chore, DiskWait, EventKind, Hold, LastBuild, Message, Outcome, Phase, QueuedBuild,
-    RunningBuild, Shortage, SlotStatus, Usage,
+    BuildReport, Capacity, Chore, DiskWait, EventKind, Forecast, Hold, LastBuild, Message, Outcome,
+    Phase, QueuedBuild, RunningBuild, Shortage, SlotPlan, SlotStatus, Usage,
 };
 use crate::slot::{CompilationRun, Evictable, Inventory, Kind, LastUse, SlotRecord, slot_name};
 use crate::snapshot::{Revision, Source};
@@ -1470,18 +1470,11 @@ impl<D: Distance> Scheduler<D> {
             // learns alone when the host has not sized unfamiliar builds.
             // With nothing running, it runs whatever it needs.
             let memory = self.memory_estimate(&self.jobs[&id]);
-            let running = self.jobs.values().any(|job| !job.queued());
-            let exclusive = self.unmeasured_memory.is_none()
-                && (memory.is_none()
-                    || self
-                        .jobs
-                        .values()
-                        .any(|job| matches!(job.state, State::Running { memory: None, .. })));
-            let reserved = memory.or(self.unmeasured_memory).unwrap_or(self.memory);
-            if running && (exclusive || in_use.saturating_add(reserved) > self.memory) {
+            if let Some(reserved) = self.memory_hold(memory, in_use) {
                 self.jobs.get_mut(&id).expect("queued above").memory_needed = Some(reserved);
                 break;
             }
+            let reserved = memory.or(self.unmeasured_memory).unwrap_or(self.memory);
             // All callers, including exits, measurements and cache releases,
             // make the same disk decision before a slot becomes busy again.
             self.disk_wait = self.keep_disk(1, &mut effects);
@@ -1703,6 +1696,21 @@ impl<D: Distance> Scheduler<D> {
             .sum()
     }
 
+    /// Admission and planning use the same reservation and exclusive-learning
+    /// policy. None means memory does not currently hold the request.
+    fn memory_hold(&self, peak: Option<u64>, in_use: u64) -> Option<u64> {
+        let running = self.jobs.values().any(|job| !job.queued());
+        let exclusive = self.unmeasured_memory.is_none()
+            && (peak.is_none()
+                || self
+                    .jobs
+                    .values()
+                    .any(|job| matches!(job.state, State::Running { memory: None, .. })));
+        let reserved = peak.or(self.unmeasured_memory).unwrap_or(self.memory);
+        (running && (exclusive || in_use.saturating_add(reserved) > self.memory))
+            .then_some(reserved)
+    }
+
     /// Memory running builds may use together, and what the running builds
     /// are expected to use.
     pub(crate) fn memory(&self) -> (u64, u64) {
@@ -1741,22 +1749,286 @@ impl<D: Distance> Scheduler<D> {
     /// command in the same directory.
     fn estimate(&self, job: &Job) -> Option<u64> {
         let compilation = Compilation::of(job);
-        let runs = || {
+        if let Some(ms) = self.compilation_time(&job.repository, &compilation) {
+            return Some(ms);
+        }
+        average(
             self.slots
                 .iter()
                 .filter(|slot| slot.repository == job.repository)
                 .flat_map(|slot| &slot.compilations)
-        };
-        if let Some(run) = runs()
-            .filter(|run| run.compilation == compilation && run.build_ms.is_some())
+                .filter(|run| {
+                    run.compilation.prefix == compilation.prefix
+                        && run.compilation.command == compilation.command
+                }),
+        )
+    }
+
+    fn compilation_time(&self, repository: &Path, compilation: &Compilation) -> Option<u64> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.repository == repository)
+            .flat_map(|slot| &slot.compilations)
+            .filter(|run| &run.compilation == compilation && run.build_ms.is_some())
             .max_by_key(|run| run.at)
-        {
-            return run.build_ms;
+            .and_then(|run| run.build_ms)
+    }
+
+    /// The same cache evidence and ordering used by `choose_slot`. Reading
+    /// a forecast may populate the distance cache, but never changes slots,
+    /// jobs, queue order, admission or compilation history.
+    fn slot_plans(
+        &mut self,
+        repository: &Path,
+        revision: &Revision,
+        compilation: &Compilation,
+        include_busy: bool,
+    ) -> Vec<(usize, SlotPlan)> {
+        let (needed, known) = needed(&self.slots, repository, compilation);
+        let mut plans = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.repository != repository || (!include_busy && slot.busy()) {
+                continue;
+            }
+            let missing = needed
+                .iter()
+                .filter(|unit| !slot.units.contains_key(**unit))
+                .count() as u64;
+            let distance = slot.revision.as_ref().and_then(|from| {
+                let distance = self.distance.distance(repository, from, revision);
+                (distance != u64::MAX).then_some(distance)
+            });
+            let wait = match slot.job {
+                Some(id) => self.remaining_ms(&self.jobs[&id]),
+                None if slot.chore.is_some() => None,
+                None => Some(0),
+            };
+            let compile_ms = distance
+                .filter(|_| compilation.command.uses_cargo())
+                .and_then(|distance| {
+                    self.compile_cost
+                        .get(repository)?
+                        .ms(missing.saturating_add(distance))
+                });
+            plans.push((
+                index,
+                SlotPlan {
+                    slot: slot_name(repository, slot.index),
+                    available: !slot.busy(),
+                    new: false,
+                    exact_history: known,
+                    reused_units: needed.len() as u64 - missing,
+                    missing_units: missing,
+                    source_work: distance,
+                    slot_wait_ms: wait,
+                    compile_ms,
+                    note: slot.chore.map(|chore| format!("{chore:?}")),
+                },
+            ));
         }
-        average(runs().filter(|run| {
-            run.compilation.prefix == compilation.prefix
-                && run.compilation.command == compilation.command
-        }))
+        plans.sort_by_key(|(index, plan)| {
+            (
+                !plan.available,
+                plan.missing_units
+                    .saturating_add(plan.source_work.unwrap_or(u64::MAX)),
+                u64::MAX - self.slots[*index].used,
+                *index,
+            )
+        });
+        plans
+    }
+
+    fn remaining_ms(&self, job: &Job) -> Option<u64> {
+        let State::Running {
+            started,
+            cancelled: false,
+            ..
+        } = job.state
+        else {
+            return None;
+        };
+        let elapsed = millis(started.elapsed());
+        self.estimate(job)
+            .filter(|expected| elapsed <= expected.saturating_mul(2))
+            .map(|expected| expected.saturating_sub(elapsed))
+    }
+
+    pub(crate) fn forecast(&mut self, submission: &Submission, capacity: Capacity) -> Forecast {
+        let repository = &submission.source.repository;
+        let compilation = Compilation::new(&submission.source.prefix, &submission.operation);
+        let plans = self.slot_plans(repository, &submission.revision, &compilation, true);
+        let mut notes = Vec::new();
+        let status = &capacity.status;
+        if status.draining {
+            notes.push("host is draining".into());
+        }
+        if !status.queue.is_empty() {
+            notes.push(format!(
+                "{} queued builds; their completion and admission order may change the slot choice",
+                status.queue.len()
+            ));
+        }
+        if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
+            notes.push("all concurrent build capacity is occupied".into());
+        }
+        if submission.optional
+            && (self
+                .jobs
+                .values()
+                .any(|job| job.queued() && !job.optional())
+                || self
+                    .capacity
+                    .saturating_sub(self.slots.iter().filter(|slot| slot.busy()).count())
+                    < 2)
+        {
+            notes.push(
+                "optional work must leave another slot free and wait behind ordinary builds".into(),
+            );
+        }
+        if let Some(reserved) = self.memory_hold(capacity.peak_memory, self.memory_in_use()) {
+            notes.push(format!(
+                "waiting for memory admission ({reserved} bytes reserved)"
+            ));
+        }
+        if let Some(wait) = &status.disk_wait {
+            notes.push(wait.to_string());
+        }
+        if self.disk_used() > self.disk_budget {
+            notes.push("cache disk budget must be met before admission".into());
+        }
+        let running_count = self.slots.iter().filter(|slot| slot.job.is_some()).count() as u64;
+        let required = self
+            .min_free
+            .saturating_add(self.build_headroom.saturating_mul(running_count + 1));
+        if status.free_disk.is_none_or(|free| free < required) {
+            notes.push(format!("disk admission requires {required} free bytes"));
+        }
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.size.is_none() && slot.unmeasured > 0)
+        {
+            notes.push("artifact inventories must be measured before admission".into());
+        }
+        let shared_slot = self.jobs.values().find_map(|job| {
+            if !job.cancelled() && job.same_build(submission) {
+                match job.state {
+                    State::Running { slot, .. } => {
+                        Some(slot_name(repository, self.slots[slot].index))
+                    }
+                    State::Queued => None,
+                }
+            } else {
+                None
+            }
+        });
+        let (needed, known) = needed(&self.slots, repository, &compilation);
+        let needed = needed
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let mut recommended_slot = plans
+            .iter()
+            .find(|(_, plan)| plan.available)
+            .map(|(_, plan)| plan.slot.clone());
+        let mut held = false;
+        let mut new_slot = None;
+        if let Some((_, idle)) = plans.iter().find(|(_, plan)| plan.available) {
+            let claimed =
+                self.jobs
+                    .values()
+                    .filter_map(|job| {
+                        let hold = job.hold.as_ref()?;
+                        let slot = self.slots.iter().position(|slot| {
+                            slot_name(&slot.repository, slot.index) == hold.slot
+                        })?;
+                        Some((slot, self.estimate(job).unwrap_or(0)))
+                    })
+                    .fold(HashMap::<usize, u64>::new(), |mut claimed, (slot, ms)| {
+                        *claimed.entry(slot).or_default() += ms;
+                        claimed
+                    });
+            let work = idle
+                .missing_units
+                .saturating_add(idle.source_work.unwrap_or(u64::MAX));
+            if let Some((hold, _)) = self.hold(
+                repository,
+                &submission.revision,
+                submission.optional,
+                &needed,
+                work,
+                &claimed,
+            ) {
+                recommended_slot = Some(hold.slot.clone());
+                notes.push(format!(
+                    "waiting for warm slot {} is estimated at {} ms through compilation, versus {} ms compiling in the best idle slot",
+                    hold.slot, hold.wait_ms, hold.cold_ms,
+                ));
+                held = true;
+            }
+        } else if plans.len() < self.capacity
+            && !plans
+                .iter()
+                .any(|(index, _)| self.slots[*index].chore.is_some())
+        {
+            let index = (0..self.capacity)
+                .find(|index| {
+                    !plans
+                        .iter()
+                        .any(|(slot, _)| self.slots[*slot].index == *index)
+                })
+                .expect("fewer than capacity slots leave an index free");
+            let slot = slot_name(repository, index);
+            recommended_slot = Some(slot.clone());
+            new_slot = Some(SlotPlan {
+                slot,
+                available: true,
+                new: true,
+                exact_history: known,
+                reused_units: 0,
+                missing_units: needed.len() as u64,
+                source_work: Some(0),
+                slot_wait_ms: Some(0),
+                compile_ms: None,
+                note: Some("a cold slot would be created on admission".into()),
+            });
+        }
+        let historical_build_ms = self.compilation_time(repository, &compilation);
+        let queue_ms =
+            if shared_slot.is_some() || (notes.is_empty() && !held && recommended_slot.is_some()) {
+                Some(0)
+            } else {
+                None
+            };
+        if let Some(shared) = &shared_slot {
+            recommended_slot = Some(shared.clone());
+            notes.clear();
+            notes.push(
+                "would join an identical running build without reserving more resources".into(),
+            );
+        }
+        if submission.operation.command.uses_cargo() && !known {
+            notes.push(
+                "no compiled-unit history for this exact package, feature and flag selection"
+                    .into(),
+            );
+        }
+        notes.push(
+            "slot waits exclude queued work; compilation estimates exclude test execution".into(),
+        );
+        let mut slots = plans.into_iter().map(|(_, plan)| plan).collect::<Vec<_>>();
+        if let Some(new_slot) = new_slot {
+            slots.insert(0, new_slot);
+        }
+        Forecast {
+            capacity,
+            recommended_slot,
+            shared_slot,
+            historical_build_ms,
+            queue_ms,
+            slots,
+            notes,
+        }
     }
 
     /// The slot queued job `id` runs in now, as the module explains, and
@@ -1767,36 +2039,21 @@ impl<D: Distance> Scheduler<D> {
         let job = &self.jobs[&id];
         let repository = job.repository.clone();
         let revision = job.revision.clone();
-        let (needed, known) = needed(&self.slots, &repository, &Compilation::of(job));
-        // Ranked by the work Cargo has, then by recent use.
-        let mut best: Option<((u64, u64, usize), bool)> = None;
-        for (index, slot) in self.slots.iter().enumerate() {
-            if slot.repository != repository || slot.busy() {
-                continue;
-            }
-            let missing = needed
-                .iter()
-                .filter(|unit| !slot.units.contains_key(**unit))
-                .count() as u64;
-            let distance = slot.revision.as_ref().map_or(u64::MAX, |from| {
-                self.distance.distance(&repository, from, &revision)
-            });
-            let rank = (
-                missing.saturating_add(distance),
-                u64::MAX - slot.used,
-                index,
-            );
-            if best.is_none_or(|(best, _)| rank < best) {
-                best = Some((rank, known && missing == 0 && slot.revision.is_some()));
-            }
-        }
-        if let Some(((work, _, index), warm)) = best {
-            // Owned: weighing busy slots measures distances, which need the
-            // scheduler mutably.
+        let compilation = Compilation::of(job);
+        let optional = job.optional();
+        let plans = self.slot_plans(&repository, &revision, &compilation, false);
+        if let Some((index, plan)) = plans.iter().find(|(_, plan)| plan.available) {
+            let work = plan
+                .missing_units
+                .saturating_add(plan.source_work.unwrap_or(u64::MAX));
+            let warm = plan.exact_history
+                && plan.missing_units == 0
+                && self.slots[*index].revision.is_some();
+            let (needed, _) = needed(&self.slots, &repository, &compilation);
             let needed = needed.into_iter().map(str::to_owned).collect();
-            return match self.hold(id, &needed, work, claimed) {
+            return match self.hold(&repository, &revision, optional, &needed, work, claimed) {
                 Some((hold, slot)) => Placement::Hold { hold, slot },
-                None => Placement::Start { slot: index, warm },
+                None => Placement::Start { slot: *index, warm },
             };
         }
         let own = || {
@@ -1817,7 +2074,7 @@ impl<D: Distance> Scheduler<D> {
             index,
             job: None,
             revision: Some(revision),
-            worktree: Some(job.waiters[0].worktree.clone()),
+            worktree: Some(self.jobs[&id].waiters[0].worktree.clone()),
             used: 0,
             chore: None,
             generation: 0,
@@ -1838,7 +2095,7 @@ impl<D: Distance> Scheduler<D> {
         }
     }
 
-    /// Whether queued job `id`, whose best idle slot leaves `work` units to
+    /// Whether a request whose best idle slot leaves `work` units to
     /// compile, should wait for a busy slot of its repository instead, and
     /// for which: the busy slot's build, and the builds already held for it
     /// (`claimed`), are expected to end and the job to build there sooner
@@ -1846,45 +2103,40 @@ impl<D: Distance> Scheduler<D> {
     /// never waits.
     fn hold(
         &mut self,
-        id: JobId,
+        repository: &Path,
+        revision: &Revision,
+        optional: bool,
         needed: &HashSet<String>,
         work: u64,
         claimed: &HashMap<usize, u64>,
     ) -> Option<(Hold, usize)> {
-        let job = &self.jobs[&id];
         // Optional work never waits for a busy slot: it holds an idle one
         // at most.
-        if job.optional() {
+        if optional || work == u64::MAX {
             return None;
         }
-        let cost = self.compile_cost.get(&job.repository)?;
+        let cost = self.compile_cost.get(repository)?;
         let cold_ms = cost.ms(work)?;
         let mut best: Option<(Hold, usize)> = None;
         for (index, slot) in self.slots.iter().enumerate() {
-            let Some(running) = slot.job.filter(|_| slot.repository == job.repository) else {
+            let Some(running) = slot.job.filter(|_| slot.repository == repository) else {
                 continue;
             };
             let running = &self.jobs[&running];
-            let State::Running { started, .. } = running.state else {
-                panic!("a slot's job runs");
-            };
-            let elapsed = millis(started.elapsed());
-            // A build far past its estimate says nothing about its end.
-            let Some(expected) = self
-                .estimate(running)
-                .filter(|expected| elapsed <= expected.saturating_mul(2))
-            else {
+            let Some(remaining) = self.remaining_ms(running) else {
                 continue;
             };
             let missing = needed
                 .iter()
                 .filter(|unit| !slot.units.contains_key(unit.as_str()))
                 .count() as u64;
-            let distance =
-                self.distance
-                    .distance(&job.repository, &running.revision, &job.revision);
-            let wait_ms = expected
-                .saturating_sub(elapsed)
+            let distance = self
+                .distance
+                .distance(repository, &running.revision, revision);
+            if distance == u64::MAX {
+                continue;
+            }
+            let wait_ms = remaining
                 .saturating_add(claimed.get(&index).copied().unwrap_or(0))
                 .saturating_add(cost.ms(missing.saturating_add(distance))?);
             if wait_ms < cold_ms && best.as_ref().is_none_or(|(best, _)| wait_ms < best.wait_ms) {
@@ -3166,6 +3418,198 @@ mod tests {
         }
         scheduler.clock = 2;
         scheduler
+    }
+
+    mod planning {
+        use super::*;
+        use crate::protocol::Status;
+
+        fn forecast(
+            scheduler: &mut Scheduler<Table>,
+            tree: &str,
+            operation: Operation,
+        ) -> Forecast {
+            let submission = Submission {
+                waiter: WaiterId(900),
+                source: source("/planning"),
+                revision: revision(tree),
+                operation,
+                label: None,
+                copy_to: None,
+                rerun_all: false,
+                optional: false,
+            };
+            let (slots, queue) = scheduler.status(|_| 1);
+            let capacity = Capacity {
+                peak_memory: scheduler.forecast_memory(
+                    &submission.source.repository,
+                    &submission.source.prefix,
+                    &submission.operation,
+                ),
+                status: Status {
+                    jobs: 4,
+                    idle_jobs: 4,
+                    capacity: scheduler.capacity,
+                    disk_budget: scheduler.disk_budget,
+                    disk_used: scheduler.disk_used(),
+                    free_disk: scheduler.free_disk,
+                    min_free: scheduler.min_free,
+                    build_headroom: scheduler.build_headroom,
+                    disk_wait: scheduler.disk_wait.clone(),
+                    undersized: scheduler.undersized,
+                    memory: scheduler.memory,
+                    memory_in_use: scheduler.memory_in_use(),
+                    unmeasured_memory: scheduler.unmeasured_memory,
+                    slots,
+                    queue,
+                    draining: false,
+                },
+            };
+            scheduler.forecast(&submission, capacity)
+        }
+
+        #[test]
+        fn a_cold_plan_creates_no_slots_jobs_or_history() {
+            let mut scheduler = scheduler(2);
+            let plan = forecast(&mut scheduler, "new", check());
+            let repeated = forecast(&mut scheduler, "new", check());
+            assert_eq!(plan, repeated);
+            assert!(scheduler.slots.is_empty());
+            assert!(scheduler.jobs.is_empty());
+            assert!(scheduler.waiting.is_empty());
+            assert_eq!(scheduler.next_job, 0);
+            assert_eq!(scheduler.clock, 0);
+            assert_eq!(plan.queue_ms, Some(0));
+            assert!(plan.historical_build_ms.is_none());
+            assert_eq!(plan.slots.len(), 1);
+            assert!(plan.slots[0].new);
+            assert!(plan.slots[0].compile_ms.is_none());
+            assert!(!plan.slots[0].exact_history);
+        }
+
+        #[test]
+        fn the_plan_and_submission_use_the_same_cache_order() {
+            let mut scheduler = checked_and_tested();
+            measure_all(&mut scheduler, 1);
+            let plan = forecast(
+                &mut scheduler,
+                "b1",
+                Operation {
+                    command: Command::Test,
+                    ..check()
+                },
+            );
+            assert_eq!(plan.slots[0].reused_units, 12);
+            assert_eq!(plan.slots[0].missing_units, 0);
+            assert_eq!(plan.slots[0].source_work, Some(0));
+            assert!(plan.slots[0].exact_history);
+            assert_eq!(plan.recommended_slot.as_ref(), Some(&plan.slots[0].slot));
+            let started =
+                submit_operation(&mut scheduler, 3, "/planning", "b1", Command::Test, &[]);
+            assert!(matches!(starts(&started)[..], [(_, 1, _)]));
+        }
+
+        #[test]
+        fn planning_a_warm_wait_does_not_claim_the_slot() {
+            let mut scheduler = checked_and_tested();
+            measure_all(&mut scheduler, 1);
+            scheduler.slots[1].compilations[0].build_ms = Some(5000);
+            submit_operation(&mut scheduler, 3, "/b", "b2", Command::Test, &[]);
+            let cost = scheduler
+                .compile_cost
+                .entry("/repo/.git".into())
+                .or_default();
+            cost.add(10, 10_000);
+            cost.add(20, 20_000);
+            let jobs = scheduler.jobs.len();
+            let next = scheduler.next_job;
+            let plan = forecast(
+                &mut scheduler,
+                "c1",
+                Operation {
+                    command: Command::Test,
+                    ..check()
+                },
+            );
+            assert_eq!(scheduler.jobs.len(), jobs);
+            assert_eq!(scheduler.next_job, next);
+            assert!(scheduler.jobs.values().all(|job| job.hold.is_none()));
+            assert_eq!(
+                plan.recommended_slot,
+                Some(slot_name(Path::new("/repo/.git"), 1))
+            );
+            assert!(
+                plan.notes
+                    .iter()
+                    .any(|note| note.contains("waiting for warm slot"))
+            );
+            assert_eq!(plan.slots[0].compile_ms, Some(22_000));
+            let effects =
+                submit_operation(&mut scheduler, 4, "/planning", "c1", Command::Test, &[]);
+            assert!(starts(&effects).is_empty());
+            let (_, queue) = scheduler.status(|_| 0);
+            assert_eq!(
+                queue[0].held.as_ref().map(|hold| &hold.slot),
+                plan.recommended_slot.as_ref()
+            );
+        }
+
+        #[test]
+        fn an_unavailable_tree_comparison_does_not_invent_a_cost() {
+            let mut scheduler = checked_and_tested();
+            measure_all(&mut scheduler, 1);
+            scheduler
+                .distance
+                .0
+                .insert(("a1".into(), "unknown".into()), u64::MAX);
+            let cost = scheduler
+                .compile_cost
+                .entry("/repo/.git".into())
+                .or_default();
+            cost.add(10, 100);
+            cost.add(20, 200);
+            let plan = forecast(&mut scheduler, "unknown", check());
+            let slot = plan
+                .slots
+                .iter()
+                .find(|slot| slot.slot == slot_name(Path::new("/repo/.git"), 0))
+                .unwrap();
+            assert!(slot.source_work.is_none());
+            assert!(slot.compile_ms.is_none());
+        }
+
+        #[test]
+        fn shared_work_needs_no_more_memory_but_unknown_new_work_waits() {
+            let mut scheduler = scheduler(2);
+            submit(&mut scheduler, 1, "/a", "a1");
+            let shared = forecast(&mut scheduler, "a1", check());
+            assert!(shared.shared_slot.is_some());
+            assert_eq!(shared.queue_ms, Some(0));
+            assert!(
+                !shared
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("waiting for memory"))
+            );
+            let different = forecast(
+                &mut scheduler,
+                "a2",
+                Operation {
+                    args: vec!["-p".into(), "unmeasured".into()],
+                    ..check()
+                },
+            );
+            assert_eq!(different.capacity.peak_memory, None);
+            assert_eq!(different.queue_ms, None);
+            assert!(
+                different
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("waiting for memory"))
+            );
+            assert_eq!(scheduler.slots.len(), 1);
+            assert_eq!(scheduler.jobs.len(), 1);
+        }
     }
 
     #[test]

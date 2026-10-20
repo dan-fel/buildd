@@ -6,7 +6,9 @@
 //! request; a build nobody waits for any more is cancelled. For
 //! [`Request::Status`] it answers with one [`Status`], for
 //! [`Request::Activity`] with one [`Activity`], for [`Request::Remotes`]
-//! with a list of [`RemoteActivity`].
+//! with a list of [`RemoteActivity`]. [`Request::Plan`] returns a
+//! `Result<Plan, String>` and [`Request::PlanRevision`] a
+//! `Result<Forecast, String>`, without accepting work.
 
 use std::path::PathBuf;
 
@@ -29,6 +31,12 @@ pub enum Request {
     // host constraints. Existing clients without that field still submit.
     #[serde(rename = "schedule", alias = "build")]
     Build(BuildRequest),
+    /// Explain placement for this worktree's current content without
+    /// submitting, reserving capacity, or transferring its source.
+    Plan(BuildRequest),
+    /// A remote host's forecast. The tree need not have been pushed yet;
+    /// source comparisons that cannot be made remain unknown.
+    PlanRevision(RevisionRequest),
     /// Build a tree another machine's daemon pushed into this daemon's
     /// mirror of a project; answered like [`Request::Build`].
     BuildRevision(RevisionRequest),
@@ -211,6 +219,62 @@ pub struct Capacity {
     /// A measured peak of this exact compilation. An unmeasured request
     /// uses the host's configured reservation, exclusive by default.
     pub peak_memory: Option<u64>,
+}
+
+/// A point-in-time explanation, never a reservation or an accepted build.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    pub revision: Revision,
+    pub recommended_host: Option<String>,
+    pub reason: String,
+    /// Eligible hosts first, in the same order automatic routing uses.
+    pub hosts: Vec<HostPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostPlan {
+    pub host: Host,
+    /// None when policy excludes the host or it could not be reached.
+    pub forecast: Option<Forecast>,
+    pub exclusion: Option<String>,
+    /// Source transfer is not measured yet. Local placement needs none.
+    pub transfer_ms: Option<u64>,
+}
+
+/// The local scheduler's observations for one exact request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Forecast {
+    pub capacity: Capacity,
+    pub recommended_slot: Option<String>,
+    /// A running identical build this request would join, when present.
+    pub shared_slot: Option<String>,
+    /// Latest successful wall time for this exact compilation, including
+    /// tests. Historical, rather than a prediction for a particular slot.
+    pub historical_build_ms: Option<u64>,
+    /// Only known to be zero when admission has no current blockers.
+    pub queue_ms: Option<u64>,
+    pub slots: Vec<SlotPlan>,
+    pub notes: Vec<String>,
+}
+
+/// Cache and timing evidence for an existing or prospective slot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SlotPlan {
+    pub slot: String,
+    pub available: bool,
+    pub new: bool,
+    /// Whether the needed units came from this exact compilation's history.
+    pub exact_history: bool,
+    pub reused_units: u64,
+    pub missing_units: u64,
+    /// Scheduler distance: changed paths, or affected packages when the
+    /// workspace is known. None means the trees could not be compared.
+    pub source_work: Option<u64>,
+    /// Until this slot's current build ends, excluding other queued work.
+    pub slot_wait_ms: Option<u64>,
+    /// The scheduler's learned compilation cost, excluding test execution.
+    pub compile_ms: Option<u64>,
+    pub note: Option<String>,
 }
 
 /// A host in the coordinator's policy. Reachability is observed separately.

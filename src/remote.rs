@@ -65,6 +65,9 @@ fn ask<T: DeserializeOwned>(
         8 * 1024 * 1024,
     )
     .map_err(|error| format!("{} ({}): {error}", remote.name, remote.ssh))?;
+    if let Ok(Message::Rejected { reason }) = serde_json::from_slice(&answer) {
+        return Err(format!("{}: {reason}", remote.name));
+    }
     serde_json::from_slice(&answer)
         .map_err(|error| format!("{} sent an invalid answer: {error}", remote.name))
 }
@@ -344,6 +347,11 @@ pub(crate) fn capacity(
         },
         None,
     )??;
+    validate_capacity(remote, &capacity)?;
+    Ok(capacity)
+}
+
+fn validate_capacity(remote: &Remote, capacity: &crate::protocol::Capacity) -> Result<(), String> {
     if capacity.status.capacity == 0
         || capacity.status.jobs == 0
         || capacity.status.idle_jobs > capacity.status.jobs
@@ -351,7 +359,21 @@ pub(crate) fn capacity(
     {
         return Err(format!("{} sent invalid resource limits", remote.name));
     }
-    Ok(capacity)
+    Ok(())
+}
+
+pub(crate) fn forecast(
+    remote: &Remote,
+    request: RevisionRequest,
+    requester: &std::os::unix::net::UnixStream,
+) -> Result<crate::protocol::Forecast, String> {
+    let forecast = ask::<Result<crate::protocol::Forecast, String>>(
+        remote,
+        &Request::PlanRevision(request),
+        Some(requester),
+    )??;
+    validate_capacity(remote, &forecast.capacity)?;
+    Ok(forecast)
 }
 
 /// The builds that failed on `remote` in the last `hours`.

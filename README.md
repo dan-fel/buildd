@@ -29,12 +29,47 @@ buildd test --host air -p my-crate    # require a particular host
 buildd hosts disable local           # steer new builds away from this machine
 buildd run --os linux -- ./image.sh   # any command, on the same snapshot
 buildd status                         # one-shot summary
+buildd plan clippy --json -p my-crate   # explain choices without submitting
 buildd top                            # live view; q quits
 buildd failures                       # what failed lately, and why
 ```
 
 Set `BUILDD_LABEL` (an agent's or task's name) so `status` and `top` show
 who asked. Otherwise a request is named after its worktree's folder.
+
+## Plan a build
+
+`buildd plan COMMAND [OPTIONS] [ARGS...]` takes the same options and arguments
+as the build it describes, including package selection, features, compiler
+flags, host and OS constraints. It snapshots uncommitted content as a build
+would, leaving the worktree and its index untouched.
+
+```sh
+buildd plan clippy -p my-crate --all-targets -- -D warnings
+buildd plan nextest --json --os linux -p my-crate
+buildd clippy --host pc -p my-crate --all-targets -- -D warnings
+```
+
+The plan ranks hosts using the same routing policy as submission, names its
+recommendation, and explains excluded, offline, draining and resource-limited
+hosts. Each reachable host reports relevant slots, compiled units present or
+missing, source distance, known wait and compilation estimates, the previous
+successful wall time for the exact compilation, and current admission blockers.
+The slot recommendation uses the scheduler's cache ordering and warm-slot wait
+comparison. Accepted equal or superseding requests retain their host affinity.
+
+Unknown estimates are `null` in JSON and `unknown` in text. Remote transfer
+time is not measured yet. A remote that has not received the requested tree
+cannot compare it with a different cached tree, so that distance remains
+unknown. Slot waits exclude queued work; compilation estimates exclude test
+execution. Historical build time includes tests and is labeled as history,
+rather than an end-to-end prediction.
+
+A plan submits no work, reserves no capacity, creates no slots or remote
+mirrors, and uploads no source. It grants no queue position. A later build
+reassesses placement and resource admission against current state. Use `--host`
+or `--os` to express a deliberate constraint; ordinary builds still choose
+automatically without requiring a planning call.
 
 ## A build, step by step
 

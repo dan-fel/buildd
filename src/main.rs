@@ -50,6 +50,12 @@ usage:
       it once it succeeds. Withdrawing it stops its whole process group.
   buildd status
       Show the build slots and the queue.
+  buildd plan check|clippy|build|test|nextest|run [OPTIONS] [ARGS...]
+      Explain the current host and slot choices for this worktree's exact
+      content, without submitting work, reserving slots or uploading source.
+      Takes the same options as the corresponding build; --json prints one
+      plan object. Unknown timings stay unknown. Placement is reassessed
+      when a build is submitted; a plan grants no priority or reservation.
   buildd hosts [enable|disable NAME]
       Show or persistently change host policy for new builds. Accepted work
       continues. Host policy takes effect immediately, without a restart.
@@ -87,6 +93,13 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
+        "plan" => match args.next().as_deref().and_then(Command::parse) {
+            Some(command) => Some(command),
+            None => {
+                eprintln!("usage: buildd plan COMMAND [OPTIONS] [ARGS...]");
+                return ExitCode::from(2);
+            }
+        },
         other => match Command::parse(other) {
             Some(command) => Some(command),
             None => {
@@ -96,7 +109,7 @@ fn main() -> ExitCode {
         },
     };
     let result = config::home().and_then(|home| match command {
-        Some(command) => build(&home, command, args.collect()),
+        Some(command) => build(&home, command, args.collect(), name == "plan"),
         None if name == "daemon" => daemon(&home),
         None if name == "top" => {
             let remote_home = home.clone();
@@ -239,7 +252,12 @@ impl Options {
     }
 }
 
-fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCode, String> {
+fn build(
+    home: &Path,
+    command: Command,
+    mut args: Vec<String>,
+    planning: bool,
+) -> Result<ExitCode, String> {
     let directory = std::env::current_dir()
         .map_err(|error| format!("could not read the current directory: {error}"))?;
     let options = Options::take(&mut args, &directory)?;
@@ -262,6 +280,15 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
         host: options.host,
         optional: false,
     };
+    if planning {
+        let plan = client::plan(connect(home)?, request)?;
+        if options.json {
+            println!("{}", serde_json::to_string(&plan).expect("plans serialize"));
+        } else {
+            print!("{}", render_plan(&plan));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let last = if options.json {
         client::build(connect(home)?, request, |message| {
             println!(
@@ -288,6 +315,95 @@ fn build(home: &Path, command: Command, mut args: Vec<String>) -> Result<ExitCod
         | Message::Rejected { .. } => ExitCode::from(FAILURE),
         other => panic!("a build's last message is final: {other:?}"),
     })
+}
+
+fn render_plan(plan: &buildd::protocol::Plan) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "Plan for tree {} (observation only; no reservation)\n",
+        plan.revision
+    );
+    let _ = writeln!(
+        out,
+        "Recommended host: {}",
+        plan.recommended_host.as_deref().unwrap_or("none")
+    );
+    let _ = writeln!(out, "{}", plan.reason);
+    for host in &plan.hosts {
+        let _ = writeln!(
+            out,
+            "\n{} ({}){}",
+            host.host.name,
+            host.host.os,
+            host.exclusion
+                .as_ref()
+                .map_or(String::new(), |reason| format!(": {reason}"))
+        );
+        let Some(forecast) = &host.forecast else {
+            continue;
+        };
+        let status = &forecast.capacity.status;
+        let reservation = forecast
+            .capacity
+            .peak_memory
+            .or(status.unmeasured_memory)
+            .unwrap_or(status.memory);
+        let _ = writeln!(
+            out,
+            "  {} of {} CPU jobs idle; memory {} reserved + {} requested / {}; {} queued builds",
+            status.idle_jobs,
+            status.jobs,
+            gib(status.memory_in_use),
+            gib(reservation),
+            gib(status.memory),
+            status.queue.len()
+        );
+        let _ = writeln!(
+            out,
+            "  queue wait: {}; transfer: {}; historical build: {}",
+            timing(forecast.queue_ms),
+            timing(host.transfer_ms),
+            timing(forecast.historical_build_ms)
+        );
+        for slot in &forecast.slots {
+            let selected = forecast.recommended_slot.as_ref() == Some(&slot.slot);
+            let _ = writeln!(
+                out,
+                "  {} {}{}: {} units reused, {} missing ({} history), source work {}; slot wait {}; compile {}{}",
+                if selected { "*" } else { " " },
+                slot.slot,
+                if slot.new {
+                    " [new]"
+                } else if slot.available {
+                    " [idle]"
+                } else {
+                    " [busy]"
+                },
+                slot.reused_units,
+                slot.missing_units,
+                if slot.exact_history {
+                    "exact"
+                } else {
+                    "inferred"
+                },
+                slot.source_work
+                    .map_or_else(|| "unknown".into(), |work| work.to_string()),
+                timing(slot.slot_wait_ms),
+                timing(slot.compile_ms),
+                slot.note
+                    .as_ref()
+                    .map_or(String::new(), |note| format!("; {note}"))
+            );
+        }
+        for note in &forecast.notes {
+            let _ = writeln!(out, "  {note}");
+        }
+    }
+    out
+}
+
+fn timing(ms: Option<u64>) -> String {
+    ms.map_or_else(|| "unknown".into(), |ms| format!("{ms} ms"))
 }
 
 /// The program and arguments of `buildd run`, from what follows its
