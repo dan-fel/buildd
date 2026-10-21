@@ -352,6 +352,15 @@ fn host_lines(name: &str, os: &str, status: &Status) -> Vec<Line<'static>> {
         None => Span::from(" · free disk unknown").red(),
     };
     let mut lines = vec![Line::from(first), Line::from(vec![memory, disk, free])];
+    if status
+        .slots
+        .iter()
+        .any(|slot| slot.build.as_ref().is_some_and(|build| build.exclusive))
+    {
+        lines.push(Line::from("  Exclusive build active: all other builds wait").yellow());
+    } else if status.queue.iter().any(|build| build.exclusive) {
+        lines.push(Line::from("  Exclusive build queued: later submissions wait").yellow());
+    }
     if let Some(reserved) = status.unmeasured_memory {
         lines.push(Line::from(format!(
             "  Unmeasured builds: {} reserved each",
@@ -409,7 +418,8 @@ fn running_lines(host: &str, slot: &SlotStatus, commands: bool) -> Vec<Line<'sta
         Line::from(vec![
             Span::from(format!("{host} {}", short_slot(&slot.name))).bold(),
             Span::from(format!(
-                "  {phase} · {} · {} jobs  ",
+                "  {phase}{} · {} · {} jobs  ",
+                if build.exclusive { " (exclusive)" } else { "" },
                 brief(build.elapsed_ms),
                 build.tokens
             ))
@@ -450,6 +460,9 @@ fn queued_lines(
         ))
         .dark_gray(),
     ];
+    if build.exclusive {
+        details.push(Span::from(" · exclusive").yellow());
+    }
     if let Some(memory) = build.memory_needed {
         details.push(Span::from(format!(" · waiting for memory (needs {})", gib(memory))).yellow());
     } else if let Some(hold) = &build.held {
@@ -997,6 +1010,7 @@ mod tests {
                             compiled: 3,
                             fresh: 412,
                             cancelled: false,
+                            exclusive: false,
                             tokens: 4,
                             phase: Phase::Testing,
                         }),
@@ -1027,6 +1041,7 @@ mod tests {
                     operation: check("app-protocol"),
                     who: vec!["agent-5".into()],
                     waited_ms: 2100,
+                    exclusive: false,
                     estimate_ms: Some(40_000),
                     memory_needed: None,
                     held: Some(Hold {
@@ -1202,6 +1217,32 @@ mod tests {
             "unshared requests stay out of the events"
         );
         assert!(text.find("agent-7 joined").unwrap() < text.find("finished check").unwrap());
+    }
+
+    #[test]
+    fn exclusivity_explains_idle_capacity_and_marks_running_and_queued_work() {
+        let now = SystemTime::now();
+        let mut activity = sample(now);
+        activity.status.queue[0].exclusive = true;
+        let text = screen(
+            &Ok(activity.clone()),
+            &[],
+            now,
+            &mut View::default(),
+            (120, 40),
+        );
+        assert!(
+            text.contains("Exclusive build queued: later submissions wait"),
+            "{text}"
+        );
+        assert!(text.contains("exclusive"), "{text}");
+        activity.status.slots[0].build.as_mut().unwrap().exclusive = true;
+        let text = screen(&Ok(activity), &[], now, &mut View::default(), (120, 40));
+        assert!(
+            text.contains("Exclusive build active: all other builds wait"),
+            "{text}"
+        );
+        assert!(text.contains("testing (exclusive)"), "{text}");
     }
 
     #[test]

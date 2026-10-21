@@ -25,6 +25,7 @@ pub(crate) struct Placement {
     operation: Operation,
     copy_to: Option<PathBuf>,
     rerun_all: bool,
+    exclusive: bool,
 }
 
 impl Placement {
@@ -34,6 +35,7 @@ impl Placement {
             && self.operation == request.operation
             && self.copy_to == request.copy_to
             && self.rerun_all == request.rerun_all
+            && self.exclusive == request.exclusive
     }
 }
 
@@ -123,6 +125,7 @@ impl Router {
             operation: request.operation.clone(),
             copy_to: request.copy_to.clone(),
             rerun_all: request.rerun_all,
+            exclusive: request.exclusive,
         });
         self.placements
             .retain(|placement| placement.strong_count() > 0);
@@ -182,7 +185,10 @@ impl Router {
                         .iter()
                         .filter(|placement| placement.host == host.name)
                         .count();
-                    rank(source, host, capacity, assigned)
+                    let exclusive = live
+                        .iter()
+                        .any(|placement| placement.host == host.name && placement.exclusive);
+                    rank(source, request, host, capacity, assigned, exclusive)
                 })
                 .map(|(host, _)| host.name.clone())
                 .ok_or_else(|| {
@@ -298,10 +304,19 @@ impl Router {
                 .iter()
                 .filter(|placement| placement.host == plan.host.name)
                 .count();
-            let rank = plan
-                .forecast
-                .as_ref()
-                .map(|forecast| rank(source, &plan.host, &forecast.capacity, assigned));
+            let rank = plan.forecast.as_ref().map(|forecast| {
+                let exclusive = live
+                    .iter()
+                    .any(|placement| placement.host == plan.host.name && placement.exclusive);
+                rank(
+                    source,
+                    request,
+                    &plan.host,
+                    &forecast.capacity,
+                    assigned,
+                    exclusive,
+                )
+            });
             (
                 plan.exclusion.is_some(),
                 recommendation
@@ -342,9 +357,11 @@ impl Router {
 /// scheduling factors, not a prediction of end-to-end completion time.
 fn rank(
     source: &Source,
+    request: &BuildRequest,
     host: &Host,
     capacity: &Capacity,
     assigned: usize,
+    exclusive: bool,
 ) -> (bool, usize, bool, std::cmp::Reverse<u64>, String) {
     let status = &capacity.status;
     let observed = status
@@ -359,6 +376,12 @@ fn rank(
         .or(status.unmeasured_memory)
         .unwrap_or(status.memory);
     let starts = load < status.capacity
+        && !exclusive
+        && !status
+            .slots
+            .iter()
+            .any(|slot| slot.build.as_ref().is_some_and(|build| build.exclusive))
+        && (!request.exclusive || load == 0)
         && status.idle_jobs > 0
         && status.queue.is_empty()
         && (capacity.peak_memory.is_some() || status.unmeasured_memory.is_some() || load == 0)
@@ -415,6 +438,7 @@ mod tests {
             rerun_all: false,
             os: None,
             host: None,
+            exclusive: false,
             optional: false,
         }
     }
@@ -472,6 +496,62 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn in_flight_exclusive_work_keeps_later_requests_on_other_hosts() {
+        let home = TempDir::new();
+        let mut router = Router::load(&home.0).unwrap();
+        let mut hosts = vec![host("local", "macos", 100), host("pc", "linux", 100)];
+        for (_, capacity) in &mut hosts {
+            capacity.as_mut().unwrap().status.capacity = 4;
+        }
+        let mut exclusive = request();
+        exclusive.exclusive = true;
+        exclusive.host = Some("local".into());
+        let first = router
+            .place(&source("/a"), &revision("a"), &exclusive, &hosts)
+            .unwrap();
+        let ordinary = router
+            .place(&source("/a"), &revision("a"), &request(), &hosts)
+            .unwrap();
+        assert_eq!(first.host, "local");
+        assert_eq!(
+            ordinary.host, "pc",
+            "isolation applies before the host observes its build"
+        );
+        let shared = router
+            .place(&source("/b"), &revision("a"), &exclusive, &hosts)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &shared));
+        let planned = router.plan(&source("/c"), revision("c"), &request(), forecasts(&hosts));
+        assert_eq!(planned.recommended_host.as_deref(), Some("pc"));
+    }
+
+    #[test]
+    fn exclusive_work_prefers_an_idle_host_and_explicit_constraints_still_hold() {
+        let home = TempDir::new();
+        let mut router = Router::load(&home.0).unwrap();
+        let mut hosts = vec![host("local", "macos", 100), host("pc", "linux", 100)];
+        for (_, capacity) in &mut hosts {
+            capacity.as_mut().unwrap().status.capacity = 4;
+        }
+        let mut local = request();
+        local.host = Some("local".into());
+        let ordinary = router
+            .place(&source("/a"), &revision("a"), &local, &hosts)
+            .unwrap();
+        let mut exclusive = request();
+        exclusive.exclusive = true;
+        let placed = router
+            .place(&source("/a"), &revision("a"), &exclusive, &hosts)
+            .unwrap();
+        assert_eq!(placed.host, "pc");
+        exclusive.host = Some("local".into());
+        let pinned = router
+            .place(&source("/c"), &revision("c"), &exclusive, &hosts)
+            .unwrap();
+        assert_eq!(pinned.host, ordinary.host);
     }
 
     #[test]

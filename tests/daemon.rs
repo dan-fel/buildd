@@ -35,7 +35,7 @@ mod planning_end_to_end {
         assert_eq!(git(&repository.0, &["diff"]), unstaged);
 
         let output = Process::new(env!("CARGO_BIN_EXE_buildd"))
-            .args(["plan", "check", "--json"])
+            .args(["plan", "check", "--json", "--exclusive"])
             .current_dir(&repository.0)
             .env("BUILDD_HOME", &daemon.home.0)
             .output()
@@ -47,6 +47,15 @@ mod planning_end_to_end {
         );
         let json: buildd::protocol::Plan = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json.revision, plan.revision);
+        assert!(
+            json.hosts[0]
+                .forecast
+                .as_ref()
+                .unwrap()
+                .notes
+                .iter()
+                .any(|note| note.contains("runs alone"))
+        );
         assert_eq!(daemon.activity().totals.builds, 0);
         let output = Process::new(env!("CARGO_BIN_EXE_buildd"))
             .args(["plan", "check"])
@@ -919,9 +928,12 @@ impl RemoteHost {
     }
 
     fn for_os(os: &'static str) -> Self {
+        Self::with_remote(os, Daemon::start(1))
+    }
+
+    fn with_remote(os: &'static str, remote: Daemon) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let remote = Daemon::start(1);
         let commands = TempDir::new();
         let ssh = commands.0.join("ssh");
         std::fs::write(
@@ -952,6 +964,164 @@ impl RemoteHost {
             os,
             _commands: commands,
         }
+    }
+}
+
+mod exclusive_end_to_end {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc::{Receiver, channel};
+
+    fn submit(
+        daemon: &Daemon,
+        request: BuildRequest,
+    ) -> (std::thread::JoinHandle<Vec<Message>>, Receiver<Message>) {
+        let stream = daemon.connect();
+        let (events, received) = channel();
+        let client = std::thread::spawn(move || {
+            let mut messages = Vec::new();
+            client::build(stream, request, |message| {
+                messages.push(message.clone());
+                events.send(message.clone()).unwrap();
+            })
+            .unwrap();
+            messages
+        });
+        (client, received)
+    }
+
+    fn accept(listener: &UnixListener) -> UnixStream {
+        let mut ready = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the listener owns this live descriptor throughout poll.
+        assert_eq!(
+            unsafe { libc::poll(&raw mut ready, 1, 5000) },
+            1,
+            "command reaches its gate"
+        );
+        listener.accept().unwrap().0
+    }
+
+    fn queued(events: &Receiver<Message>) {
+        loop {
+            match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Message::Queued { .. } => return,
+                Message::Stderr { .. } => {} // Source-upload progress precedes admission.
+                other => panic!("expected queue admission, got {other:?}"),
+            }
+        }
+    }
+
+    fn holds_the_host(coordinator: &Daemon, building: &Daemon, host: &str) {
+        let first_repository = crate_repository(None);
+        let exclusive_repository = crate_repository(None);
+        let gates = TempDir::new();
+        let socket = gates.0.join("gate");
+        let gate = UnixListener::bind(&socket).unwrap();
+        let script = format!(
+            "import socket\ns=socket.socket(socket.AF_UNIX)\ns.connect({socket:?})\nassert s.recv(1)==b'x'\n"
+        );
+        let mut first = run_request(&first_repository.0, &["python3", "-c", &script]);
+        first.host = Some(host.into());
+        let (first, first_events) = submit(coordinator, first);
+        queued(&first_events);
+        let mut first_gate = accept(&gate);
+
+        let mut exclusive = run_request(&exclusive_repository.0, &["python3", "-c", &script]);
+        exclusive.host = Some(host.into());
+        exclusive.exclusive = true;
+        let (exclusive_client, exclusive_events) = submit(coordinator, exclusive.clone());
+        queued(&exclusive_events);
+        let plan = client::plan(coordinator.connect(), exclusive).unwrap();
+        let forecast = plan
+            .hosts
+            .iter()
+            .find(|plan| plan.host.name == host)
+            .unwrap()
+            .forecast
+            .as_ref()
+            .unwrap();
+        assert_eq!(forecast.queue_ms, None);
+        assert!(
+            forecast
+                .notes
+                .iter()
+                .any(|note| note.contains("all active builds"))
+        );
+
+        let mut later = run_request(&first_repository.0, &["true"]);
+        later.host = Some(host.into());
+        let (later_client, later_events) = submit(coordinator, later.clone());
+        queued(&later_events);
+        let status = building.status();
+        assert_eq!(status.capacity, 3);
+        assert_eq!(
+            status
+                .slots
+                .iter()
+                .filter(|slot| slot.build.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(status.queue.len(), 2);
+        assert!(status.queue[0].exclusive);
+        assert!(!status.queue[1].exclusive);
+
+        first_gate.write_all(b"x").unwrap();
+        let messages = first.join().unwrap();
+        assert!(outcome(&messages).success(), "{messages:?}");
+        let mut exclusive_gate = accept(&gate);
+        let status = building.status();
+        let active = status
+            .slots
+            .iter()
+            .filter_map(|slot| slot.build.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].exclusive);
+        assert_eq!(status.queue.len(), 1);
+        let plan = client::plan(coordinator.connect(), later).unwrap();
+        let forecast = plan
+            .hosts
+            .iter()
+            .find(|plan| plan.host.name == host)
+            .unwrap()
+            .forecast
+            .as_ref()
+            .unwrap();
+        assert!(
+            forecast
+                .notes
+                .iter()
+                .any(|note| note.contains("exclusive work holds admission"))
+        );
+
+        exclusive_gate.write_all(b"x").unwrap();
+        let messages = exclusive_client.join().unwrap();
+        assert!(outcome(&messages).success(), "{messages:?}");
+        let messages = later_client.join().unwrap();
+        assert!(outcome(&messages).success(), "{messages:?}");
+        assert!(building.status().queue.is_empty());
+    }
+
+    const CONFIG: &str = "slots = 3\njobs = 4\ntest_jobs = 1\nmin_free_gib = 0\nmemory_gib = 8\nunmeasured_memory_gib = 1\n";
+
+    #[test]
+    fn local_commands_reserve_all_repositories_despite_spare_slots_and_memory() {
+        let daemon = Daemon::configured(CONFIG);
+        holds_the_host(&daemon, &daemon, "local");
+    }
+
+    #[test]
+    fn remote_commands_enforce_isolation_at_the_building_daemon() {
+        let hosts = RemoteHost::with_remote(std::env::consts::OS, Daemon::configured(CONFIG));
+        holds_the_host(&hosts.local, &hosts.remote, "far");
+        assert!(hosts.local.status().slots.is_empty());
     }
 }
 
@@ -1056,6 +1226,7 @@ fn request(directory: &Path, command: Command, args: &[&str]) -> BuildRequest {
         label: None,
         copy_to: None,
         rerun_all: false,
+        exclusive: false,
         optional: false,
         os: None,
         host: None,
@@ -1952,6 +2123,7 @@ fn a_tree_pushed_into_a_mirror_builds_like_a_worktree_and_drain_stops_new_builds
             label: Some("remote".into()),
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: false,
         });
         ask(&request)

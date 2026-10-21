@@ -114,6 +114,8 @@ pub(crate) struct Submission {
     pub(crate) copy_to: Option<PathBuf>,
     /// Run test binaries that passed before and are unchanged too.
     pub(crate) rerun_all: bool,
+    /// Run alone on this host, across repositories.
+    pub(crate) exclusive: bool,
     /// Optional work: see [`crate::protocol::BuildRequest::optional`].
     pub(crate) optional: bool,
 }
@@ -212,6 +214,7 @@ struct Job {
     operation: Operation,
     copy_to: Option<PathBuf>,
     rerun_all: bool,
+    exclusive: bool,
     waiters: Vec<Waiter>,
     /// The job's place in the queue: the earliest submission it carries.
     order: u64,
@@ -510,6 +513,7 @@ impl Job {
             && self.operation.merged(&submission.operation).is_some()
             && self.copy_to == submission.copy_to
             && self.rerun_all == submission.rerun_all
+            && self.exclusive == submission.exclusive
     }
 
     fn queued(&self) -> bool {
@@ -669,6 +673,7 @@ impl<D: Distance> Scheduler<D> {
             label,
             copy_to,
             rerun_all,
+            exclusive,
             optional,
         } = submission;
         assert!(!self.waiting.contains_key(&waiter), "a waiter submits once");
@@ -731,6 +736,7 @@ impl<D: Distance> Scheduler<D> {
                     operation: operation.clone(),
                     copy_to,
                     rerun_all,
+                    exclusive,
                     waiters: Vec::new(),
                     order,
                     state: State::Queued,
@@ -803,9 +809,11 @@ impl<D: Distance> Scheduler<D> {
         let job = self.jobs.get_mut(&id).expect("a waiter's job is tracked");
         job.waiters.retain(|other| other.id != waiter);
         if !job.waiters.is_empty() {
-            return Vec::new();
+            // Withdrawing an ordinary waiter can make this optional again,
+            // moving an exclusive barrier behind ordinary queued work.
+            return self.start_ready();
         }
-        match &mut job.state {
+        let mut effects = match &mut job.state {
             State::Queued => {
                 let job = self.jobs.remove(&id).expect("found above");
                 vec![Effect::Report(EventKind::Dropped {
@@ -830,7 +838,9 @@ impl<D: Distance> Scheduler<D> {
                     }),
                 ]
             }
-        }
+        };
+        effects.extend(self.start_ready());
+        effects
     }
 
     /// A line of output of running job `id`.
@@ -1464,6 +1474,15 @@ impl<D: Distance> Scheduler<D> {
             if self.jobs[&id].optional() && (others_wait || self.capacity - busy < 2) {
                 continue;
             }
+            // An exclusive build is a host-wide queue barrier. Do not let
+            // later work prolong its wait while existing process groups end.
+            if self
+                .jobs
+                .values()
+                .any(|job| !job.queued() && (job.exclusive || self.jobs[&id].exclusive))
+            {
+                break;
+            }
             // A build that does not fit waits, and so does everything behind
             // it: smaller builds slipping past would keep it waiting for good.
             // An unmeasured build uses the host's explicit reservation, or
@@ -1660,6 +1679,12 @@ impl<D: Distance> Scheduler<D> {
     /// build minus time waited, so short builds go ahead and a long one goes
     /// once it has waited its own length; then submission order.
     fn queue_order(&self) -> Vec<JobId> {
+        let barriers = self
+            .jobs
+            .values()
+            .filter(|job| job.queued() && job.exclusive)
+            .map(|job| (job.optional(), job.order))
+            .collect::<Vec<_>>();
         let mut queued = self
             .jobs
             .iter()
@@ -1670,9 +1695,19 @@ impl<D: Distance> Scheduler<D> {
                     .estimate(job)
                     .or_else(|| typical(&self.slots, &job.repository))
                     .unwrap_or(0);
-                // Optional work comes after every other build.
+                // Keep the existing shortest-first policy between exclusive
+                // submissions, without letting later work cross a barrier.
+                // Optional work still comes after every ordinary build.
+                let barrier = barriers
+                    .iter()
+                    .filter(|(optional, order)| *optional == job.optional() && *order >= job.order)
+                    .map(|(_, order)| *order)
+                    .min()
+                    .unwrap_or(u64::MAX);
                 (
                     job.optional(),
+                    barrier,
+                    job.exclusive,
                     expected.saturating_sub(waited),
                     job.order,
                     *id,
@@ -1868,6 +1903,15 @@ impl<D: Distance> Scheduler<D> {
                 status.queue.len()
             ));
         }
+        if submission.exclusive {
+            if self.jobs.values().any(|job| !job.queued()) {
+                notes.push(
+                    "exclusive build waits for all active builds on this host to finish".into(),
+                );
+            }
+        } else if self.jobs.values().any(|job| job.exclusive) {
+            notes.push("exclusive work holds admission for later builds on this host".into());
+        }
         if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
             notes.push("all concurrent build capacity is occupied".into());
         }
@@ -2005,6 +2049,11 @@ impl<D: Distance> Scheduler<D> {
             notes.clear();
             notes.push(
                 "would join an identical running build without reserving more resources".into(),
+            );
+        }
+        if submission.exclusive {
+            notes.push(
+                "runs alone across every repository on this host; later submissions wait".into(),
             );
         }
         if submission.operation.command.uses_cargo() && !known {
@@ -2186,6 +2235,7 @@ impl<D: Distance> Scheduler<D> {
                         compiled: job.compiled,
                         fresh: job.fresh,
                         cancelled,
+                        exclusive: job.exclusive,
                         tokens,
                         phase: if copying {
                             Phase::Copying
@@ -2212,6 +2262,7 @@ impl<D: Distance> Scheduler<D> {
                     operation: job.operation.clone(),
                     who: job.who(),
                     waited_ms: job.waited_ms(),
+                    exclusive: job.exclusive,
                     estimate_ms: self.estimate(job),
                     held: job.hold.clone(),
                     memory_needed: job.memory_needed,
@@ -2403,6 +2454,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: false,
         })
     }
@@ -2427,6 +2479,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: false,
         })
     }
@@ -2445,6 +2498,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: true,
         })
     }
@@ -2505,6 +2559,7 @@ mod tests {
                 label: None,
                 copy_to: None,
                 rerun_all: false,
+                exclusive: false,
                 optional,
             });
             assert_eq!(starts(&effects).len(), usize::from(!optional));
@@ -2739,6 +2794,182 @@ mod tests {
         slot
     }
 
+    mod exclusive {
+        use super::*;
+
+        fn request(waiter: u64, repository: &str, tree: &str, exclusive: bool) -> Submission {
+            let mut source = source(&format!("/work/{waiter}"));
+            source.repository = repository.into();
+            Submission {
+                waiter: WaiterId(waiter),
+                source,
+                revision: revision(tree),
+                operation: check(),
+                label: None,
+                copy_to: None,
+                rerun_all: false,
+                exclusive,
+                optional: false,
+            }
+        }
+
+        #[test]
+        fn waits_for_every_repository_and_blocks_spare_capacity() {
+            let mut scheduler = scheduler(4);
+            scheduler.unmeasured_memory = Some(1);
+            let first = scheduler.submit(request(1, "/a", "a1", false));
+            let second = scheduler.submit(request(2, "/b", "b1", false));
+            let first = starts(&first)[0].0;
+            let second = starts(&second)[0].0;
+            assert!(starts(&scheduler.submit(request(3, "/c", "c1", true))).is_empty());
+            assert!(starts(&scheduler.submit(request(4, "/d", "d1", false))).is_empty());
+            let (_, queue) = scheduler.status(|_| 0);
+            assert!(queue[0].exclusive);
+            assert!(!queue[1].exclusive);
+            assert!(
+                starts(&scheduler.exited(first, &ok(), None, BuildReport::default())).is_empty()
+            );
+            let next = scheduler.exited(second, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            let [(exclusive, _, ref tree)] = starts(&next)[..] else {
+                panic!("only the exclusive build starts: {next:?}");
+            };
+            assert_eq!(tree, "c1");
+            let (slots, _) = scheduler.status(|_| 0);
+            assert_eq!(slots.iter().filter(|slot| slot.build.is_some()).count(), 1);
+            assert!(
+                slots
+                    .iter()
+                    .any(|slot| slot.build.as_ref().is_some_and(|build| build.exclusive))
+            );
+            assert!(starts(&scheduler.submit(request(5, "/e", "e1", false))).is_empty());
+            let next = scheduler.exited(exclusive, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            assert_eq!(
+                starts(&next).len(),
+                2,
+                "ordinary concurrency resumes: {next:?}"
+            );
+        }
+
+        #[test]
+        fn later_short_builds_cannot_overtake_exclusive_work() {
+            let mut scheduler = scheduler(4);
+            scheduler.unmeasured_memory = Some(1);
+            let first = scheduler.submit(request(1, "/a", "a1", false));
+            let job = starts(&first)[0].0;
+            assert!(starts(&scheduler.submit(request(2, "/a", "b1", true))).is_empty());
+            // Exact history makes the exclusive build much longer than the
+            // new work. Resource availability and shortest-first cannot bypass it.
+            scheduler.slots[0].compilations.push(CompilationRun {
+                compilation: Compilation::new(Path::new(""), &check()),
+                at: now(),
+                units: BTreeSet::new(),
+                build_ms: Some(1_000_000),
+                peak_memory: Some(1),
+                test_memory: None,
+            });
+            assert!(starts(&scheduler.submit(request(3, "/c", "c1", false))).is_empty());
+            assert!(starts(&scheduler.submit(request(4, "/d", "d1", true))).is_empty());
+            let next = scheduler.exited(job, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            let [(exclusive, _, ref tree)] = starts(&next)[..] else {
+                panic!("{next:?}");
+            };
+            assert_eq!(tree, "b1");
+            let next = scheduler.exited(exclusive, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            let [(ordinary, _, ref tree)] = starts(&next)[..] else {
+                panic!("work before the second barrier runs first: {next:?}");
+            };
+            assert_eq!(tree, "c1");
+            let next = scheduler.exited(ordinary, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            assert_eq!(starts(&next)[0].2, "d1");
+        }
+
+        #[test]
+        fn queued_withdrawal_releases_the_barrier_and_running_withdrawal_waits_for_exit() {
+            let mut scheduler = scheduler(4);
+            scheduler.unmeasured_memory = Some(1);
+            let first = scheduler.submit(request(1, "/a", "a1", false));
+            let first = starts(&first)[0].0;
+            scheduler.submit(request(2, "/b", "b1", true));
+            scheduler.submit(request(3, "/c", "c1", false));
+            let released = scheduler.withdraw(WaiterId(2));
+            let second = starts(&released)[0].0;
+            scheduler.exited(first, &ok(), None, BuildReport::default());
+            scheduler.exited(second, &ok(), None, BuildReport::default());
+            let next = scheduler.submit(request(4, "/d", "d1", true));
+            let next = complete_measurements(&mut scheduler, next);
+            let exclusive = starts(&next)[0].0;
+            scheduler.submit(request(5, "/e", "e1", false));
+            let cancelled = scheduler.withdraw(WaiterId(4));
+            assert!(
+                cancelled.iter().any(
+                    |effect| matches!(effect, Effect::Cancel { job, .. } if *job == exclusive)
+                )
+            );
+            assert!(starts(&cancelled).is_empty());
+            assert!(starts(&scheduler.maintain()).is_empty());
+            let released = scheduler.exited(
+                exclusive,
+                &Outcome::Signaled { signal: 15 },
+                None,
+                BuildReport::default(),
+            );
+            let released = complete_measurements(&mut scheduler, released);
+            assert_eq!(starts(&released)[0].2, "e1");
+        }
+
+        #[test]
+        fn shared_and_exclusive_requests_neither_join_nor_supersede_each_other() {
+            let mut scheduler = scheduler(4);
+            scheduler.unmeasured_memory = Some(1);
+            let first = scheduler.submit(request(1, "/a", "a1", false));
+            let first = starts(&first)[0].0;
+            let mut exclusive = request(2, "/a", "a1", true);
+            exclusive.source.worktree = "/work/1".into();
+            scheduler.submit(exclusive);
+            assert_eq!(scheduler.jobs.len(), 2);
+            let joined = scheduler.submit(request(3, "/a", "a1", true));
+            assert!(starts(&joined).is_empty());
+            assert_eq!(scheduler.jobs.len(), 2);
+            assert_eq!(scheduler.status(|_| 0).1[0].who.len(), 2);
+            let mut newer = request(5, "/a", "a2", false);
+            newer.source.worktree = "/work/1".into();
+            assert!(starts(&scheduler.submit(newer)).is_empty());
+            assert_eq!(scheduler.status(|_| 0).1[0].revision, revision("a1"));
+            let next = scheduler.exited(first, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            let exclusive = starts(&next)[0].0;
+            let joined = scheduler.submit(request(4, "/a", "a1", true));
+            assert!(matches!(sent(&joined, 4)[0], Message::Started { .. }));
+            let next = scheduler.exited(exclusive, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            assert_eq!(starts(&next)[0].2, "a2");
+        }
+
+        #[test]
+        fn optional_prewarming_waits_and_testing_and_copying_keep_the_host_exclusive() {
+            let mut scheduler = scheduler(4);
+            scheduler.unmeasured_memory = Some(1);
+            let mut exclusive = request(1, "/a", "a1", true);
+            exclusive.operation.command = Command::Test;
+            let next = scheduler.submit(exclusive);
+            let job = starts(&next)[0].0;
+            let mut optional = request(2, "/b", "b1", false);
+            optional.optional = true;
+            assert!(starts(&scheduler.submit(optional)).is_empty());
+            assert!(starts(&scheduler.testing(job)).is_empty());
+            scheduler.copying(job);
+            assert!(starts(&scheduler.maintain()).is_empty());
+            let next = scheduler.exited(job, &ok(), None, BuildReport::default());
+            let next = complete_measurements(&mut scheduler, next);
+            assert_eq!(starts(&next)[0].2, "b1");
+        }
+    }
+
     #[test]
     fn equal_requests_share_one_build_and_a_late_joiner_gets_the_output_so_far() {
         let mut scheduler = scheduler(1);
@@ -2808,6 +3039,7 @@ mod tests {
             label: None,
             copy_to: copy_to.map(PathBuf::from),
             rerun_all: false,
+            exclusive: false,
             optional: false,
         };
         let first = scheduler.submit(request(1, Some("/out"), &[]));
@@ -3077,6 +3309,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: false,
         });
         assert!(starts(&waiting).is_empty());
@@ -3313,6 +3546,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: false,
         });
         assert_eq!(starts(&other).len(), 1);
@@ -3437,6 +3671,7 @@ mod tests {
                 label: None,
                 copy_to: None,
                 rerun_all: false,
+                exclusive: false,
                 optional: false,
             };
             let (slots, queue) = scheduler.status(|_| 1);
@@ -4629,6 +4864,7 @@ mod tests {
             label: Some("agent-1".into()),
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: false,
         });
         let [(job, ..)] = starts(&first)[..] else {

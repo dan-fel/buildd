@@ -458,6 +458,7 @@ impl Connection {
                         label: request.label,
                         copy_to: request.copy_to,
                         rerun_all: request.rerun_all,
+                        exclusive: request.exclusive,
                         optional: request.optional,
                     })
                 });
@@ -541,6 +542,7 @@ impl Connection {
                                         label: request.label.clone(),
                                         copy_to: request.copy_to.clone(),
                                         rerun_all: request.rerun_all,
+                                        exclusive: request.exclusive,
                                         optional: request.optional,
                                     })
                                 })
@@ -561,6 +563,7 @@ impl Connection {
                                     label: request.label.clone(),
                                     copy_to: request.copy_to.clone(),
                                     rerun_all: request.rerun_all,
+                                    exclusive: request.exclusive,
                                     optional: request.optional,
                                 },
                                 requester,
@@ -681,6 +684,7 @@ impl Connection {
             label: request.label,
             copy_to: request.copy_to,
             rerun_all: request.rerun_all,
+            exclusive: request.exclusive,
             optional: request.optional,
         };
         self.submit(stream, reader, submission);
@@ -711,6 +715,7 @@ impl Connection {
             label,
             copy_to: request.copy_to,
             rerun_all: request.rerun_all,
+            exclusive: request.exclusive,
             optional: request.optional,
         };
         let pushing = format!(
@@ -863,6 +868,7 @@ impl Connection {
             label: request.label,
             copy_to: request.copy_to,
             rerun_all: request.rerun_all,
+            exclusive: request.exclusive,
             optional: request.optional,
         };
         self.submit(stream, reader, submission);

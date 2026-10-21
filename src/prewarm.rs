@@ -111,6 +111,7 @@ fn submit(home: &Path, prewarm: &Prewarm, worktree: &Path, build: &[String]) -> 
         rerun_all: false,
         os: prewarm.os.clone(),
         host: None,
+        exclusive: false,
         optional: true,
     };
     let home: PathBuf = home.to_owned();

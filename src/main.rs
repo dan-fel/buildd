@@ -34,9 +34,11 @@ usage:
                            since they passed (they are skipped otherwise)
         --os OS            use any enabled host running OS (linux, macos)
         --host NAME        use this configured host, or local
+        --exclusive        wait for active builds, then run alone on that host;
+                           later submissions wait even with spare capacity
       Without a constraint, use an enabled host with available capacity.
       Artifact exports without a host or OS constraint build locally.
-  buildd run [--json] [--copy-to DIR] [--os OS] [--host NAME] -- COMMAND [ARGS...]
+  buildd run [--json] [--copy-to DIR] [--os OS] [--host NAME] [--exclusive] -- COMMAND [ARGS...]
       Run COMMAND, not Cargo, on the same snapshot of this worktree a build
       would compile, in a build slot, queued and cancelled like builds, and
       exit with its status. It runs in the slot's checkout, in the
@@ -159,13 +161,14 @@ fn hosts(home: &Path, args: Vec<String>) -> Result<ExitCode, String> {
 }
 
 /// The names of buildd's own options of a build.
-const OPTIONS: [&str; 6] = [
+const OPTIONS: [&str; 7] = [
     "--json",
     "--copy-to",
     "--rustflags",
     "--rerun-all",
     "--os",
     "--host",
+    "--exclusive",
 ];
 
 /// buildd's own options of a build, which come before Cargo's arguments.
@@ -177,6 +180,7 @@ struct Options {
     rerun_all: bool,
     os: Option<String>,
     host: Option<String>,
+    exclusive: bool,
 }
 
 impl Options {
@@ -207,6 +211,7 @@ impl Options {
             match name {
                 "--json" if inline.is_none() => options.json = true,
                 "--rerun-all" if inline.is_none() => options.rerun_all = true,
+                "--exclusive" if inline.is_none() => options.exclusive = true,
                 "--copy-to" => options.copy_to = Some(value(&mut taken)?.into()),
                 "--os" => options.os = Some(value(&mut taken)?),
                 "--host" => options.host = Some(value(&mut taken)?),
@@ -278,6 +283,7 @@ fn build(
         rerun_all: options.rerun_all,
         os: options.os,
         host: options.host,
+        exclusive: options.exclusive,
         optional: false,
     };
     if planning {
@@ -678,6 +684,14 @@ fn status(home: &Path) -> Result<ExitCode, String> {
             gib(build_headroom)
         );
     }
+    if slots
+        .iter()
+        .any(|slot| slot.build.as_ref().is_some_and(|build| build.exclusive))
+    {
+        println!("exclusive build active: all other builds wait on this host");
+    } else if queue.iter().any(|build| build.exclusive) {
+        println!("exclusive build queued: later submissions wait on this host");
+    }
     for slot in slots {
         let worktree = slot.worktree.map_or_else(String::new, |worktree| {
             format!(" for {}", worktree.display())
@@ -687,7 +701,7 @@ fn status(home: &Path) -> Result<ExitCode, String> {
             .map_or_else(String::new, |size| format!(" [{}]", gib(size)));
         match slot.build {
             Some(build) => println!(
-                "slot {}{size}: {} {} for {} ({}, compiled {} reused {}{})",
+                "slot {}{size}: {} {} for {} ({}, compiled {} reused {}{}{})",
                 slot.name,
                 build.revision.short(),
                 build.operation,
@@ -695,6 +709,7 @@ fn status(home: &Path) -> Result<ExitCode, String> {
                 seconds(build.elapsed_ms),
                 build.compiled,
                 build.fresh,
+                if build.exclusive { ", exclusive" } else { "" },
                 if build.cancelled { ", cancelled" } else { "" },
             ),
             None => {
@@ -715,11 +730,12 @@ fn status(home: &Path) -> Result<ExitCode, String> {
             (None, None) => String::new(),
         };
         println!(
-            "queued {}: {} {} (waited {}{why}) for {}",
+            "queued {}: {} {} (waited {}{}{why}) for {}",
             position + 1,
             build.revision.short(),
             build.operation,
             seconds(build.waited_ms),
+            if build.exclusive { ", exclusive" } else { "" },
             build.who.join(", "),
         );
     }
@@ -855,6 +871,7 @@ mod tests {
                 rerun_all: false,
                 os: None,
                 host: None,
+                exclusive: false,
             }
         );
         assert_eq!(rest, ["--release", "--", "--json"]);
@@ -868,6 +885,24 @@ mod tests {
                 .0
                 .unwrap_err()
                 .contains("needs a value")
+        );
+    }
+
+    #[test]
+    fn exclusive_applies_to_builds_plans_and_runs_before_their_arguments() {
+        let (options, rest) = take(&["--host", "m4", "--exclusive", "-p", "app"]);
+        let options = options.unwrap();
+        assert!(options.exclusive);
+        assert_eq!(options.host.as_deref(), Some("m4"));
+        assert_eq!(rest, ["-p", "app"]);
+        assert!(take(&["-p", "app", "--exclusive"]).0.is_err());
+        assert!(take(&["--exclusive=true"]).0.is_err());
+        let (options, rest) = take(&["--exclusive", "--", "benchmark", "--exclusive"]);
+        let options = options.unwrap();
+        assert!(options.exclusive);
+        assert_eq!(
+            run_arguments(&options, rest).unwrap(),
+            ["benchmark", "--exclusive"]
         );
     }
 

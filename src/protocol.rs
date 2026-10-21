@@ -27,18 +27,21 @@ pub enum Request {
         operation: crate::cache::Operation,
     },
     /// Build the current content of the worktree holding `directory`.
-    // A new sender must be rejected by an older daemon that cannot honor
-    // host constraints. Existing clients without that field still submit.
-    #[serde(rename = "schedule", alias = "build")]
+    // Older daemons ignore unknown fields. Version these requests so they
+    // reject exclusive work instead of silently running it concurrently.
+    #[serde(rename = "schedule_v2", alias = "schedule", alias = "build")]
     Build(BuildRequest),
     /// Explain placement for this worktree's current content without
     /// submitting, reserving capacity, or transferring its source.
+    #[serde(rename = "plan_v2", alias = "plan")]
     Plan(BuildRequest),
     /// A remote host's forecast. The tree need not have been pushed yet;
     /// source comparisons that cannot be made remain unknown.
+    #[serde(rename = "plan_revision_v2", alias = "plan_revision")]
     PlanRevision(RevisionRequest),
     /// Build a tree another machine's daemon pushed into this daemon's
     /// mirror of a project; answered like [`Request::Build`].
+    #[serde(rename = "build_revision_v2", alias = "build_revision")]
     BuildRevision(RevisionRequest),
     /// The bare repository this daemon keeps for `project`, created when
     /// absent: where another daemon pushes trees. Answered with one
@@ -162,6 +165,10 @@ pub struct BuildRequest {
     /// matching `os`. Artifact exports without an OS or host stay local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Run alone on the selected host, across all repositories. Existing
+    /// builds finish first; later submissions wait until this build ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusive: bool,
     /// Optional work, such as prewarming a branch: it waits behind every
     /// other build and starts only while another slot stays free. A build
     /// anyone else asks for is no longer optional.
@@ -202,6 +209,9 @@ pub struct RevisionRequest {
     pub copy_to: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rerun_all: bool,
+    /// Host-wide isolation, as [`BuildRequest::exclusive`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusive: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
 }
@@ -524,6 +534,9 @@ pub struct RunningBuild {
     pub fresh: u64,
     /// Nobody waits for it any more; it is being stopped.
     pub cancelled: bool,
+    /// This build owns the host until its processes and cleanup finish.
+    #[serde(default)]
+    pub exclusive: bool,
     /// Jobs of the budget it uses now: Cargo's own and the tokens its
     /// processes took, and at least the tests' share while its tests run.
     #[serde(default)]
@@ -552,6 +565,9 @@ pub struct QueuedBuild {
     /// Who waits for it, one entry per request it serves.
     pub who: Vec<String>,
     pub waited_ms: u64,
+    /// This build will run alone on the host.
+    #[serde(default)]
+    pub exclusive: bool,
     /// How long it is expected to take, from earlier builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_ms: Option<u64>,
@@ -804,6 +820,7 @@ mod tests {
             label: None,
             copy_to: None,
             rerun_all: false,
+            exclusive: false,
             optional: false,
             os: None,
             host: None,
@@ -811,9 +828,50 @@ mod tests {
         let text = serde_json::to_string(&request).unwrap();
         assert_eq!(
             text,
-            r#"{"type":"schedule","directory":"/work","operation":{"command":"check","args":["-p","a"]}}"#
+            r#"{"type":"schedule_v2","directory":"/work","operation":{"command":"check","args":["-p","a"]}}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), request);
+        assert_eq!(
+            serde_json::from_str::<Request>(&text.replace("schedule_v2", "schedule")).unwrap(),
+            request
+        );
+        let Request::Build(mut input) = request else {
+            unreachable!()
+        };
+        input.exclusive = true;
+        let revision = RevisionRequest {
+            project: "fixture".into(),
+            revision: serde_json::from_value(serde_json::json!("abc")).unwrap(),
+            worktree: input.directory.clone(),
+            prefix: PathBuf::new(),
+            operation: input.operation.clone(),
+            label: None,
+            copy_to: None,
+            rerun_all: false,
+            exclusive: true,
+            optional: false,
+        };
+        // The previous tags are the only ones an older daemon understands.
+        // Unknown fields alone cannot protect the isolation guarantee.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PreviousRequest {
+            Schedule,
+            Plan,
+            BuildRevision,
+            PlanRevision,
+        }
+        for request in [
+            Request::Build(input.clone()),
+            Request::Plan(input),
+            Request::BuildRevision(revision.clone()),
+            Request::PlanRevision(revision),
+        ] {
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["exclusive"], true);
+            assert!(serde_json::from_value::<PreviousRequest>(value.clone()).is_err());
+            assert_eq!(serde_json::from_value::<Request>(value).unwrap(), request);
+        }
         assert_eq!(
             serde_json::to_string(&Request::Status).unwrap(),
             r#"{"type":"status"}"#

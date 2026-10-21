@@ -26,6 +26,7 @@ buildd test -p my-crate -- some_test  # same arguments as cargo
 buildd nextest --workspace            # every test in its own process
 buildd test --os linux --workspace    # on a remote Linux host
 buildd test --host air -p my-crate    # require a particular host
+buildd test --host m4 --exclusive -p my-crate # run alone on m4
 buildd hosts disable local           # steer new builds away from this machine
 buildd run --os linux -- ./image.sh   # any command, on the same snapshot
 buildd status                         # one-shot summary
@@ -36,6 +37,38 @@ buildd failures                       # what failed lately, and why
 
 Set `BUILDD_LABEL` (an agent's or task's name) so `status` and `top` show
 who asked. Otherwise a request is named after its worktree's folder.
+
+### Run alone on a host
+
+Use `--exclusive` before Cargo's arguments, or before `--` for `run`:
+
+```sh
+buildd test --host m4 --exclusive -p my-crate
+buildd run --host m4 --exclusive -- ./benchmark.sh
+buildd plan test --json --host m4 --exclusive -p my-crate
+```
+
+`m4` must be a configured host name; use `--host local` for this machine.
+Without `--host`, normal automatic placement chooses the host to reserve.
+The selected host's daemon waits for active builds to finish, then runs the
+exclusive request alone across all repositories, even with spare slots, CPU
+and memory. Later submissions cannot overtake it while the host becomes idle.
+Other hosts can keep building. This governs work managed by that daemon;
+unrelated processes on the machine are unaffected.
+
+The reservation lasts through tests, artifact copying, and cancellation
+cleanup. Completion or withdrawal releases it automatically. Identical
+exclusive requests can share one build; shared and exclusive requests never
+merge. Optional prewarming remains behind ordinary work. `status`, `top`,
+and `plan` show exclusivity; planning itself reserves nothing.
+
+Upgrade and restart the coordinator and building daemons before using this
+version. Build and plan request tags are now `schedule_v2`,
+`build_revision_v2`, `plan_v2`, and `plan_revision_v2`: older daemons reject
+new clients rather than ignoring isolation. Updated daemons still accept the
+previous tags, defaulting absent `exclusive` to false. No stored data changes.
+Let active work finish before restarting a daemon; restarting interrupts its
+running builds and connections.
 
 ## Plan a build
 
