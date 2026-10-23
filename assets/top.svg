@@ -1,32 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="708" height="548" viewBox="0 0 708 548">
 <title>buildd top: rendered test fixture showing remote work and a memory wait</title>
+<style>text { white-space: pre; }</style>
 <rect width="708" height="548" rx="10" fill="#1b1d23"/>
 <circle cx="20" cy="17" r="6" fill="#ff5f57"/><circle cx="40" cy="17" r="6" fill="#febc2e"/><circle cx="60" cy="17" r="6" fill="#28c840"/>
-<g font-family="SF Mono, Menlo, Consolas, DejaVu Sans Mono, monospace" font-size="14" fill="#d7dae0" xml:space="preserve">
-<text x="18" y="52" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">┌ buildd · up 1h0m ────────────────────────────────────────────────────────────┐</text>
-<text x="18" y="71" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│local (linux)  0/2 running · 0 queued · CPU jobs 0/12 · 0 idle caches         │</text>
-<text x="18" y="90" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│  peak estimate 0.0/18.0 GiB · cache 0.0/40.0 GiB · disk 64.0 GiB free        │</text>
-<text x="18" y="109" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│pc (linux)  1/2 running · 1 queued · CPU jobs 4/12 · 100 idle caches          │</text>
-<text x="18" y="128" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#e06c75">│  peak estimate 15.0/10.0 GiB · cache 24.0/40.0 GiB · disk 100.0 GiB free     │</text>
-<text x="18" y="147" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#e5c07b">│  Memory queue: next build needs 6.0 GiB; budget remaining 0.0 GiB            │</text>
-<text x="18" y="166" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">└──────────────────────────────────────────────────────────────────────────────┘</text>
-<text x="18" y="185" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">┌ work ────────────────────────────────────────────────────────────────────────┐</text>
-<text x="18" y="204" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#56b6c2">│ACTIVE  1                                                                     │</text>
-<text x="18" y="223" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│pc app-c716/0  testing · 4.2 s · 4 jobs  check · app-ui                       │</text>
-<text x="18" y="242" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#7f848e">│    agent-1, agent-7 @ 7f3a9c0d1e · compiled 3 · reused 412 · shared by 2     │</text>
-<text x="18" y="261" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│                                                                              │</text>
-<text x="18" y="280" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#e5c07b">│QUEUED  1                                                                     │</text>
-<text x="18" y="299" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#e5c07b">│pc #1  waited 13m29s  check · app-protocol                                    │</text>
-<text x="18" y="318" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#e5c07b">│    agent-5 @ 3d2e000000 · waiting for memory (needs 6.0 GiB) · build ~40 s   │</text>
-<text x="18" y="337" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│                                                                              │</text>
-<text x="18" y="356" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│RECENT EVENTS                                                                 │</text>
-<text x="18" y="375" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│15:23:54  pc  agent-7 joined check · app-ui @ 7f3a9c0d1e: no extra Cargo run  │</text>
-<text x="18" y="394" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│15:23:52  pc  app-c716/1 gave up 31 units, 4 caches, 1 test files: 2.0 GiB for│</text>
-<text x="18" y="413" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│1.5 GiB over budget                                                           │</text>
-<text x="18" y="432" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│15:23:51  pc  app-c716/1 finished check · app-core in 2.1 s: compiled 2,      │</text>
-<text x="18" y="451" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│reused 233, CPU 3.4 s                                                         │</text>
-<text x="18" y="470" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│                                                                              │</text>
-<text x="18" y="489" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">│                                                                              │</text>
-<text x="18" y="508" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#d7dae0">└──────────────────────────────────────────────────────────────────────────────┘</text>
-<text x="18" y="527" textLength="672" lengthAdjust="spacingAndGlyphs" fill="#7f848e"> q quit · ↑↓/PgUp/PgDn scroll · d commands:off · i idle:off · s stats:off  1/14 </text>
+<g font-family="SF Mono, Menlo, Consolas, DejaVu Sans Mono, monospace" font-size="14" fill="#d7dae0">
+<text x="18" y="52" fill="#d7dae0">┌ buildd · up 1h0m ────────────────────────────────────────────────────────────┐</text>
+<text x="18" y="71" fill="#d7dae0">│local (linux)  0/2 running · 0 queued · CPU jobs 0/12 · 0 idle caches         │</text>
+<text x="18" y="90" fill="#d7dae0">│  peak estimate 0.0/18.0 GiB · cache 0.0/40.0 GiB · disk 64.0 GiB free        │</text>
+<text x="18" y="109" fill="#d7dae0">│pc (linux)  1/2 running · 1 queued · CPU jobs 4/12 · 100 idle caches          │</text>
+<text x="18" y="128" fill="#e06c75">│  peak estimate 15.0/10.0 GiB · cache 24.0/40.0 GiB · disk 100.0 GiB free     │</text>
+<text x="18" y="147" fill="#e5c07b">│  Memory queue: next build needs 6.0 GiB; budget remaining 0.0 GiB            │</text>
+<text x="18" y="166" fill="#d7dae0">└──────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="18" y="185" fill="#d7dae0">┌ work ────────────────────────────────────────────────────────────────────────┐</text>
+<text x="18" y="204" fill="#56b6c2">│ACTIVE  1                                                                     │</text>
+<text x="18" y="223" fill="#d7dae0">│pc app-c716/0  testing · 4.2 s · 4 jobs  check · app-ui                       │</text>
+<text x="18" y="242" fill="#7f848e">│    agent-1, agent-7 @ 7f3a9c0d1e · compiled 3 · reused 412 · shared by 2     │</text>
+<text x="18" y="261" fill="#d7dae0">│                                                                              │</text>
+<text x="18" y="280" fill="#e5c07b">│QUEUED  1                                                                     │</text>
+<text x="18" y="299" fill="#e5c07b">│pc #1  waited 13m29s  check · app-protocol                                    │</text>
+<text x="18" y="318" fill="#e5c07b">│    agent-5 @ 3d2e000000 · waiting for memory (needs 6.0 GiB) · build ~40 s   │</text>
+<text x="18" y="337" fill="#d7dae0">│                                                                              │</text>
+<text x="18" y="356" fill="#d7dae0">│RECENT EVENTS                                                                 │</text>
+<text x="18" y="375" fill="#d7dae0">│15:23:54  pc  agent-7 joined check · app-ui @ 7f3a9c0d1e: no extra Cargo run  │</text>
+<text x="18" y="394" fill="#d7dae0">│15:23:52  pc  app-c716/1 gave up 31 units, 4 caches, 1 test files: 2.0 GiB for│</text>
+<text x="18" y="413" fill="#d7dae0">│1.5 GiB over budget                                                           │</text>
+<text x="18" y="432" fill="#d7dae0">│15:23:51  pc  app-c716/1 finished check · app-core in 2.1 s: compiled 2,      │</text>
+<text x="18" y="451" fill="#d7dae0">│reused 233, CPU 3.4 s                                                         │</text>
+<text x="18" y="470" fill="#d7dae0">│                                                                              │</text>
+<text x="18" y="489" fill="#d7dae0">│                                                                              │</text>
+<text x="18" y="508" fill="#d7dae0">└──────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="18" y="527" fill="#7f848e"> q quit · ↑↓/PgUp/PgDn scroll · d commands:off · i idle:off · s stats:off  1/14 </text>
 </g></svg>
