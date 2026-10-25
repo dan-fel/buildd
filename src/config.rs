@@ -264,9 +264,21 @@ pub fn home() -> Result<PathBuf, String> {
         }
         return Ok(home);
     }
-    directories::BaseDirs::new()
-        .map(|directories| directories.cache_dir().join("buildd"))
+    default_home(std::env::home_dir(), std::env::var_os("XDG_CACHE_HOME"))
         .ok_or_else(|| "the user has no home directory".to_owned())
+}
+
+fn default_home(home: Option<PathBuf>, xdg_cache: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let home = home.filter(|path| !path.as_os_str().is_empty())?;
+    let cache = if cfg!(target_os = "macos") {
+        home.join("Library/Caches")
+    } else {
+        xdg_cache
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".cache"))
+    };
+    Some(cache.join("buildd"))
 }
 
 /// The daemon's socket in `home`.
@@ -279,6 +291,31 @@ pub fn socket(home: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::snapshot::tests::TempDir;
+
+    #[test]
+    fn default_home_requires_an_account_home_even_with_an_xdg_override() {
+        for home in [None, Some(PathBuf::new())] {
+            assert_eq!(default_home(home, Some("/cache".into())), None);
+        }
+    }
+
+    #[test]
+    fn default_home_preserves_native_cache_locations_and_xdg_rules() {
+        for xdg in [None, Some(""), Some("relative"), Some("/cache")] {
+            let home = PathBuf::from("/users/example");
+            let expected = if cfg!(target_os = "macos") {
+                home.join("Library/Caches/buildd")
+            } else if xdg == Some("/cache") {
+                PathBuf::from("/cache/buildd")
+            } else {
+                home.join(".cache/buildd")
+            };
+            assert_eq!(
+                default_home(Some(home), xdg.map(Into::into)),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn settings_default_and_reject_nonpositive_and_unknown_keys() {
