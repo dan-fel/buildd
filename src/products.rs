@@ -36,8 +36,12 @@ pub(crate) fn copy(products: &[Product], directory: &Path) -> Result<Vec<String>
         .map(|product| {
             for file in &product.files {
                 let to = directory.join(file_name(file)?);
-                install(&to, |partial| copy_tree(file, partial))
-                    .map_err(|error| failed("copy", file, &to, &error))?;
+                // Cargo names an uplifted file, which may link to the one it
+                // built in `deps`: the copy is what it names, not the link.
+                install(&to, |partial| {
+                    copy_tree(&std::fs::canonicalize(file)?, partial)
+                })
+                .map_err(|error| failed("copy", file, &to, &error))?;
             }
             Ok(rewrite(&product.message, directory))
         })
@@ -167,8 +171,12 @@ mod tests {
         let executable = slot.join(name);
         let symbols = slot.join(format!("{name}.dSYM"));
         std::fs::write(&executable, name).unwrap();
-        std::fs::create_dir_all(symbols.join("Contents")).unwrap();
-        std::fs::write(symbols.join("Contents/Info.plist"), "plist").unwrap();
+        // As Cargo uplifts packed symbols: a relative link to those it built
+        // in `deps`.
+        let built = format!("deps/{name}-0123456789abcdef.dSYM");
+        std::fs::create_dir_all(slot.join(&built).join("Contents")).unwrap();
+        std::fs::write(slot.join(&built).join("Contents/Info.plist"), "plist").unwrap();
+        std::os::unix::fs::symlink(&built, &symbols).unwrap();
         let message = serde_json::json!({
             "reason": "compiler-artifact",
             "target": {"name": name},
@@ -199,6 +207,12 @@ mod tests {
             "plist"
         );
         assert!(!destination.join("app.dSYM/stale").exists());
+        assert!(
+            std::fs::symlink_metadata(destination.join("tool.dSYM"))
+                .unwrap()
+                .is_dir(),
+            "a linked product is copied as what it names"
+        );
         let first: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         assert_eq!(
             first["executable"],
