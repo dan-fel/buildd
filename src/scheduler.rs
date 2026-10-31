@@ -41,13 +41,28 @@
 //!   once [`MEASURE_DUE`] builds went unmeasured, so disk stays known under
 //!   constant load. What an idle slot's target holds stays true until its
 //!   next build.
+//! - **Disk admission.** A build starts only while free disk covers the
+//!   volume's floor, what running builds reserve for their output, and
+//!   what it is expected to add itself: the larger of what its kind of
+//!   build (its compilation, else the same command in the same directory)
+//!   last added to the slot it takes, and how far that slot is below the
+//!   size it had after that build. A slot without such history, or a new
+//!   one, assumes the host's `build_headroom`. Growth is measured when
+//!   exactly one build ran between two measurements of its slot.
 //! - **Eviction.** When the slots' targets are over their budget, or free
 //!   disk cannot cover its floor and build output reservations, idle slots
-//!   give up what builds used longest ago. Maintenance has first claim on
-//!   idle slots before any queued build starts. Pressure forces measurement
-//!   of dirty idle slots; a failed scan holds admission until it recovers.
-//!   A breached volume floor stops running process groups with a resource
-//!   failure. Only after they exit can their artifacts be reclaimed.
+//!   give up what builds used longest ago; never the slot a build is being
+//!   admitted to, whose artifacts it would only compile again. Maintenance
+//!   has first claim on idle slots before any queued build starts. Pressure
+//!   forces measurement of dirty idle slots; a failed scan holds admission
+//!   until it recovers. A breached volume floor stops running process
+//!   groups with a resource failure. Only after they exit can their
+//!   artifacts be reclaimed.
+//! - **Waiting.** Every queued build knows why it waits, and its clients
+//!   hear it when it first waits and whenever the reason changes. When
+//!   free disk is short, no build runs and idle artifacts cannot cover the
+//!   shortfall, only someone freeing space helps: after `disk_wait` of
+//!   that, a build that does not fit is refused instead of waiting on.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,10 +71,13 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cargo::{Compilation, Operation};
 use crate::passed::PassedBinary;
 use crate::protocol::{
-    BuildReport, Capacity, Chore, DiskWait, EventKind, Forecast, Hold, LastBuild, Message, Outcome,
-    Phase, QueuedBuild, RunningBuild, Shortage, SlotPlan, SlotStatus, Usage,
+    BuildReport, Capacity, Chore, DiskWait, EventKind, Forecast, Growth, Headroom, Hold, LastBuild,
+    Message, Outcome, Phase, QueuedBuild, RunningBuild, Shortage, SlotPlan, SlotStatus, Usage,
+    Wait,
 };
-use crate::slot::{CompilationRun, Evictable, Inventory, Kind, LastUse, SlotRecord, slot_name};
+use crate::slot::{
+    CompilationRun, DiskUse, Evictable, Inventory, Kind, LastUse, SlotRecord, slot_name,
+};
 use crate::snapshot::{Revision, Source};
 
 /// How long a slot stays idle before its target is measured.
@@ -229,10 +247,9 @@ struct Job {
     /// The compiled units it used so far, each with its place in the order
     /// Cargo reported them.
     units: HashMap<String, usize>,
-    /// It waits for a busy slot although another is idle, and why.
-    hold: Option<Hold>,
-    /// It waits for memory: what it is expected to need at its peak.
-    memory_needed: Option<u64>,
+    /// Why it waits, while it is queued: what its clients last heard, with
+    /// the latest numbers.
+    wait: Option<Wait>,
     /// Test binaries it did not run: unchanged since they passed.
     skipped: u64,
 }
@@ -250,6 +267,8 @@ enum State {
         cancelled: bool,
         /// Measured peak, or None while learning under the host's reservation.
         memory: Option<u64>,
+        /// Free disk reserved for its output: what it was expected to add.
+        disk: u64,
     },
 }
 
@@ -277,6 +296,10 @@ struct Slot {
     /// Its target's disk usage when last measured, less what it gave up
     /// since.
     size: Option<u64>,
+    /// The compilation of its latest build and its target's measured size
+    /// when that build started, while that build is the only one since the
+    /// measurement: the next measurement tells what it added.
+    growing: Option<(Compilation, u64)>,
     /// What its target holds, from its measurement since its latest build.
     inventory: Option<Inventory>,
     maintenance_error: Option<String>,
@@ -371,11 +394,57 @@ impl Slot {
                 build_ms: succeeded.then_some(build_ms),
                 peak_memory: usage.map(|usage| usage.peak_memory),
                 test_memory: usage.and_then(|usage| usage.test_memory),
+                disk: None,
             }),
         }
         while self.compilations.len() > KEPT_COMPILATIONS {
             self.compilations.remove(0);
         }
+    }
+
+    /// Its latest build of `compilation` left its target at `disk`.
+    fn grew(&mut self, compilation: Compilation, disk: DiskUse) {
+        match self
+            .compilations
+            .iter_mut()
+            .find(|run| run.compilation == compilation)
+        {
+            Some(run) => run.disk = Some(disk),
+            None => {
+                self.compilations.push(CompilationRun {
+                    compilation,
+                    at: now(),
+                    units: std::collections::BTreeSet::new(),
+                    build_ms: None,
+                    peak_memory: None,
+                    test_memory: None,
+                    disk: Some(disk),
+                });
+                if self.compilations.len() > KEPT_COMPILATIONS {
+                    self.compilations.remove(0);
+                }
+            }
+        }
+    }
+
+    /// What a build of `compilation` is expected to add to its target, as
+    /// far as its history tells: the larger of what the latest measured
+    /// build of the compilation (else of the same command in the same
+    /// directory) added, and how far the target is below the size that
+    /// build left. A target of unknown size counts as empty.
+    fn growth(&self, compilation: &Compilation) -> Option<u64> {
+        let size = self.size.unwrap_or(0);
+        let expected = |alike: &dyn Fn(&Compilation) -> bool| {
+            self.compilations
+                .iter()
+                .filter(|run| alike(&run.compilation))
+                .filter_map(|run| run.disk)
+                .map(|disk| disk.added.max(disk.total.saturating_sub(size)))
+                .max()
+        };
+        expected(&|run| run == compilation).or_else(|| {
+            expected(&|run| run.prefix == compilation.prefix && run.command == compilation.command)
+        })
     }
 
     fn persist(&self) -> Effect {
@@ -495,6 +564,11 @@ pub(crate) struct Scheduler<D> {
     /// cannot authorize a build.
     free_disk: Option<u64>,
     disk_wait: Option<DiskWait>,
+    /// How long admission waits for disk only someone freeing space can
+    /// provide before refusing builds that do not fit.
+    disk_wait_limit: Duration,
+    /// Since when admission has waited for such disk.
+    disk_stalled: Option<Instant>,
 }
 
 impl Job {
@@ -520,6 +594,14 @@ impl Job {
 
     fn queued(&self) -> bool {
         matches!(self.state, State::Queued)
+    }
+
+    /// The busy slot it waits for although another is idle.
+    fn held(&self) -> Option<&Hold> {
+        match &self.wait {
+            Some(Wait::Warm { hold }) => Some(hold),
+            _ => None,
+        }
     }
 
     /// Whether only optional work waits for it.
@@ -590,6 +672,8 @@ impl<D: Distance> Scheduler<D> {
             build_headroom: config.build_headroom,
             free_disk: None,
             disk_wait: None,
+            disk_wait_limit: config.disk_wait,
+            disk_stalled: None,
         }
     }
 
@@ -643,6 +727,7 @@ impl<D: Distance> Scheduler<D> {
             unmeasured: 1,
             idle_since: Instant::now(),
             size: None,
+            growing: None,
             inventory: None,
             maintenance_error: None,
             last: None,
@@ -746,8 +831,7 @@ impl<D: Distance> Scheduler<D> {
                     compiled: 0,
                     fresh: 0,
                     units: HashMap::new(),
-                    hold: None,
-                    memory_needed: None,
+                    wait: None,
                     skipped: 0,
                 },
             );
@@ -783,12 +867,12 @@ impl<D: Distance> Scheduler<D> {
     fn greeting(&self, id: JobId, waiter: WaiterId) -> Vec<Effect> {
         let job = &self.jobs[&id];
         match job.state {
-            State::Queued => vec![Effect::Send {
-                waiter,
-                message: Message::Queued {
-                    revision: job.revision.clone(),
-                },
-            }],
+            State::Queued => std::iter::once(Message::Queued {
+                revision: job.revision.clone(),
+            })
+            .chain(job.wait.clone().map(|wait| Message::Waiting { wait }))
+            .map(|message| Effect::Send { waiter, message })
+            .collect(),
             State::Running { slot, .. } => {
                 let started = Message::Started {
                     revision: job.revision.clone(),
@@ -1003,6 +1087,10 @@ impl<D: Distance> Scheduler<D> {
                 usage,
             );
         }
+        // What a killed or cancelled build added says little about the next.
+        if !matches!(outcome, Outcome::Exited { .. }) {
+            entry.growing = None;
+        }
         let persist = entry.persist();
         entry.job = None;
         entry.unmeasured += 1;
@@ -1139,6 +1227,7 @@ impl<D: Distance> Scheduler<D> {
             slot.passed.clear();
             slot.compilations.clear();
             slot.size = None;
+            slot.growing = None;
             slot.inventory = None;
             slot.maintenance_error = None;
             slot.duplicated = None;
@@ -1217,10 +1306,21 @@ impl<D: Distance> Scheduler<D> {
                 }
                 slot.duplicated = Some(crates);
                 slot.size = Some(inventory.total);
+                if let Some((compilation, before)) = slot.growing.take() {
+                    slot.grew(
+                        compilation,
+                        DiskUse {
+                            added: inventory.total.saturating_sub(before),
+                            total: inventory.total,
+                        },
+                    );
+                    effects.push(slot.persist());
+                }
                 slot.inventory = Some(inventory);
             }
             Err(error) => {
                 slot.size = None;
+                slot.growing = None;
                 slot.inventory = None;
                 slot.maintenance_error = Some(error);
                 // Filesystem failures hold admission. A quiet-period scan
@@ -1239,10 +1339,10 @@ impl<D: Distance> Scheduler<D> {
     }
 
     /// Chooses what idle slots give up to cover `shortage`: what builds used
-    /// longest ago first, across every measured idle slot. None while an
-    /// eviction is under way, or when no idle slot has anything to give up.
-    /// The slots it chooses from are busy until [`Self::evicted`].
-    pub(crate) fn evict(&mut self, shortage: Shortage) -> Option<Effect> {
+    /// longest ago first, across every measured idle slot but `keep`. None
+    /// while an eviction is under way, or when no such slot has anything to
+    /// give up. The slots it chooses from are busy until [`Self::evicted`].
+    pub(crate) fn evict(&mut self, shortage: Shortage, keep: Option<usize>) -> Option<Effect> {
         let needed = shortage.needed();
         assert!(needed > 0, "an eviction covers a shortage");
         if self.evicting.is_some() {
@@ -1252,7 +1352,7 @@ impl<D: Distance> Scheduler<D> {
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| !slot.busy())
+            .filter(|(index, slot)| !slot.busy() && keep != Some(*index))
             .filter_map(|(index, slot)| Some((index, slot, slot.inventory.as_ref()?)))
             .flat_map(|(index, slot, inventory)| {
                 inventory
@@ -1270,7 +1370,7 @@ impl<D: Distance> Scheduler<D> {
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| !slot.busy())
+            .filter(|(index, slot)| !slot.busy() && keep != Some(*index))
         {
             let Some(inventory) = &slot.inventory else {
                 continue;
@@ -1412,7 +1512,7 @@ impl<D: Distance> Scheduler<D> {
 
     /// Starts queued builds, next first, while slots are free. A build that
     /// waits for its repository's slot lets later builds of other
-    /// repositories go first.
+    /// repositories go first. Every build left queued learns why it waits.
     fn start_ready(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         if let Some(free) = self.free_disk.filter(|free| *free < self.min_free) {
@@ -1440,12 +1540,19 @@ impl<D: Distance> Scheduler<D> {
                 }
             }
         }
-        self.disk_wait = self.keep_disk(0, &mut effects);
-        if self.disk_wait.is_some() {
-            for job in self.jobs.values_mut().filter(|job| job.queued()) {
-                job.memory_needed = None;
-                job.hold = None;
+        let mut waits = HashMap::new();
+        self.disk_wait = self.keep_disk(None, &mut effects);
+        if let Some(wait) = self.disk_wait.clone() {
+            let refuse = self.disk_stalled(&wait);
+            let queued = self.queue_order();
+            for id in queued {
+                if refuse {
+                    effects.extend(self.refuse(id, &wait));
+                } else {
+                    waits.insert(id, Wait::Disk { disk: wait.clone() });
+                }
             }
+            effects.extend(self.tell(waits));
             return effects;
         }
         let mut in_use = self.memory_in_use();
@@ -1459,21 +1566,24 @@ impl<D: Distance> Scheduler<D> {
             .jobs
             .values()
             .any(|job| job.queued() && !job.optional());
-        // Queue reasons belong to this pass. Remember earlier holds only to
-        // avoid reporting the same decision again while it remains valid.
-        let mut previously_held = HashSet::new();
-        for (id, job) in self.jobs.iter_mut().filter(|(_, job)| job.queued()) {
-            job.memory_needed = None;
-            if job.hold.take().is_some() {
-                previously_held.insert(*id);
-            }
-        }
+        // Reasons belong to this pass. Remember earlier holds only to avoid
+        // reporting the same decision again while it remains valid.
+        let previously_held = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.queued() && job.held().is_some())
+            .map(|(id, _)| *id)
+            .collect::<HashSet<_>>();
+        // Why the builds this pass does not reach wait.
+        let mut rest = None;
         for id in self.queue_order() {
             let busy = self.slots.iter().filter(|slot| slot.busy()).count();
             if busy >= self.capacity {
+                rest = Some(Wait::Slot);
                 break;
             }
             if self.jobs[&id].optional() && (others_wait || self.capacity - busy < 2) {
+                waits.insert(id, if others_wait { Wait::Queue } else { Wait::Slot });
                 continue;
             }
             // An exclusive build is a host-wide queue barrier. Do not let
@@ -1483,6 +1593,7 @@ impl<D: Distance> Scheduler<D> {
                 .values()
                 .any(|job| !job.queued() && (job.exclusive || self.jobs[&id].exclusive))
             {
+                rest = Some(Wait::Exclusive);
                 break;
             }
             // A build that does not fit waits, and so does everything behind
@@ -1492,23 +1603,28 @@ impl<D: Distance> Scheduler<D> {
             // With nothing running, it runs whatever it needs.
             let memory = self.memory_estimate(&self.jobs[&id]);
             if let Some(reserved) = self.memory_hold(memory, in_use) {
-                self.jobs.get_mut(&id).expect("queued above").memory_needed = Some(reserved);
+                waits.insert(
+                    id,
+                    Wait::Memory {
+                        needed: reserved,
+                        available: self.memory.saturating_sub(in_use),
+                    },
+                );
+                rest = Some(Wait::Queue);
                 break;
             }
             let reserved = memory.or(self.unmeasured_memory).unwrap_or(self.memory);
-            // All callers, including exits, measurements and cache releases,
-            // make the same disk decision before a slot becomes busy again.
-            self.disk_wait = self.keep_disk(1, &mut effects);
-            if self.disk_wait.is_some() {
-                break;
-            }
-            let (slot, warm) = match self.choose_slot(id, &claimed) {
-                Placement::Start { slot, warm } => (slot, warm),
-                Placement::Wait => continue,
+            let (chosen, warm) = match self.choose_slot(id, &claimed) {
+                Placement::Start { slot, warm } => (Some(slot), warm),
+                Placement::Create => (None, false),
+                Placement::Wait => {
+                    waits.insert(id, Wait::Slot);
+                    continue;
+                }
                 Placement::Hold { hold, slot } => {
                     let expected = self.estimate(&self.jobs[&id]).unwrap_or(0);
                     *claimed.entry(slot).or_default() += expected;
-                    let job = self.jobs.get_mut(&id).expect("queued above");
+                    let job = &self.jobs[&id];
                     if !previously_held.contains(&id) {
                         effects.push(Effect::Report(EventKind::Held {
                             who: job.who(),
@@ -1516,10 +1632,24 @@ impl<D: Distance> Scheduler<D> {
                             hold: hold.clone(),
                         }));
                     }
-                    job.hold = Some(hold);
+                    waits.insert(id, Wait::Warm { hold });
                     continue;
                 }
             };
+            let growth = self.growth(chosen, &Compilation::of(&self.jobs[&id]));
+            // All callers, including exits, measurements and cache releases,
+            // make the same disk decision before a slot becomes busy again.
+            self.disk_wait = self.keep_disk(Some((growth, chosen)), &mut effects);
+            if let Some(wait) = self.disk_wait.clone() {
+                if self.disk_stalled(&wait) {
+                    effects.extend(self.refuse(id, &wait));
+                    continue;
+                }
+                waits.insert(id, Wait::Disk { disk: wait });
+                rest = Some(Wait::Queue);
+                break;
+            }
+            let slot = chosen.unwrap_or_else(|| self.create_slot(id));
             in_use += reserved;
             self.clock += 1;
             let job = &self.jobs[&id];
@@ -1530,12 +1660,18 @@ impl<D: Distance> Scheduler<D> {
             let entry = &mut self.slots[slot];
             entry.advance_generation();
             entry.job = Some(id);
-            // Its build changes what its target holds.
+            // Its build changes what its target holds. Measured right before
+            // it, the next measurement tells what it added.
             entry.inventory = None;
+            entry.growing = entry
+                .size
+                .filter(|_| entry.unmeasured == 0)
+                .map(|size| (Compilation::of(job), size));
             entry.revision = Some(job.revision.clone());
             entry.worktree = Some(job.waiters[0].worktree.clone());
             entry.used = self.clock;
             let job = self.jobs.get_mut(&id).expect("chosen above");
+            job.wait = None;
             job.state = State::Running {
                 slot,
                 started: Instant::now(),
@@ -1543,6 +1679,7 @@ impl<D: Distance> Scheduler<D> {
                 copying: false,
                 cancelled: false,
                 memory,
+                disk: growth.bytes,
             };
             let name = slot_name(&self.slots[slot].repository, self.slots[slot].index);
             let started = Message::Started {
@@ -1576,31 +1713,127 @@ impl<D: Distance> Scheduler<D> {
                 },
             }));
         }
+        if let Some(rest) = rest {
+            for (id, _) in self.jobs.iter().filter(|(_, job)| job.queued()) {
+                waits.entry(*id).or_insert_with(|| rest.clone());
+            }
+        }
         // A later build may have taken the last idle slot after earlier
         // builds chose to wait for warmth. That choice no longer delays them.
         if self.slots.iter().filter(|slot| slot.busy()).count() >= self.capacity {
-            for job in self.jobs.values_mut().filter(|job| job.queued()) {
-                job.hold = None;
+            for wait in waits.values_mut() {
+                if let Wait::Warm { .. } = wait {
+                    *wait = Wait::Slot;
+                }
             }
         }
+        if self.disk_wait.is_none() {
+            self.disk_stalled = None;
+        }
+        effects.extend(self.tell(waits));
         effects
+    }
+
+    /// Records why each queued job waits, from `waits`, which names them
+    /// all, and tells the clients of those whose reason changed.
+    fn tell(&mut self, mut waits: HashMap<JobId, Wait>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for (id, job) in self.jobs.iter_mut().filter(|(_, job)| job.queued()) {
+            let wait = waits.remove(id).expect("every queued job has a reason");
+            if job
+                .wait
+                .as_ref()
+                .is_none_or(|told| !told.same_reason(&wait))
+            {
+                effects.extend(job.send_all(&Message::Waiting { wait: wait.clone() }));
+            }
+            job.wait = Some(wait);
+        }
+        assert!(waits.is_empty(), "only queued jobs wait");
+        effects
+    }
+
+    /// Whether queued builds have waited for disk only someone freeing
+    /// space can provide for `disk_wait_limit`: `wait` is a shortfall idle
+    /// artifacts cannot cover, and no build runs whose end would release
+    /// its reservation. Any other wait, or an empty queue, restarts the
+    /// count.
+    fn disk_stalled(&mut self, wait: &DiskWait) -> bool {
+        let lasting = matches!(wait, DiskWait::Headroom(_) | DiskWait::Budget { .. })
+            && self.jobs.values().all(Job::queued)
+            && !self.jobs.is_empty();
+        if !lasting {
+            self.disk_stalled = None;
+            return false;
+        }
+        self.disk_stalled.get_or_insert_with(Instant::now).elapsed() >= self.disk_wait_limit
+    }
+
+    /// Gives up queued job `id`, which `wait` keeps from starting.
+    fn refuse(&mut self, id: JobId, wait: &DiskWait) -> Vec<Effect> {
+        let job = self.jobs.remove(&id).expect("a queued job is refused");
+        assert!(job.queued(), "only a queued job is refused");
+        let reason = format!(
+            "refused: for {} s no build ran on this host and idle build artifacts could not \
+             cover the disk this build needs: {wait}. Free space and retry, or adjust \
+             min_free_gib, build_headroom_gib or disk_wait_secs in buildd's config.toml",
+            self.disk_wait_limit.as_secs()
+        );
+        for waiter in &job.waiters {
+            self.waiting.remove(&waiter.id);
+        }
+        let mut effects = job
+            .send_all(&Message::Rejected {
+                reason: reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        effects.push(Effect::Report(EventKind::Refused {
+            who: job.who(),
+            operation: job.operation,
+            revision: job.revision,
+            reason,
+        }));
+        effects
+    }
+
+    /// What a build of `compilation` is expected to add to slot `slot`, or
+    /// to a new slot when None: its history there, else the host's
+    /// headroom for a build without history.
+    fn growth(&self, slot: Option<usize>, compilation: &Compilation) -> Growth {
+        match slot.and_then(|slot| self.slots[slot].growth(compilation)) {
+            Some(bytes) => Growth {
+                bytes,
+                measured: true,
+            },
+            None => Growth {
+                bytes: self.build_headroom,
+                measured: false,
+            },
+        }
     }
 
     /// Gives maintenance first claim on idle slots. Measurements are forced
     /// under pressure rather than waiting for the quiet/periodic scan. A
-    /// prospective build reserves output space together with running builds.
-    fn keep_disk(&mut self, additional: u64, effects: &mut Vec<Effect>) -> Option<DiskWait> {
+    /// prospective `build`, expected to grow by its growth in the slot it
+    /// takes (a new one when None), reserves output space together with
+    /// running builds; that slot gives up nothing for it.
+    fn keep_disk(
+        &mut self,
+        build: Option<(Growth, Option<usize>)>,
+        effects: &mut Vec<Effect>,
+    ) -> Option<DiskWait> {
         let Some(free) = self.free_disk else {
             return Some(DiskWait::Unavailable);
         };
-        let running = u64::try_from(self.slots.iter().filter(|slot| slot.job.is_some()).count())
-            .expect("the slot count fits u64");
-        let required = self
-            .min_free
-            .saturating_add(self.build_headroom.saturating_mul(running + additional));
+        let headroom = Headroom {
+            free,
+            floor: self.min_free,
+            running: self.disk_reserved(),
+            build: build.map(|(growth, _)| growth),
+        };
         let shortage = Shortage {
             over_budget: self.disk_used().saturating_sub(self.disk_budget),
-            under_floor: required.saturating_sub(free),
+            under_floor: headroom.required().saturating_sub(free),
         };
         if let Some(slot) = self
             .slots
@@ -1625,7 +1858,7 @@ impl<D: Distance> Scheduler<D> {
             .disk_used()
             .saturating_add(self.build_headroom.saturating_mul(unmeasured))
             > self.disk_budget;
-        let unknown = additional > 0
+        let unknown = build.is_some()
             && self
                 .slots
                 .iter()
@@ -1667,14 +1900,17 @@ impl<D: Distance> Scheduler<D> {
         if shortage.needed() == 0 {
             return None;
         }
-        if let Some(effect) = self.evict(shortage) {
+        if let Some(effect) = self.evict(shortage, build.and_then(|(_, slot)| slot)) {
             effects.push(effect);
             return Some(DiskWait::Evicting);
         }
         Some(if shortage.under_floor > 0 {
-            DiskWait::Headroom { required }
+            DiskWait::Headroom(headroom)
         } else {
-            DiskWait::Budget
+            DiskWait::Budget {
+                used: self.disk_used(),
+                budget: self.disk_budget,
+            }
         })
     }
 
@@ -1770,6 +2006,35 @@ impl<D: Distance> Scheduler<D> {
         operation: &Operation,
     ) -> Option<u64> {
         self.compilation_memory(repository, &Compilation::new(prefix, operation))
+    }
+
+    /// What a build of `operation` is expected to add to the slot it takes:
+    /// the least any slot of its repository expects, as the warm slot it
+    /// prefers usually has its history; without history, the headroom.
+    pub(crate) fn forecast_growth(
+        &self,
+        repository: &Path,
+        prefix: &Path,
+        operation: &Operation,
+    ) -> u64 {
+        let compilation = Compilation::new(prefix, operation);
+        self.slots
+            .iter()
+            .filter(|slot| slot.repository == repository)
+            .filter_map(|slot| slot.growth(&compilation))
+            .min()
+            .unwrap_or(self.build_headroom)
+    }
+
+    /// What running builds reserve for their output.
+    pub(crate) fn disk_reserved(&self) -> u64 {
+        self.jobs
+            .values()
+            .filter_map(|job| match job.state {
+                State::Running { disk, .. } => Some(disk),
+                State::Queued => None,
+            })
+            .sum()
     }
 
     fn compilation_memory(&self, repository: &Path, compilation: &Compilation) -> Option<u64> {
@@ -1943,13 +2208,6 @@ impl<D: Distance> Scheduler<D> {
         if self.disk_used() > self.disk_budget {
             notes.push("cache disk budget must be met before admission".into());
         }
-        let running_count = self.slots.iter().filter(|slot| slot.job.is_some()).count() as u64;
-        let required = self
-            .min_free
-            .saturating_add(self.build_headroom.saturating_mul(running_count + 1));
-        if status.free_disk.is_none_or(|free| free < required) {
-            notes.push(format!("disk admission requires {required} free bytes"));
-        }
         if self
             .slots
             .iter()
@@ -1985,7 +2243,7 @@ impl<D: Distance> Scheduler<D> {
                 self.jobs
                     .values()
                     .filter_map(|job| {
-                        let hold = job.hold.as_ref()?;
+                        let hold = job.held()?;
                         let slot = self.slots.iter().position(|slot| {
                             slot_name(&slot.repository, slot.index) == hold.slot
                         })?;
@@ -2039,6 +2297,22 @@ impl<D: Distance> Scheduler<D> {
                 compile_ms: None,
                 note: Some("a cold slot would be created on admission".into()),
             });
+        }
+        let target = recommended_slot.as_ref().and_then(|name| {
+            self.slots
+                .iter()
+                .position(|slot| slot_name(&slot.repository, slot.index) == *name)
+        });
+        if let Some(free) = status.free_disk {
+            let headroom = Headroom {
+                free,
+                floor: self.min_free,
+                running: self.disk_reserved(),
+                build: Some(self.growth(target, &compilation)),
+            };
+            if !headroom.covered() {
+                notes.push(format!("disk admission: {headroom}"));
+            }
         }
         let historical_build_ms = self.compilation_time(repository, &compilation);
         let queue_ms =
@@ -2117,22 +2391,35 @@ impl<D: Distance> Scheduler<D> {
         if own().any(|slot| slot.chore.is_some()) || own().count() >= self.capacity {
             return Placement::Wait;
         }
+        Placement::Create
+    }
+
+    /// Adds a slot for queued job `id`, which [`Self::choose_slot`] placed
+    /// in a new one, and returns its index.
+    fn create_slot(&mut self, id: JobId) -> usize {
+        let job = &self.jobs[&id];
         // Restored slots can leave gaps: take the lowest free index.
         let index = (0..self.capacity)
-            .find(|index| !own().any(|slot| slot.index == *index))
+            .find(|index| {
+                !self
+                    .slots
+                    .iter()
+                    .any(|slot| slot.repository == job.repository && slot.index == *index)
+            })
             .expect("a repository with fewer than capacity slots has a free index");
         self.slots.push(Slot {
-            repository,
+            repository: job.repository.clone(),
             index,
             job: None,
-            revision: Some(revision),
-            worktree: Some(self.jobs[&id].waiters[0].worktree.clone()),
+            revision: Some(job.revision.clone()),
+            worktree: Some(job.waiters[0].worktree.clone()),
             used: 0,
             chore: None,
             generation: 0,
             unmeasured: 0,
             idle_since: Instant::now(),
             size: None,
+            growing: None,
             inventory: None,
             maintenance_error: None,
             last: None,
@@ -2141,10 +2428,7 @@ impl<D: Distance> Scheduler<D> {
             compilations: Vec::new(),
             units: HashMap::new(),
         });
-        Placement::Start {
-            slot: self.slots.len() - 1,
-            warm: false,
-        }
+        self.slots.len() - 1
     }
 
     /// Whether a request whose best idle slot leaves `work` units to
@@ -2267,8 +2551,7 @@ impl<D: Distance> Scheduler<D> {
                     waited_ms: job.waited_ms(),
                     exclusive: job.exclusive,
                     estimate_ms: self.estimate(job),
-                    held: job.hold.clone(),
-                    memory_needed: job.memory_needed,
+                    wait: job.wait.clone(),
                 }
             })
             .collect();
@@ -2282,6 +2565,8 @@ enum Placement {
         slot: usize,
         warm: bool,
     },
+    /// A new slot of its repository, which has fewer than capacity.
+    Create,
     /// No slot is free for it.
     Wait,
     /// It waits for busy slot `slot` although one is idle.
@@ -2391,6 +2676,7 @@ mod tests {
             disk: u64::MAX,
             min_free: 0,
             build_headroom: 0,
+            disk_wait: Duration::from_secs(120),
             remotes: Vec::new(),
             prewarm: Vec::new(),
         };
@@ -2414,6 +2700,7 @@ mod tests {
                     build_ms: None,
                     peak_memory: Some(1),
                     test_memory: None,
+                    disk: None,
                 }],
                 ..SlotRecord::default()
             },
@@ -2610,7 +2897,7 @@ mod tests {
             idle.key,
             Ok(inventory(&["debug/1111111111111111".into()], 100)),
         );
-        let Some(Effect::Evict(removals)) = scheduler.evict(over_budget(1)) else {
+        let Some(Effect::Evict(removals)) = scheduler.evict(over_budget(1), None) else {
             panic!("eviction");
         };
         assert_eq!(scheduler.cache_generation(&name), Some(2));
@@ -2787,6 +3074,27 @@ mod tests {
         Outcome::Exited { code: 0 }
     }
 
+    fn required(wait: &DiskWait) -> Option<u64> {
+        match wait {
+            DiskWait::Headroom(headroom) => Some(headroom.required()),
+            _ => None,
+        }
+    }
+
+    fn held_for(build: &QueuedBuild) -> Option<&Hold> {
+        match &build.wait {
+            Some(Wait::Warm { hold }) => Some(hold),
+            _ => None,
+        }
+    }
+
+    fn memory_needed(build: &QueuedBuild) -> Option<u64> {
+        match build.wait {
+            Some(Wait::Memory { needed, .. }) => Some(needed),
+            _ => None,
+        }
+    }
+
     /// Runs `tree` for `worktree` to its end and returns the slot it ran in.
     fn run(scheduler: &mut Scheduler<Table>, waiter: u64, worktree: &str, tree: &str) -> usize {
         let effects = submit(scheduler, waiter, worktree, tree);
@@ -2872,6 +3180,7 @@ mod tests {
                 build_ms: Some(1_000_000),
                 peak_memory: Some(1),
                 test_memory: None,
+                disk: None,
             });
             assert!(starts(&scheduler.submit(request(3, "/c", "c1", false))).is_empty());
             assert!(starts(&scheduler.submit(request(4, "/d", "d1", true))).is_empty());
@@ -3006,7 +3315,7 @@ mod tests {
         let newer = submit(&mut scheduler, 5, "/a", "t2");
         // /a's waiter moves to t2; /b's keeps t1, which is still its content.
         assert!(
-            matches!(sent(&newer, 2)[..], [Message::Queued { revision }] if revision.to_string() == "t2")
+            matches!(sent(&newer, 2)[..], [Message::Queued { revision }, Message::Waiting { wait: Wait::Slot }] if revision.to_string() == "t2")
         );
         let (_, queue) = scheduler.status(|_| 0);
         let order = queue
@@ -3174,7 +3483,13 @@ mod tests {
         ));
         // An equal request does not join the build being stopped.
         let again = submit(&mut scheduler, 3, "/a", "t1");
-        assert!(matches!(sent(&again, 3)[..], [Message::Queued { .. }]));
+        assert!(matches!(
+            sent(&again, 3)[..],
+            [
+                Message::Queued { .. },
+                Message::Waiting { wait: Wait::Slot }
+            ]
+        ));
         let next = scheduler.exited(
             job,
             &Outcome::Signaled { signal: 15 },
@@ -3366,10 +3681,7 @@ mod tests {
             panic!("one build fits");
         };
         assert!(starts(&submit(&mut scheduler, 2, "/b", "b1")).is_empty());
-        assert_eq!(
-            scheduler.disk_wait(),
-            Some(&DiskWait::Headroom { required: 25 })
-        );
+        assert_eq!(scheduler.disk_wait().and_then(required), Some(25));
         scheduler.observe_disk(Some(25));
         let second = scheduler.maintain();
         assert_eq!(
@@ -3387,10 +3699,7 @@ mod tests {
             starts(&measured).is_empty(),
             "accepted work still needs disk admission"
         );
-        assert_eq!(
-            scheduler.disk_wait(),
-            Some(&DiskWait::Headroom { required: 15 })
-        );
+        assert_eq!(scheduler.disk_wait().and_then(required), Some(15));
         assert!(
             !scheduler.status(|_| 0).0[1]
                 .build
@@ -3400,6 +3709,262 @@ mod tests {
         );
         scheduler.observe_disk(Some(25));
         assert_eq!(starts(&scheduler.maintain()).len(), 1);
+    }
+
+    /// Measures idle slot `key`, now holding `total` bytes.
+    fn measure_total(scheduler: &mut Scheduler<Table>, key: SlotKey, total: u64) -> Vec<Effect> {
+        let due = scheduler.measurement_due(Instant::now() + MEASURE_QUIET);
+        assert!(
+            measures(&due).contains(&scheduler.slots[key.0].index),
+            "{due:?}"
+        );
+        scheduler.measured(
+            key,
+            Ok(Inventory {
+                total,
+                ..Inventory::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn a_build_reserves_what_its_kind_of_build_added_to_its_slot_or_the_default() {
+        let mut scheduler = scheduler(1);
+        scheduler.min_free = 5;
+        scheduler.build_headroom = 10;
+        scheduler.observe_disk(Some(14));
+        // Without history, the default headroom.
+        assert!(starts(&submit(&mut scheduler, 1, "/a", "a1")).is_empty());
+        let unknown = Growth {
+            bytes: 10,
+            measured: false,
+        };
+        assert_eq!(
+            scheduler.disk_wait(),
+            Some(&DiskWait::Headroom(Headroom {
+                free: 14,
+                floor: 5,
+                running: 0,
+                build: Some(unknown),
+            }))
+        );
+        scheduler.observe_disk(Some(100));
+        let [(first, ..)] = starts(&scheduler.maintain())[..] else {
+            panic!("space admits it");
+        };
+        scheduler.exited(first, &ok(), None, BuildReport::default());
+        // The slot was new: there is nothing to compare its size with.
+        measure_total(&mut scheduler, SlotKey(0), 3);
+        assert!(scheduler.slots[0].compilations.is_empty());
+        // Measured before and after, a build tells what it added.
+        let [(second, ..)] = starts(&submit(&mut scheduler, 2, "/a", "a2"))[..] else {
+            panic!("space admits it");
+        };
+        scheduler.exited(second, &ok(), None, BuildReport::default());
+        let measured = measure_total(&mut scheduler, SlotKey(0), 4);
+        let added = DiskUse { added: 1, total: 4 };
+        assert!(measured.iter().any(|effect| matches!(
+            effect,
+            Effect::Persist { record, .. } if record.compilations[0].disk == Some(added)
+        )));
+        // A warm slot reserves what its incremental build added.
+        scheduler.observe_disk(Some(6));
+        let [(third, ..)] = starts(&submit(&mut scheduler, 3, "/a", "a3"))[..] else {
+            panic!("1 byte of growth fits");
+        };
+        scheduler.exited(third, &ok(), None, BuildReport::default());
+        measure_total(&mut scheduler, SlotKey(0), 4);
+        assert_eq!(
+            scheduler.slots[0].compilations[0].disk,
+            Some(DiskUse { added: 0, total: 4 })
+        );
+        // Another kind of build has no history in the slot.
+        assert!(
+            starts(&submit_operation(
+                &mut scheduler,
+                4,
+                "/a",
+                "a4",
+                Command::Test,
+                &[]
+            ))
+            .is_empty()
+        );
+        assert!(matches!(
+            scheduler.disk_wait(),
+            Some(DiskWait::Headroom(Headroom { build: Some(growth), .. })) if *growth == unknown
+        ));
+        scheduler.withdraw(WaiterId(4));
+        // A slot below the size its build left grows back to it.
+        scheduler.slots[0].size = Some(1);
+        assert!(starts(&submit(&mut scheduler, 5, "/a", "a5")).is_empty());
+        assert_eq!(
+            scheduler.disk_wait(),
+            Some(&DiskWait::Headroom(Headroom {
+                free: 6,
+                floor: 5,
+                running: 0,
+                build: Some(Growth {
+                    bytes: 3,
+                    measured: true
+                }),
+            }))
+        );
+        scheduler.observe_disk(Some(8));
+        assert_eq!(starts(&scheduler.maintain()).len(), 1);
+        assert_eq!(scheduler.disk_reserved(), 3);
+    }
+
+    #[test]
+    fn admission_does_not_evict_the_slot_the_build_takes() {
+        let mut scheduler = scheduler(2);
+        scheduler.min_free = 5;
+        scheduler.build_headroom = 10;
+        scheduler.observe_disk(Some(14));
+        for (key, repository, prefix) in [(0, "/repo/.git", "a"), (1, "/other/.git", "o")] {
+            scheduler.restore(
+                repository.into(),
+                0,
+                Some(revision("old")),
+                SlotRecord::default(),
+            );
+            scheduler.measure(key);
+            scheduler.measured(SlotKey(key), Ok(inventory(&units(prefix, 2), 4)));
+        }
+        let effects = submit(&mut scheduler, 1, "/a", "a1");
+        assert!(starts(&effects).is_empty());
+        let eviction = effects
+            .iter()
+            .find(|effect| matches!(effect, Effect::Evict(_)))
+            .expect("the shortfall is evicted");
+        assert_eq!(
+            removed(eviction)
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [1],
+            "only the other repository's slot gives up artifacts"
+        );
+    }
+
+    #[test]
+    fn a_queued_build_hears_why_it_waits_and_again_when_the_reason_changes() {
+        const GIB: u64 = 1 << 30;
+        let mut scheduler = scheduler(1);
+        scheduler.min_free = 15 * GIB;
+        scheduler.build_headroom = 10 * GIB;
+        scheduler.observe_disk(Some(100 * GIB));
+        assert_eq!(starts(&submit(&mut scheduler, 1, "/a", "a1")).len(), 1);
+        let queued = submit(&mut scheduler, 2, "/b", "b1");
+        assert_eq!(
+            sent(&queued, 2),
+            [
+                &Message::Queued {
+                    revision: revision("b1")
+                },
+                &Message::Waiting { wait: Wait::Slot }
+            ]
+        );
+        // The volume fills: it no longer covers the floor and the running
+        // build's reservation.
+        scheduler.observe_disk(Some(25 * GIB - 400 * (1 << 20)));
+        let filled = scheduler.maintain();
+        let [Message::Waiting { wait }] = sent(&filled, 2)[..] else {
+            panic!("{filled:?}");
+        };
+        assert_eq!(
+            wait.to_string(),
+            "waiting for disk: 24.6 GiB free, needs 25.0 GiB (floor 15.0 GiB + 10.0 GiB \
+             reserved by running builds); free 0.4 GiB more on this volume"
+        );
+        // New numbers for the same reason are no news; status has them.
+        scheduler.observe_disk(Some(24 * GIB));
+        assert!(sent(&scheduler.maintain(), 2).is_empty());
+        assert!(matches!(
+            scheduler.status(|_| 0).1[0].wait,
+            Some(Wait::Disk {
+                disk: DiskWait::Headroom(Headroom { free, .. })
+            }) if free == 24 * GIB
+        ));
+        // A client joining the queued build hears the reason at once.
+        let joined = submit(&mut scheduler, 3, "/b", "b1");
+        assert!(matches!(
+            sent(&joined, 3)[..],
+            [
+                Message::Queued { .. },
+                Message::Waiting {
+                    wait: Wait::Disk { .. }
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_build_waiting_for_disk_nothing_will_free_is_refused_after_the_bound() {
+        let mut scheduler = scheduler(2);
+        scheduler.unmeasured_memory = Some(1);
+        scheduler.min_free = 5;
+        scheduler.build_headroom = 10;
+        scheduler.disk_wait_limit = Duration::from_secs(3600);
+        scheduler.observe_disk(Some(20));
+        let [(running, ..)] = starts(&submit(&mut scheduler, 1, "/a", "a1"))[..] else {
+            panic!("the first build fits");
+        };
+        assert!(
+            starts(&submit_operation(
+                &mut scheduler,
+                2,
+                "/b",
+                "b1",
+                Command::Test,
+                &[]
+            ))
+            .is_empty()
+        );
+        // The running build's end releases its reservation: no bound applies.
+        scheduler.disk_wait_limit = Duration::ZERO;
+        assert!(sent(&scheduler.maintain(), 2).is_empty());
+        scheduler.disk_wait_limit = Duration::from_secs(3600);
+        scheduler.observe_disk(Some(14));
+        let exited = scheduler.exited(running, &ok(), None, BuildReport::default());
+        assert_eq!(measures(&exited), [0], "pressure measures the idle slot");
+        let measured = scheduler.measured(SlotKey(0), Ok(Inventory::default()));
+        assert!(starts(&measured).is_empty());
+        assert!(
+            matches!(
+                sent(&measured, 2)[..],
+                [Message::Waiting {
+                    wait: Wait::Disk {
+                        disk: DiskWait::Headroom(_)
+                    }
+                }]
+            ),
+            "{measured:?}"
+        );
+        // Nothing runs and nothing idle is left to evict: only someone
+        // freeing space helps. Within the bound the build waits.
+        assert!(sent(&scheduler.maintain(), 2).is_empty());
+        scheduler.disk_wait_limit = Duration::ZERO;
+        let refused = scheduler.maintain();
+        let [Message::Rejected { reason }] = sent(&refused, 2)[..] else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            reason.starts_with(
+                "refused: for 0 s no build ran on this host and idle build artifacts could not \
+                 cover the disk this build needs: 0.0 GiB free, needs 0.0 GiB"
+            ),
+            "{reason}"
+        );
+        assert!(matches!(
+            reports(&refused)[..],
+            [EventKind::Refused { revision, .. }] if revision.to_string() == "b1"
+        ));
+        assert!(scheduler.status(|_| 0).1.is_empty());
+        assert!(
+            scheduler.withdraw(WaiterId(2)).is_empty(),
+            "its client was answered"
+        );
     }
 
     #[test]
@@ -3421,7 +3986,13 @@ mod tests {
             }),
         );
         assert!(starts(&measured).is_empty());
-        assert_eq!(scheduler.disk_wait(), Some(&DiskWait::Budget));
+        assert_eq!(
+            scheduler.disk_wait(),
+            Some(&DiskWait::Budget {
+                used: 51,
+                budget: 50
+            })
+        );
     }
 
     #[test]
@@ -3635,6 +4206,7 @@ mod tests {
                         build_ms: Some(0),
                         peak_memory: Some(1),
                         test_memory: None,
+                        disk: None,
                     }],
                     units: held
                         .into_iter()
@@ -3680,6 +4252,11 @@ mod tests {
             };
             let (slots, queue) = scheduler.status(|_| 1);
             let capacity = Capacity {
+                disk_growth: scheduler.forecast_growth(
+                    &submission.source.repository,
+                    &submission.source.prefix,
+                    &submission.operation,
+                ),
                 peak_memory: scheduler.forecast_memory(
                     &submission.source.repository,
                     &submission.source.prefix,
@@ -3694,6 +4271,7 @@ mod tests {
                     free_disk: scheduler.free_disk,
                     min_free: scheduler.min_free,
                     build_headroom: scheduler.build_headroom,
+                    disk_reserved: scheduler.disk_reserved(),
                     disk_wait: scheduler.disk_wait.clone(),
                     undersized: scheduler.undersized,
                     memory: scheduler.memory,
@@ -3772,7 +4350,7 @@ mod tests {
             );
             assert_eq!(scheduler.jobs.len(), jobs);
             assert_eq!(scheduler.next_job, next);
-            assert!(scheduler.jobs.values().all(|job| job.hold.is_none()));
+            assert!(scheduler.jobs.values().all(|job| job.held().is_none()));
             assert_eq!(
                 plan.recommended_slot,
                 Some(slot_name(Path::new("/repo/.git"), 1))
@@ -3788,7 +4366,7 @@ mod tests {
             assert!(starts(&effects).is_empty());
             let (_, queue) = scheduler.status(|_| 0);
             assert_eq!(
-                queue[0].held.as_ref().map(|hold| &hold.slot),
+                held_for(&queue[0]).map(|hold| &hold.slot),
                 plan.recommended_slot.as_ref()
             );
         }
@@ -3953,7 +4531,7 @@ mod tests {
             ]
         ));
         let (_, queue) = scheduler.status(|_| 0);
-        assert!(queue[0].held.is_some());
+        assert!(held_for(&queue[0]).is_some());
         // A second build waits behind the first held one too: about 5 s more
         // there, still sooner than 22 s cold.
         let second = submit_operation(&mut scheduler, 5, "/d", "d1", Command::Test, &[]);
@@ -3976,7 +4554,7 @@ mod tests {
         assert!(matches!(starts(&third)[..], [(_, 0, _)]), "{third:?}");
         let (_, queue) = scheduler.status(|_| 0);
         assert!(
-            queue.iter().all(|build| build.held.is_none()),
+            queue.iter().all(|build| held_for(build).is_none()),
             "every slot is busy: waiting for warmth no longer delays a build"
         );
         let next = scheduler.exited(job, &ok(), None, BuildReport::default());
@@ -4131,7 +4709,7 @@ mod tests {
             starts(&third).is_empty(),
             "two reservations fill the budget"
         );
-        assert_eq!(scheduler.status(|_| 0).1[0].memory_needed, Some(5));
+        assert_eq!(memory_needed(&scheduler.status(|_| 0).1[0]), Some(5));
 
         // Learning never publishes the configured reservation as a measured peak.
         assert_eq!(
@@ -4153,7 +4731,7 @@ mod tests {
         assert_eq!(scheduler.memory(), (10, 10));
         let measured = submit(&mut scheduler, 4, "/a", "a2");
         assert!(starts(&measured).is_empty());
-        assert_eq!(scheduler.status(|_| 0).1[0].memory_needed, Some(7));
+        assert_eq!(memory_needed(&scheduler.status(|_| 0).1[0]), Some(7));
         let finished = scheduler.exited(b, &ok(), None, BuildReport::default());
         let finished = complete_measurements(&mut scheduler, finished);
         assert!(
@@ -4350,12 +4928,12 @@ mod tests {
         let check = submit(&mut scheduler, 5, "/c", "c1");
         assert!(starts(&check).is_empty(), "{check:?}");
         let (_, queue) = scheduler.status(|_| 0);
-        assert_eq!(queue[0].memory_needed, Some(8), "{queue:?}");
+        assert_eq!(memory_needed(&queue[0]), Some(8), "{queue:?}");
         assert_eq!(scheduler.memory(), (10, 4));
         let next = scheduler.exited(job, &ok(), None, BuildReport::default());
         assert_eq!(starts(&next).len(), 1, "the test runs alone: {next:?}");
         let (_, queue) = scheduler.status(|_| 0);
-        assert_eq!(queue[0].memory_needed, Some(4), "{queue:?}");
+        assert_eq!(memory_needed(&queue[0]), Some(4), "{queue:?}");
         // With memory to spare and every slot busy, it waits for a slot.
         scheduler.memory = 100;
         let idle = scheduler
@@ -4367,7 +4945,7 @@ mod tests {
         submit_optional(&mut scheduler, 6, "/p", "p1");
         let (_, queue) = scheduler.status(|_| 0);
         assert!(
-            queue.iter().all(|build| build.memory_needed.is_none()),
+            queue.iter().all(|build| memory_needed(build).is_none()),
             "{queue:?}"
         );
     }
@@ -4485,7 +5063,7 @@ mod tests {
         for used in scheduler.slots[0].units.values_mut() {
             used.at -= 60;
         }
-        let eviction = scheduler.evict(over_budget(120)).unwrap();
+        let eviction = scheduler.evict(over_budget(120), None).unwrap();
         let [(0, gone)] = &removed(&eviction)[..] else {
             panic!("{eviction:?}");
         };
@@ -4519,7 +5097,7 @@ mod tests {
             bytes: 10,
         });
         inventory.total += 10;
-        let eviction = scheduler.evict(over_budget(15)).unwrap();
+        let eviction = scheduler.evict(over_budget(15), None).unwrap();
         assert_eq!(
             removed(&eviction),
             [
@@ -4530,7 +5108,7 @@ mod tests {
         let (slots, _) = scheduler.status(|_| 0);
         assert!(slots.iter().all(|slot| slot.chore == Some(Chore::Evicting)));
         assert_eq!(
-            scheduler.evict(over_budget(1)),
+            scheduler.evict(over_budget(1), None),
             None,
             "one eviction at a time"
         );
@@ -4580,7 +5158,7 @@ mod tests {
                 over_budget: 100,
                 under_floor: if external { 20 } else { 110 },
             };
-            let eviction = scheduler.evict(shortage).unwrap();
+            let eviction = scheduler.evict(shortage, None).unwrap();
             assert_eq!(removed(&eviction), [(0, units[..2].to_vec())]);
             let done = scheduler.evicted(vec![(SlotKey(0), Ok(()))]);
             assert_eq!(
@@ -4620,7 +5198,7 @@ mod tests {
             [2, 1, 0].map(|after| LastUse { at, after })
         );
         measure_all(&mut scheduler, 10);
-        let eviction = scheduler.evict(over_budget(20)).unwrap();
+        let eviction = scheduler.evict(over_budget(20), None).unwrap();
         assert_eq!(removed(&eviction), [(0, vec![binary, dependent])]);
     }
 
@@ -4633,7 +5211,7 @@ mod tests {
             panic!("{busy:?}");
         };
         // Slot 0 builds; slot 1's units were all used a moment ago.
-        let eviction = scheduler.evict(over_budget(1_000)).unwrap();
+        let eviction = scheduler.evict(over_budget(1_000), None).unwrap();
         let [(1, gone)] = &removed(&eviction)[..] else {
             panic!("{eviction:?}");
         };
@@ -4650,7 +5228,7 @@ mod tests {
         assert!(scheduler.undersized());
         assert_eq!(starts(&done).len(), 1, "{done:?}");
         // Slot 1 builds now, slot 0 is unmeasured: nothing is left to evict.
-        assert_eq!(scheduler.evict(over_budget(1)), None);
+        assert_eq!(scheduler.evict(over_budget(1), None), None);
         assert!(scheduler.evicting.is_none());
     }
 
@@ -4658,7 +5236,7 @@ mod tests {
     fn a_slot_that_failed_to_evict_is_measured_again() {
         let mut scheduler = checked_and_tested();
         measure_all(&mut scheduler, 10);
-        scheduler.evict(over_budget(10)).unwrap();
+        scheduler.evict(over_budget(10), None).unwrap();
         let failed_at = Instant::now();
         let done = scheduler.evicted(vec![(SlotKey(0), Err("busy device".into()))]);
         assert!(matches!(
@@ -4807,6 +5385,7 @@ mod tests {
                 build_ms: Some(1),
                 peak_memory: None,
                 test_memory: None,
+                disk: None,
             },
         );
         let mut restored = self::scheduler(1);
@@ -5006,7 +5585,7 @@ mod tests {
         assert_eq!(record.units.len(), 3);
         // Evicted units are forgotten, and that is persisted too.
         measure_all(&mut scheduler, 1);
-        scheduler.evict(over_budget(3)).unwrap();
+        scheduler.evict(over_budget(3), None).unwrap();
         let evicted = scheduler.evicted(vec![(SlotKey(0), Ok(()))]);
         assert!(matches!(
             persisted(&evicted)[..],
@@ -5026,6 +5605,7 @@ mod tests {
                 build_ms: None,
                 peak_memory: Some(1),
                 test_memory: None,
+                disk: None,
             }],
             units: units("c", 12)
                 .into_iter()
@@ -5089,7 +5669,7 @@ mod tests {
         );
         measure_all(&mut scheduler, 1);
         // Reported last, the build script's output goes first.
-        let eviction = scheduler.evict(over_budget(1)).unwrap();
+        let eviction = scheduler.evict(over_budget(1), None).unwrap();
         assert_eq!(
             removed(&eviction),
             [(0, vec!["debug/bbbbbbbbbbbbbbbb".to_owned()])]

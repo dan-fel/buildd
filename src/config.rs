@@ -22,9 +22,14 @@ pub struct Config {
     /// Disk the volume holding the home keeps free, in bytes. Breaching
     /// it stops running builds before their idle artifacts are reclaimed.
     pub min_free: u64,
-    /// Free space reserved for each running build's additional output,
-    /// beyond the volume's free-disk floor.
+    /// Output growth assumed for a build whose slot has not measured what
+    /// that kind of build adds, in bytes. Builds with history reserve their
+    /// slot's measured growth instead, beyond the volume's free-disk floor.
     pub build_headroom: u64,
+    /// How long queued builds wait for free disk that only someone freeing
+    /// space can provide: no build runs, and idle artifacts cannot cover the
+    /// shortfall. After that, a build that does not fit is refused.
+    pub disk_wait: std::time::Duration,
     /// Memory running builds may use together, in bytes, by their recorded
     /// peaks: a build that would not fit waits.
     pub memory: u64,
@@ -96,6 +101,7 @@ struct File {
     disk_gib: Option<f64>,
     min_free_gib: Option<f64>,
     build_headroom_gib: Option<f64>,
+    disk_wait_secs: Option<u64>,
     memory_gib: Option<f64>,
     unmeasured_memory_gib: Option<f64>,
     #[serde(default)]
@@ -114,9 +120,9 @@ impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
     /// two slots, one job per available CPU, half of them for a build's
     /// tests, 20 GiB of build disk per slot, 15 GiB of free disk, 10 GiB of
-    /// output headroom per running build, the
-    /// machine's memory less 6 GiB for builds, and builds at
-    /// [`Priority::Low`].
+    /// output growth for a build without history, two minutes of waiting
+    /// for disk nothing will free, the machine's memory less 6 GiB for
+    /// builds, and builds at [`Priority::Low`].
     ///
     /// # Errors
     /// When the file cannot be read or parsed, or a limit is not positive.
@@ -194,6 +200,7 @@ impl Config {
                 reason = "a non-negative, finite number of GiB rounds to bytes"
             )]
             build_headroom: (build_headroom_gib * GIB).round() as u64,
+            disk_wait: std::time::Duration::from_secs(file.disk_wait_secs.unwrap_or(120)),
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -349,6 +356,7 @@ mod tests {
         assert_eq!(defaults.test_jobs, (defaults.jobs / 2).max(1));
         assert_eq!(defaults.min_free, 15 << 30);
         assert_eq!(defaults.build_headroom, 10 << 30);
+        assert_eq!(defaults.disk_wait, std::time::Duration::from_secs(120));
         assert!(defaults.memory >= 1 << 30);
         write("slots = 3\njobs = 6\ndisk_gib = 0.5\nmin_free_gib = 0\nmemory_gib = 8\n");
         let expected = Config {
@@ -358,6 +366,7 @@ mod tests {
             disk: 1 << 29,
             min_free: 0,
             build_headroom: 10 << 30,
+            disk_wait: std::time::Duration::from_secs(120),
             memory: 8 << 30,
             unmeasured_memory: None,
             priority: Priority::Low,
@@ -419,6 +428,11 @@ mod tests {
         assert_eq!(Config::load(&home.0).unwrap().disk, 60 << 30);
         write("disk_gib = 12\n");
         assert_eq!(Config::load(&home.0).unwrap().disk, 12 << 30);
+        write("disk_wait_secs = 0\n");
+        assert_eq!(
+            Config::load(&home.0).unwrap().disk_wait,
+            std::time::Duration::ZERO
+        );
         write("jobs = 6\ntest_jobs = 6\n");
         assert_eq!(Config::load(&home.0).unwrap().test_jobs, 6);
         for invalid in [

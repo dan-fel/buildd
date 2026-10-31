@@ -388,14 +388,10 @@ fn rank(
         && status.memory_in_use.saturating_add(reserved) <= status.memory
         && status.disk_wait.is_none()
         && status.free_disk.is_some_and(|free| {
-            let running = status
-                .slots
-                .iter()
-                .filter(|slot| slot.build.is_some())
-                .count() as u64;
             free >= status
                 .min_free
-                .saturating_add(status.build_headroom.saturating_mul(running + 1))
+                .saturating_add(status.disk_reserved)
+                .saturating_add(capacity.disk_growth)
         });
     let warm = status
         .slots
@@ -454,6 +450,7 @@ mod tests {
             },
             Ok(Capacity {
                 peak_memory: Some(2),
+                disk_growth: 0,
                 status: Status {
                     jobs: 2,
                     idle_jobs: 2,
@@ -466,6 +463,7 @@ mod tests {
                     free_disk: Some(30),
                     min_free: 15,
                     build_headroom: 0,
+                    disk_reserved: 0,
                     disk_wait: None,
                     undersized: false,
                     slots: Vec::new(),
@@ -651,8 +649,9 @@ mod tests {
         let mut router = Router::load(&home.0).unwrap();
         let mut hosts = [host("local", "linux", 12), host("pc", "linux", 12)];
         // Both hosts have the same CPU/memory load. The first cannot cover
-        // the next build's output reservation, so the second can start sooner.
-        hosts[0].1.as_mut().unwrap().status.build_headroom = 20;
+        // the output this build is expected to add there, so the second can
+        // start sooner.
+        hosts[0].1.as_mut().unwrap().disk_growth = 20;
         assert_eq!(
             router
                 .place(&source("/a"), &revision("a"), &request(), &hosts)
@@ -660,8 +659,8 @@ mod tests {
                 .host,
             "pc"
         );
+        hosts[0].1.as_mut().unwrap().disk_growth = 0;
         let local = &mut hosts[0].1.as_mut().unwrap().status;
-        local.build_headroom = 0;
         local.disk_wait = Some(crate::protocol::DiskWait::Measuring);
         assert_eq!(
             router

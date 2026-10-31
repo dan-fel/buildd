@@ -49,6 +49,17 @@ pub fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
 }
 
+/// Like [`gib`], rounded up: an amount someone must provide is never shown
+/// as less than it is.
+#[must_use]
+#[expect(clippy::cast_precision_loss, reason = "a size in GiB for people")]
+pub fn gib_up(bytes: u64) -> String {
+    format!(
+        "{:.1} GiB",
+        (bytes as f64 / f64::from(1 << 30) * 10.0).ceil() / 10.0
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

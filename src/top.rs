@@ -11,7 +11,7 @@ use buildd::cargo::{Command, Operation};
 use buildd::log::gib;
 use buildd::protocol::{
     Activity, Chore, EventKind, Outcome, Percentiles, Phase, QueuedBuild, RemoteActivity, Shortage,
-    SlotStatus, Speed, Status,
+    SlotStatus, Speed, Status, Wait,
 };
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -368,15 +368,12 @@ fn host_lines(name: &str, os: &str, status: &Status) -> Vec<Line<'static>> {
         )));
     }
     if let Some(wait) = &status.disk_wait {
-        lines.push(
-            Line::from(format!(
-                "  Disk admission: {wait}; {} output headroom per build",
-                gib(status.build_headroom),
-            ))
-            .yellow(),
-        );
+        lines.push(Line::from(format!("  Disk admission: {wait}")).yellow());
     }
-    if let Some(needed) = status.queue.iter().find_map(|build| build.memory_needed) {
+    if let Some(needed) = status.queue.iter().find_map(|build| match build.wait {
+        Some(Wait::Memory { needed, .. }) => Some(needed),
+        _ => None,
+    }) {
         let remaining = status.memory.saturating_sub(status.memory_in_use);
         lines.push(
             Line::from(format!(
@@ -463,10 +460,13 @@ fn queued_lines(
     if build.exclusive {
         details.push(Span::from(" · exclusive").yellow());
     }
-    if let Some(memory) = build.memory_needed {
-        details.push(Span::from(format!(" · waiting for memory (needs {})", gib(memory))).yellow());
-    } else if let Some(hold) = &build.held {
-        details.push(
+    match &build.wait {
+        Some(Wait::Memory { needed, .. }) => {
+            details.push(
+                Span::from(format!(" · waiting for memory (needs {})", gib(*needed))).yellow(),
+            );
+        }
+        Some(Wait::Warm { hold }) => details.push(
             Span::from(format!(
                 " · warm {} ~{} vs ~{} cold",
                 short_slot(&hold.slot),
@@ -474,7 +474,11 @@ fn queued_lines(
                 brief(hold.cold_ms),
             ))
             .yellow(),
-        );
+        ),
+        Some(Wait::Disk { disk }) => {
+            details.push(Span::from(format!(" · waiting for disk: {disk}")).yellow());
+        }
+        Some(Wait::Slot | Wait::Exclusive | Wait::Queue) | None => {}
     }
     if let Some(estimate) = build.estimate_ms {
         details.push(Span::from(format!(" · build ~{}", brief(estimate))).dark_gray());
@@ -807,6 +811,21 @@ fn describe(kind: &EventKind) -> Option<(String, Style)> {
                 Style::new().fg(Color::Yellow),
             )
         }
+        EventKind::Refused {
+            operation,
+            revision,
+            reason,
+            ..
+        } => {
+            let operation = operation_summary(operation);
+            (
+                format!(
+                    "refused queued {operation} @ {}: {reason}",
+                    revision.short()
+                ),
+                Style::new().fg(Color::Red),
+            )
+        }
         EventKind::Cancelled {
             slot,
             operation,
@@ -990,6 +1009,7 @@ mod tests {
                 free_disk: Some(10 << 30),
                 min_free: 15 << 30,
                 build_headroom: 0,
+                disk_reserved: 0,
                 disk_wait: None,
                 undersized: false,
                 memory: 18 << 30,
@@ -1043,11 +1063,12 @@ mod tests {
                     waited_ms: 2100,
                     exclusive: false,
                     estimate_ms: Some(40_000),
-                    memory_needed: None,
-                    held: Some(Hold {
-                        slot: "app-c716/0".into(),
-                        wait_ms: 30_000,
-                        cold_ms: 300_000,
+                    wait: Some(Wait::Warm {
+                        hold: Hold {
+                            slot: "app-c716/0".into(),
+                            wait_ms: 30_000,
+                            cold_ms: 300_000,
+                        },
                     }),
                 }],
             },
@@ -1288,7 +1309,10 @@ mod tests {
         remote.status.idle_jobs = remote.status.jobs - 4;
         remote.status.free_disk = Some(100 << 30);
         remote.status.queue[0].waited_ms = 809_700;
-        remote.status.queue[0].memory_needed = Some(6 << 30);
+        remote.status.queue[0].wait = Some(Wait::Memory {
+            needed: 6 << 30,
+            available: 0,
+        });
         remote.status.queue[0].who.push("agent-5".into());
         let busy = remote.status.slots[0].clone();
         remote.status.slots = vec![busy.clone()];

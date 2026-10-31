@@ -229,6 +229,9 @@ pub struct Capacity {
     /// A measured peak of this exact compilation. An unmeasured request
     /// uses the host's configured reservation, exclusive by default.
     pub peak_memory: Option<u64>,
+    /// Output this compilation is expected to add to its slot, in bytes.
+    #[serde(default)]
+    pub disk_growth: u64,
 }
 
 /// A point-in-time explanation, never a reservation or an accepted build.
@@ -302,6 +305,9 @@ pub enum Message {
     /// The request waits for a slot. Sent again with a newer revision when a
     /// later request from the same worktree supersedes it.
     Queued { revision: Revision },
+    /// Why the queued request has not started: sent when it first waits and
+    /// whenever the reason changes.
+    Waiting { wait: Wait },
     /// Cargo runs for `revision` in `slot`.
     Started { revision: Revision, slot: String },
     /// A line of Cargo's standard output: JSON messages (diagnostics, the
@@ -326,7 +332,7 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         test_ms: Option<u64>,
     },
-    /// The request was not accepted.
+    /// The request was not accepted, or was given up before it started.
     Rejected { reason: String },
 }
 
@@ -408,9 +414,13 @@ pub struct Status {
     pub free_disk: Option<u64>,
     #[serde(default)]
     pub min_free: u64,
-    /// Free space reserved for additional output per running build.
+    /// Output growth assumed for a build whose slot has no measured growth
+    /// of its kind of build, in bytes.
     #[serde(default)]
     pub build_headroom: u64,
+    /// Free space the running builds reserve for their expected output.
+    #[serde(default)]
+    pub disk_reserved: u64,
     /// Disk maintenance or space is holding build admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_wait: Option<DiskWait>,
@@ -480,18 +490,98 @@ pub enum DiskWait {
         reason: String,
     },
     Evicting,
-    /// The cache budget cannot yet be met by idle artifacts.
-    Budget,
-    /// The floor and output reservations require this much free space.
-    Headroom {
-        required: u64,
+    /// The slots' targets hold `used` bytes, more than the `budget`, and
+    /// idle artifacts cannot yet cover the excess.
+    Budget {
+        used: u64,
+        budget: u64,
     },
+    /// Free disk does not cover what admission requires.
+    Headroom(Headroom),
     /// Reading the volume's free space failed. Admission fails closed.
     Unavailable,
 }
 
+/// What disk admission requires, in bytes: the volume's `floor`, what
+/// running builds reserve for their output and, when one is being admitted,
+/// what the next build is expected to add; against what is `free`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Headroom {
+    pub free: u64,
+    pub floor: u64,
+    pub running: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Growth>,
+}
+
+impl Headroom {
+    /// The free space admission requires.
+    #[must_use]
+    pub fn required(&self) -> u64 {
+        self.floor
+            .saturating_add(self.running)
+            .saturating_add(self.build.map_or(0, |build| build.bytes))
+    }
+
+    /// Whether free space covers what admission requires.
+    #[must_use]
+    pub fn covered(&self) -> bool {
+        self.free >= self.required()
+    }
+}
+
+impl std::fmt::Display for Headroom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::log::gib;
+        let required = self.required();
+        write!(
+            f,
+            "{} free, needs {} (floor {}",
+            gib(self.free),
+            gib(required),
+            gib(self.floor)
+        )?;
+        if self.running > 0 {
+            write!(f, " + {} reserved by running builds", gib(self.running))?;
+        }
+        if let Some(build) = self.build {
+            write!(
+                f,
+                " + {} for this build, {}",
+                gib(build.bytes),
+                build.basis()
+            )?;
+        }
+        write!(
+            f,
+            "); free {} more on this volume",
+            crate::log::gib_up(required.saturating_sub(self.free))
+        )
+    }
+}
+
+/// What a build is expected to add to its slot's target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Growth {
+    pub bytes: u64,
+    /// From the slot's measured growth for this kind of build; otherwise
+    /// the host's `build_headroom_gib` for a build without history.
+    pub measured: bool,
+}
+
+impl Growth {
+    fn basis(self) -> &'static str {
+        if self.measured {
+            "from its slot's history"
+        } else {
+            "no history: build_headroom_gib"
+        }
+    }
+}
+
 impl std::fmt::Display for DiskWait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::log::gib;
         match self {
             Self::Measuring => f.write_str("measuring build artifacts"),
             Self::Protected => f.write_str("waiting for protected artifact inventories"),
@@ -499,12 +589,13 @@ impl std::fmt::Display for DiskWait {
                 write!(f, "artifact maintenance failed for {slot}: {reason}")
             }
             Self::Evicting => f.write_str("reclaiming idle build artifacts"),
-            Self::Budget => f.write_str("cache disk budget exceeded"),
-            Self::Headroom { required } => write!(
+            Self::Budget { used, budget } => write!(
                 f,
-                "need {} free for the disk floor and build output",
-                crate::log::gib(*required)
+                "build artifacts hold {}, over their {} budget, and none idle can be removed",
+                gib(*used),
+                gib(*budget)
             ),
+            Self::Headroom(headroom) => headroom.fmt(f),
             Self::Unavailable => f.write_str("free disk could not be read"),
         }
     }
@@ -571,14 +662,70 @@ pub struct QueuedBuild {
     /// How long it is expected to take, from earlier builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_ms: Option<u64>,
+    /// Why it has not started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Wait>,
+}
+
+/// Why a queued build has not started.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Wait {
+    /// Every slot it may use is busy.
+    Slot,
+    /// Exclusive work holds the host, or this exclusive build waits for the
+    /// running builds to end.
+    Exclusive,
+    /// It waits behind earlier builds that wait.
+    Queue,
+    /// It is expected to need `needed` bytes at its peak, more than the
+    /// `available` bytes running builds leave of the memory budget.
+    Memory { needed: u64, available: u64 },
     /// It waits for a busy slot that has what it needs, although another
     /// slot is idle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub held: Option<Hold>,
-    /// It waits for memory: it is expected to need this many bytes at its
-    /// peak, more than running builds leave.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_needed: Option<u64>,
+    Warm { hold: Hold },
+    /// Disk admission holds it.
+    Disk { disk: DiskWait },
+}
+
+impl Wait {
+    /// Whether `other` is the same reason, whatever its current numbers:
+    /// a client hears again only when the reason changes.
+    #[must_use]
+    pub fn same_reason(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Warm { hold }, Self::Warm { hold: other }) => hold.slot == other.slot,
+            (Self::Disk { disk }, Self::Disk { disk: other }) => {
+                std::mem::discriminant(disk) == std::mem::discriminant(other)
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+impl std::fmt::Display for Wait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::log::gib;
+        match self {
+            Self::Slot => f.write_str("waiting for a free slot"),
+            Self::Exclusive => f.write_str("waiting for exclusive work on this host"),
+            Self::Queue => f.write_str("waiting behind earlier builds"),
+            Self::Memory { needed, available } => write!(
+                f,
+                "waiting for memory: needs {}, {} available",
+                gib(*needed),
+                gib(*available)
+            ),
+            Self::Warm { hold } => write!(
+                f,
+                "waiting for warm slot {}: ~{} s there against ~{} s cold",
+                hold.slot,
+                hold.wait_ms / 1000,
+                hold.cold_ms / 1000
+            ),
+            Self::Disk { disk } => write!(f, "waiting for disk: {disk}"),
+        }
+    }
 }
 
 /// Why a build waits for a busy slot: building cold in an idle one was
@@ -743,6 +890,13 @@ pub enum EventKind {
         operation: Operation,
         revision: Revision,
     },
+    /// A queued build was given up before it started, as `reason` says.
+    Refused {
+        who: Vec<String>,
+        operation: Operation,
+        revision: Revision,
+        reason: String,
+    },
     /// A running build nobody waited for any more was stopped.
     Cancelled {
         slot: String,
@@ -807,6 +961,54 @@ pub struct TestMemory {
 mod tests {
     use super::*;
     use crate::cargo::Command;
+
+    #[test]
+    fn a_waiting_client_reads_the_disk_shortfall_with_its_numbers() {
+        const GIB: u64 = 1 << 30;
+        let wait = Wait::Disk {
+            disk: DiskWait::Headroom(Headroom {
+                free: 25 * GIB - 400 * (1 << 20),
+                floor: 15 * GIB,
+                running: 0,
+                build: Some(Growth {
+                    bytes: 10 * GIB,
+                    measured: false,
+                }),
+            }),
+        };
+        assert_eq!(
+            wait.to_string(),
+            "waiting for disk: 24.6 GiB free, needs 25.0 GiB (floor 15.0 GiB + 10.0 GiB for \
+             this build, no history: build_headroom_gib); free 0.4 GiB more on this volume"
+        );
+        let measured = Headroom {
+            free: 15 * GIB,
+            floor: 15 * GIB,
+            running: 2 * GIB,
+            build: Some(Growth {
+                bytes: GIB / 2,
+                measured: true,
+            }),
+        };
+        assert_eq!(
+            measured.to_string(),
+            "15.0 GiB free, needs 17.5 GiB (floor 15.0 GiB + 2.0 GiB reserved by running \
+             builds + 0.5 GiB for this build, from its slot's history); free 2.5 GiB more on \
+             this volume"
+        );
+        // `--json` prints the same message as a tagged line.
+        let line = serde_json::to_string(&Message::Waiting { wait: wait.clone() }).unwrap();
+        assert!(
+            line.starts_with(
+                r#"{"type":"waiting","wait":{"kind":"disk","disk":{"kind":"headroom","#
+            ),
+            "{line}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Message>(&line).unwrap(),
+            Message::Waiting { wait }
+        );
+    }
 
     #[test]
     fn requests_and_messages_are_tagged_json_lines() {

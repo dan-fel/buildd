@@ -71,6 +71,18 @@ pub(crate) struct CompilationRun {
     /// Largest sampled test-phase peak at the recorded test concurrency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) test_memory: Option<crate::protocol::TestMemory>,
+    /// What the latest build of it measured alone added to the slot's
+    /// target, and the target's size after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) disk: Option<DiskUse>,
+}
+
+/// A slot's target after one build, in bytes: what the build added, and
+/// what the target held then.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DiskUse {
+    pub(crate) added: u64,
+    pub(crate) total: u64,
 }
 
 /// A slot directory a daemon left behind.
@@ -1200,6 +1212,7 @@ mod tests {
                 build_ms: Some(4200),
                 peak_memory: None,
                 test_memory: None,
+                disk: None,
             }],
             units: [(
                 "debug/0123456789abcdef".to_owned(),

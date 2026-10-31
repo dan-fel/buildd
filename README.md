@@ -91,7 +91,12 @@ State lives in `$BUILDD_HOME`: by default `~/Library/Caches/buildd` on macOS
 or `~/.cache/buildd` on Linux. Set budgets in its `config.toml` with `slots`,
 `jobs`, `test_jobs`, `memory_gib` and `disk_gib`. Defaults allow two concurrent
 builds per repository and share the available CPUs. Disk admission keeps
-15 GiB free plus 10 GiB of growth headroom per running build. See
+15 GiB free plus the output each running build is expected to add: what
+the same kind of build last added to its slot, or 10 GiB for a build
+without history. A queued build tells its client why it waits, with the
+numbers. When free disk is short, nothing runs and idle artifacts cannot
+cover it, the build is refused after two minutes (`disk_wait_secs`) instead
+of waiting for space nobody frees. See
 [the configuration fields](src/config.rs) for all settings and defaults.
 Restart daemons after configuration changes or upgrades, once active work
 has finished.

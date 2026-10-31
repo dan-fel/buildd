@@ -1164,18 +1164,29 @@ impl Daemon {
                     operation,
                     reply,
                 } => {
-                    let peak_memory =
-                        self.scheduler
-                            .forecast_memory(&repository, &prefix, &operation);
                     let _ = reply.send(Capacity {
                         status: self.status(),
-                        peak_memory,
+                        peak_memory: self.scheduler.forecast_memory(
+                            &repository,
+                            &prefix,
+                            &operation,
+                        ),
+                        disk_growth: self.scheduler.forecast_growth(
+                            &repository,
+                            &prefix,
+                            &operation,
+                        ),
                     });
                     Vec::new()
                 }
                 Event::Forecast { submission, reply } => {
                     let capacity = Capacity {
                         peak_memory: self.scheduler.forecast_memory(
+                            &submission.source.repository,
+                            &submission.source.prefix,
+                            &submission.operation,
+                        ),
+                        disk_growth: self.scheduler.forecast_growth(
                             &submission.source.repository,
                             &submission.source.prefix,
                             &submission.operation,
@@ -1282,6 +1293,7 @@ impl Daemon {
             free_disk: self.scheduler.disk_space(),
             min_free: self.config.min_free,
             build_headroom: self.config.build_headroom,
+            disk_reserved: self.scheduler.disk_reserved(),
             disk_wait: self.scheduler.disk_wait().cloned(),
             undersized: self.scheduler.undersized(),
             memory,

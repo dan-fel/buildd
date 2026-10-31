@@ -447,6 +447,7 @@ struct Diagnostic {
 fn render(message: &Message, command: Command) {
     match message {
         Message::Queued { revision } => eprintln!("buildd: tree {} queued", revision.short()),
+        Message::Waiting { wait } => eprintln!("buildd: {wait}"),
         Message::Started { revision, slot } => {
             let doing = if command.uses_cargo() {
                 "building"
@@ -638,6 +639,7 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         free_disk,
         min_free,
         build_headroom,
+        disk_reserved,
         disk_wait,
         undersized,
         memory,
@@ -681,7 +683,8 @@ fn status(home: &Path) -> Result<ExitCode, String> {
     }
     if let Some(wait) = disk_wait {
         println!(
-            "disk admission: {wait} ({} headroom per build)",
+            "disk admission: {wait}; running builds reserve {}, a build without history {}",
+            gib(disk_reserved),
             gib(build_headroom)
         );
     }
@@ -725,11 +728,10 @@ fn status(home: &Path) -> Result<ExitCode, String> {
         }
     }
     for (position, build) in queue.iter().enumerate() {
-        let why = match (&build.memory_needed, &build.held) {
-            (Some(needed), _) => format!(", waiting for memory (needs {})", gib(*needed)),
-            (None, Some(hold)) => format!(", waiting for slot {}", hold.slot),
-            (None, None) => String::new(),
-        };
+        let why = build
+            .wait
+            .as_ref()
+            .map_or_else(String::new, |wait| format!(", {wait}"));
         println!(
             "queued {}: {} {} (waited {}{}{why}) for {}",
             position + 1,

@@ -744,7 +744,9 @@ use std::time::{Duration, Instant};
 
 use buildd::cargo::{Command, Operation};
 use buildd::client;
-use buildd::protocol::{Activity, BuildRequest, EventKind, Message, Outcome, Status};
+use buildd::protocol::{
+    Activity, BuildRequest, DiskWait, EventKind, Headroom, Message, Outcome, Status, Wait,
+};
 
 #[test]
 fn serve_publishes_a_queued_frame_before_waiting_for_more_output_and_relays_eof() {
@@ -2461,6 +2463,54 @@ fn a_restarted_daemon_meets_its_budget_by_retiring_old_cache_and_keeps_dependenc
             }
         )),
         "the dependency output was reused"
+    );
+}
+
+#[test]
+fn a_build_hears_why_it_waits_for_disk_and_is_refused_when_nothing_will_free_it() {
+    // Output no volume covers, for a build without history: only someone
+    // freeing space could admit it, and a second is allowed for that.
+    let mut daemon = Daemon::start(1);
+    std::fs::write(
+        daemon.home.0.join("config.toml"),
+        "slots = 1\njobs = 4\nmin_free_gib = 0\nbuild_headroom_gib = 16777216\ndisk_wait_secs = 1\n",
+    )
+    .unwrap();
+    daemon.restart();
+    let repository = crate_repository(None);
+    let messages = daemon.build(&repository.0, Command::Check, &[]);
+    let [
+        Message::Queued { .. },
+        Message::Waiting {
+            wait:
+                Wait::Disk {
+                    disk:
+                        DiskWait::Headroom(Headroom {
+                            build: Some(growth),
+                            ..
+                        }),
+                },
+        },
+        Message::Rejected { reason },
+    ] = &messages[..]
+    else {
+        panic!("{messages:#?}");
+    };
+    assert_eq!(growth.bytes, 16_777_216 << 30);
+    assert!(!growth.measured);
+    assert!(
+        reason.starts_with(
+            "refused: for 1 s no build ran on this host and idle build artifacts could not cover"
+        ),
+        "{reason}"
+    );
+    assert!(daemon.status().queue.is_empty());
+    assert!(
+        daemon
+            .activity()
+            .events
+            .iter()
+            .any(|event| matches!(&event.kind, EventKind::Refused { reason: refused, .. } if refused == reason))
     );
 }
 

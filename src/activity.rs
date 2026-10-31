@@ -178,7 +178,10 @@ impl ActivityLog {
             }
             EventKind::Dropped { .. } => totals.dropped += 1,
             EventKind::Cancelled { .. } => totals.cancelled += 1,
-            EventKind::Evicted { .. } | EventKind::Held { .. } | EventKind::Duplicated { .. } => {}
+            EventKind::Evicted { .. }
+            | EventKind::Held { .. }
+            | EventKind::Duplicated { .. }
+            | EventKind::Refused { .. } => {}
         }
         let event = Event {
             at_ms: epoch_millis(at),
@@ -449,6 +452,7 @@ mod tests {
             free_disk: None,
             min_free: 0,
             build_headroom: 0,
+            disk_reserved: 0,
             disk_wait: None,
             undersized: false,
             memory: 1,

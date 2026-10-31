@@ -2205,6 +2205,7 @@ mod tests {
                 disk: u64::MAX,
                 min_free: 0,
                 build_headroom: 0,
+                disk_wait: Duration::from_secs(120),
                 remotes: Vec::new(),
                 prewarm: Vec::new(),
             };
@@ -2237,6 +2238,7 @@ mod tests {
                         build_ms: None,
                         peak_memory: None,
                         test_memory: None,
+                        disk: None,
                     }],
                     passed: vec![crate::passed::PassedBinary {
                         id: "test".into(),
