@@ -35,7 +35,8 @@ usage:
         --os OS            use any enabled host running OS (linux, macos)
         --host NAME        use this configured host, or local
         --exclusive        wait for active builds, then run alone on that host;
-                           later submissions wait even with spare capacity
+                           later submissions wait even with spare capacity;
+                           it runs at the daemon's priority, not below it
       Without a constraint, use an enabled host with available capacity.
       Artifact exports without a host or OS constraint build locally.
   buildd run [--json] [--copy-to DIR] [--os OS] [--host NAME] [--exclusive] -- COMMAND [ARGS...]

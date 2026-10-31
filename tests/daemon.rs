@@ -1524,6 +1524,37 @@ fn delivered(messages: &[Message]) -> Vec<PathBuf> {
 }
 
 #[test]
+fn builds_run_below_interactive_work_and_exclusive_work_at_the_daemons_priority() {
+    // What the scheduler gives a process the command starts: on macOS its
+    // priority, on Linux its nice value and policy.
+    let report = if cfg!(target_os = "macos") {
+        "sh -c 'ps -o pri= -p $$'"
+    } else {
+        "awk '{ print $19, $41 }' /proc/self/stat"
+    };
+    let direct = Process::new("sh").args(["-c", report]).output().unwrap();
+    let direct = String::from_utf8(direct.stdout).unwrap();
+    let daemon = Daemon::start(1);
+    let repository = crate_repository(None);
+    let mut request = run_request(&repository.0, &["sh", "-c", report]);
+    let low = daemon.submit(request.clone());
+    assert!(outcome(&low).success(), "{low:#?}");
+    let low = lines(&low, true).join("\n");
+    if cfg!(target_os = "macos") {
+        // The utility QoS class's base priority.
+        assert_eq!(low.trim(), "20");
+    } else {
+        let (nice, policy) = low.split_once(' ').unwrap();
+        assert!(nice.parse::<i32>().unwrap() >= 10, "{low}");
+        assert_eq!(policy, "3", "SCHED_BATCH: {low}");
+    }
+    request.exclusive = true;
+    let exclusive = daemon.submit(request);
+    assert!(outcome(&exclusive).success(), "{exclusive:#?}");
+    assert_eq!(lines(&exclusive, true).join("\n"), direct.trim_end());
+}
+
+#[test]
 fn a_command_runs_on_the_worktrees_snapshot_in_a_slot_and_delivers_its_outputs() {
     use std::os::unix::fs::PermissionsExt as _;
 

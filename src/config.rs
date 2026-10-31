@@ -32,10 +32,27 @@ pub struct Config {
     /// reserving the whole budget. This is admission policy, not a measured
     /// peak or a process memory limit.
     pub unmeasured_memory: Option<u64>,
+    /// The priority of the processes builds start, which everything they
+    /// start keeps. Exclusive work always runs at [`Priority::Normal`].
+    pub priority: Priority,
     /// Other machines eligible for automatic or explicit build placement.
     pub remotes: Vec<Remote>,
     /// Branches whose new commits are built before anyone asks.
     pub prewarm: Vec<Prewarm>,
+}
+
+/// How a host's builds share its processors and disk with the people using
+/// it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    /// Below interactive work, which always goes first: builds take the
+    /// processors nobody else is using. On macOS the utility QoS class; on
+    /// Linux nice 10, `SCHED_BATCH` and the lowest best-effort I/O priority.
+    #[default]
+    Low,
+    /// The daemon's own priority.
+    Normal,
 }
 
 /// A branch whose new commits buildd builds as optional work, so the
@@ -82,6 +99,8 @@ struct File {
     memory_gib: Option<f64>,
     unmeasured_memory_gib: Option<f64>,
     #[serde(default)]
+    priority: Priority,
+    #[serde(default)]
     remote: Vec<Remote>,
     #[serde(default)]
     prewarm: Vec<Prewarm>,
@@ -95,8 +114,9 @@ impl Config {
     /// Reads `config.toml` in `home`. Absent settings take their defaults:
     /// two slots, one job per available CPU, half of them for a build's
     /// tests, 20 GiB of build disk per slot, 15 GiB of free disk, 10 GiB of
-    /// output headroom per running build, and the
-    /// machine's memory less 6 GiB for builds.
+    /// output headroom per running build, the
+    /// machine's memory less 6 GiB for builds, and builds at
+    /// [`Priority::Low`].
     ///
     /// # Errors
     /// When the file cannot be read or parsed, or a limit is not positive.
@@ -188,6 +208,7 @@ impl Config {
             unmeasured_memory: file
                 .unmeasured_memory_gib
                 .map(|gib| (gib * GIB).round() as u64),
+            priority: file.priority,
             remotes: file.remote,
             prewarm: file.prewarm,
         };
@@ -339,10 +360,15 @@ mod tests {
             build_headroom: 10 << 30,
             memory: 8 << 30,
             unmeasured_memory: None,
+            priority: Priority::Low,
             remotes: Vec::new(),
             prewarm: Vec::new(),
         };
         assert_eq!(Config::load(&home.0).unwrap(), expected);
+        write("priority = \"normal\"\n");
+        assert_eq!(Config::load(&home.0).unwrap().priority, Priority::Normal);
+        write("priority = \"idle\"\n");
+        assert!(Config::load(&home.0).is_err());
         write("memory_gib = 8\nunmeasured_memory_gib = 2\n");
         assert_eq!(
             Config::load(&home.0).unwrap().unmeasured_memory,

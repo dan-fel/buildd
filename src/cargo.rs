@@ -3,7 +3,6 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 
@@ -402,16 +401,13 @@ impl fmt::Display for Operation {
 
 /// The `cargo` process for `operation` in `directory` of a slot's checkout,
 /// its tests running on `test_jobs` threads or processes,
-/// building into the slot's `target`. It runs in its own process group so a
-/// cancellation reaches everything it started.
+/// building into the slot's `target`, for [`crate::spawn::spawn`].
 pub(crate) fn command(
     directory: &Path,
     target: &Path,
     operation: &Operation,
     test_jobs: usize,
 ) -> std::process::Command {
-    use std::os::unix::process::CommandExt as _;
-
     let mut command = std::process::Command::new("cargo");
     command.current_dir(directory);
     match operation.command {
@@ -432,11 +428,7 @@ pub(crate) fn command(
         .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TERM_PROGRESS_WHEN", "never")
         .env_remove("CARGO_BUILD_TARGET_DIR")
-        .env_remove("CARGO_BUILD_JOBS")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .env_remove("CARGO_BUILD_JOBS");
     if !operation.rustflags.is_empty() {
         command.env(
             "CARGO_ENCODED_RUSTFLAGS",

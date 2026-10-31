@@ -184,6 +184,8 @@ pub(crate) struct Start {
     pub(crate) revision: Revision,
     pub(crate) operation: Operation,
     pub(crate) copy_to: Option<PathBuf>,
+    /// It has the host to itself.
+    pub(crate) exclusive: bool,
     /// Who asked, for its log.
     pub(crate) who: Vec<String>,
     /// The test binaries that passed in the slot, which a run of every test
@@ -1565,6 +1567,7 @@ impl<D: Distance> Scheduler<D> {
                 revision: job.revision.clone(),
                 operation: job.operation.clone(),
                 copy_to: job.copy_to.clone(),
+                exclusive: job.exclusive,
                 who: job.who(),
                 passed: if job.operation.runs_every_test() && !job.rerun_all {
                     self.slots[slot].passed.clone()
@@ -2384,6 +2387,7 @@ mod tests {
             test_jobs: 2,
             memory: u64::MAX,
             unmeasured_memory: None,
+            priority: crate::config::Priority::Low,
             disk: u64::MAX,
             min_free: 0,
             build_headroom: 0,

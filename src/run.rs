@@ -22,7 +22,6 @@
 //! buildd promises about that slot.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use crate::cargo::Operation;
 use crate::log::log;
@@ -66,8 +65,8 @@ impl Drop for RunDirectory {
 }
 
 /// The process of `operation`, a `run`, in `directory` of a slot's checkout
-/// of `tree`, using `jobs` cores and the directories of `run`. It runs in
-/// its own process group so a cancellation reaches everything it started.
+/// of `tree`, using `jobs` cores and the directories of `run`, for
+/// [`crate::spawn::spawn`].
 pub(crate) fn command(
     directory: &Path,
     operation: &Operation,
@@ -75,8 +74,6 @@ pub(crate) fn command(
     run: &RunDirectory,
     jobs: usize,
 ) -> std::process::Command {
-    use std::os::unix::process::CommandExt as _;
-
     let (program, args) = operation
         .args
         .split_first()
@@ -97,11 +94,7 @@ pub(crate) fn command(
         .env("CARGO_TARGET_DIR", run.target())
         .env("CARGO_BUILD_JOBS", jobs.to_string())
         .env_remove("CARGO_BUILD_TARGET_DIR")
-        .env_remove("CARGO_MAKEFLAGS")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .env_remove("CARGO_MAKEFLAGS");
     command
 }
 

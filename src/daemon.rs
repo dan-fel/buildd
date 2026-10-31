@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,7 @@ use crate::scheduler::{
 };
 use crate::slot::{self, Inventory, SlotDirectory, SlotRecord, slot_name};
 use crate::snapshot::{self, Source};
+use crate::spawn::spawn;
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
 /// process group is killed.
@@ -1329,6 +1331,13 @@ impl Daemon {
                     .cloned();
                 let logs = self.home.join("logs");
                 let log = BuildLog::create(&logs, log_name(start.job), &log_header(&start));
+                // Exclusive work has the host to itself, often to measure
+                // it, so it runs at the daemon's own priority.
+                let priority = if start.exclusive {
+                    config::Priority::Normal
+                } else {
+                    self.config.priority
+                };
                 let building = Building {
                     slot: SlotDirectory::new(&self.home, &start.repository, start.slot),
                     start,
@@ -1337,6 +1346,7 @@ impl Daemon {
                     runs: self.home.join("runs"),
                     budget: self.budget.clone(),
                     test_jobs: self.config.test_jobs,
+                    priority,
                     workspace,
                     run,
                     events: self.events.clone(),
@@ -1603,6 +1613,8 @@ struct Building {
     /// Threads a test build's tests run on, and the cores a `run` command
     /// may keep busy.
     test_jobs: usize,
+    /// What the build's processes run at.
+    priority: config::Priority,
     /// The repository's workspace, once known: what decides which test
     /// binaries a run of every test may skip.
     workspace: Option<Workspace>,
@@ -1778,10 +1790,11 @@ impl Building {
             operation,
             self.test_jobs,
         );
-        lease.configure(&mut command);
+        let jobserver = lease.configure(&mut command);
         let products = Arc::new(Mutex::new(Vec::new()));
         let (status, usage) = self.execute(
             command,
+            &jobserver,
             Stream::Cargo {
                 target,
                 products: Arc::clone(&products),
@@ -1826,7 +1839,7 @@ impl Building {
             &own,
             self.test_jobs,
         );
-        let ran = self.execute(command, Stream::Stdout);
+        let ran = self.execute(command, &[], Stream::Stdout);
         // Whatever the command changed in the checkout, the slot holds the
         // tree it names again. A failure here leaves that to the next
         // build's checkout, which makes the same reset.
@@ -1848,17 +1861,18 @@ impl Building {
         (outcome, Some(usage))
     }
 
-    /// Starts `command`, which runs in a process group of its own, and
-    /// forwards its standard output as `stdout` says and its standard error
-    /// until it exits; a cancellation stops the whole group. Returns how it
-    /// exited and what it used.
+    /// Starts `command` at the build's priority with `inherit` open, as
+    /// [`spawn`] does, and forwards its standard output as `stdout` says and
+    /// its standard error until it exits; a cancellation stops its whole
+    /// process group. Returns how it exited and what it used.
     fn execute(
         &self,
-        mut command: std::process::Command,
+        command: std::process::Command,
+        inherit: &[RawFd],
         stdout: Stream,
     ) -> Result<(ExitStatus, Usage), String> {
         let program = command.get_program().to_string_lossy().into_owned();
-        let mut child = {
+        let process = {
             let mut state = self.run.lock();
             if let Some(reason) = &state.stopped {
                 return Err(match reason {
@@ -1866,28 +1880,30 @@ impl Building {
                     Stop::Failed(reason) => reason.clone(),
                 });
             }
-            let child = command
-                .spawn()
+            let process = spawn(command, inherit, self.priority)
                 .map_err(|error| format!("could not start {program}: {error}"))?;
-            state.group = Some(Pid::from_child(&child));
+            state.group = Some(process.pid);
             state.exited = false;
-            child
+            process
         };
-        let pid = Pid::from_child(&child);
-        let monitor = match memory::Monitor::start(child.id()) {
+        let pid = process.pid;
+        let monitor = match memory::Monitor::start(pid.as_raw_pid().cast_unsigned()) {
             Ok(monitor) => monitor,
             Err(error) => {
                 kill_leftovers(pid);
                 self.run.lock().exited = true;
-                reap(&child);
+                reap(pid);
                 return Err(format!("could not start memory sampling: {error}"));
             }
         };
         let (done, finished) = crossbeam_channel::bounded(2);
-        let output = child.stdout.take().expect("the process's output is piped");
-        let errors = child.stderr.take().expect("the process's errors are piped");
-        self.forward(output, stdout, done.clone(), Some(monitor.events.clone()));
-        self.forward(errors, Stream::Stderr, done, None);
+        self.forward(
+            process.stdout,
+            stdout,
+            done.clone(),
+            Some(monitor.events.clone()),
+        );
+        self.forward(process.stderr, Stream::Stderr, done, None);
         // Wait without reaping, so the process group id cannot be reused
         // while the group's remaining processes are killed and before a
         // pending cancellation learns that the process exited.
@@ -1906,7 +1922,7 @@ impl Building {
         let (peak, test_peak) = monitor.finish();
         kill_leftovers(pid);
         self.run.lock().exited = true;
-        let (status, mut usage) = reap(&child);
+        let (status, mut usage) = reap(pid);
         usage.peak_memory = usage.peak_memory.max(peak);
         usage.test_memory = test_peak.map(|peak_memory| TestMemory {
             jobs: self.test_jobs,
@@ -2090,12 +2106,12 @@ const MAX_RSS_UNIT: u64 = 1;
 #[cfg(not(target_os = "macos"))]
 const MAX_RSS_UNIT: u64 = 1024;
 
-/// Reaps `child`, which has exited, with what it and the processes it
+/// Reaps `pid`, which has exited, with what it and the processes it
 /// waited for used: Cargo waits for every compiler it starts.
-fn reap(child: &std::process::Child) -> (ExitStatus, Usage) {
+fn reap(pid: Pid) -> (ExitStatus, Usage) {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let pid = libc::pid_t::try_from(child.id()).expect("process ids fit pid_t");
+    let pid = pid.as_raw_pid();
     let mut status = 0;
     // SAFETY: rusage holds only integers, for which all zeroes is valid.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };

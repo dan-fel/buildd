@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -269,10 +269,10 @@ pub(crate) struct Lease {
 
 impl Lease {
     /// Makes `command` a client of the build's jobserver, as Cargo reads it
-    /// from `CARGO_MAKEFLAGS`.
-    pub(crate) fn configure(&self, command: &mut std::process::Command) {
-        use std::os::unix::process::CommandExt as _;
-
+    /// from `CARGO_MAKEFLAGS`. Returns the jobserver's descriptors, which
+    /// the process must inherit; the account keeps them open until the
+    /// lease is dropped.
+    pub(crate) fn configure(&self, command: &mut std::process::Command) -> [RawFd; 2] {
         let ledger = self.budget.ledger();
         let account = &ledger.accounts[&self.id];
         let read = account.child_reader.as_raw_fd();
@@ -281,18 +281,7 @@ impl Lease {
             "CARGO_MAKEFLAGS",
             format!("-j --jobserver-fds={read},{write} --jobserver-auth={read},{write}"),
         );
-        // SAFETY: the closure only calls fcntl, which is async-signal-safe,
-        // on descriptors the account keeps open until the lease is dropped,
-        // after the child started.
-        unsafe {
-            command.pre_exec(move || {
-                for fd in [read, write] {
-                    let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
-                    rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())?;
-                }
-                Ok(())
-            });
-        }
+        [read, write]
     }
 
     /// The build's processes use cores without taking tokens from now on,

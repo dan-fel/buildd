@@ -96,6 +96,14 @@ builds per repository and share the available CPUs. Disk admission keeps
 Restart daemons after configuration changes or upgrades, once active work
 has finished.
 
+Builds run below interactive work, so the apps you use stay responsive and
+builds take the processors nobody else needs. Cargo and everything it
+starts run in the utility QoS class on macOS, and at nice 10 with
+`SCHED_BATCH` and the lowest best-effort I/O priority on Linux. Set
+`priority = "normal"` in a host's `config.toml` to build at the daemon's own
+priority. `--exclusive` work always runs at the daemon's own priority, so
+measurements are not slowed or skewed.
+
 - Files ignored by Git are omitted unless already tracked. Generated inputs
   must be tracked or created during the build.
 - Builds use the daemon's environment. Pass compiler flags with

@@ -2201,6 +2201,7 @@ mod tests {
                 test_jobs: 2,
                 memory: u64::MAX,
                 unmeasured_memory: None,
+                priority: crate::config::Priority::Low,
                 disk: u64::MAX,
                 min_free: 0,
                 build_headroom: 0,
