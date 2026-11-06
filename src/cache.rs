@@ -5,9 +5,8 @@
 //! running and its exact receipt can be queried until expiry. A new daemon has
 //! no knowledge of an old daemon's outcomes and refuses its receipts.
 
+use crate::facts::Facts;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::Read as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -192,31 +191,6 @@ pub enum Response {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Fingerprint {
-    dev: u64,
-    inode: u64,
-    mode: u32,
-    len: u64,
-    links: u64,
-    blocks: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-fn fingerprint(metadata: &std::fs::Metadata) -> Fingerprint {
-    Fingerprint {
-        dev: metadata.dev(),
-        inode: metadata.ino(),
-        mode: metadata.mode(),
-        len: metadata.len(),
-        links: metadata.nlink(),
-        blocks: metadata.blocks(),
-        modified: (metadata.mtime(), metadata.mtime_nsec()),
-        changed: (metadata.ctime(), metadata.ctime_nsec()),
-    }
-}
-
 /// A Cargo artifact group, not a caller-supplied pathname. Compiled units
 /// include every matching hash in the profile's Cargo kind directories.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -252,9 +226,9 @@ impl Scope {
 #[derive(Debug)]
 struct Snapshot {
     root: PathBuf,
-    ancestors: BTreeMap<PathBuf, std::fs::Metadata>,
+    ancestors: BTreeMap<PathBuf, Facts>,
     roots: BTreeMap<Scope, Vec<PathBuf>>,
-    entries: BTreeMap<PathBuf, std::fs::Metadata>,
+    entries: BTreeMap<PathBuf, Facts>,
 }
 
 #[derive(Debug)]
@@ -384,20 +358,20 @@ impl Scan {
         if !metadata.is_dir() {
             return Err(Refusal::Protected);
         }
+        let facts =
+            Facts::read(&self.snapshot.root.join(path), &metadata).map_err(|_| Refusal::Io)?;
         if let Some(expected) = &mut self.expected {
             let (path, before) = expected
                 .ancestors
                 .remove_entry(path)
                 .ok_or(Refusal::Changed)?;
-            if (before.dev(), before.ino(), before.mode())
-                != (metadata.dev(), metadata.ino(), metadata.mode())
-            {
+            if (before.dev, before.inode, before.mode) != (facts.dev, facts.inode, facts.mode) {
                 return Err(Refusal::Protected);
             }
             self.snapshot.ancestors.insert(path, before);
         } else if self.selected.is_some() && !self.snapshot.ancestors.contains_key(path) {
             self.admit(path.as_os_str().len())?;
-            self.snapshot.ancestors.insert(path.to_owned(), metadata);
+            self.snapshot.ancestors.insert(path.to_owned(), facts);
         }
         Ok(())
     }
@@ -487,12 +461,14 @@ impl Scan {
         scope: &Scope,
         metadata: std::fs::Metadata,
     ) -> Result<(), Refusal> {
+        let facts =
+            Facts::read(&self.snapshot.root.join(path), &metadata).map_err(|_| Refusal::Io)?;
         if let Some(expected) = &mut self.expected {
             let (path, before) = expected
                 .entries
                 .remove_entry(path)
                 .ok_or(Refusal::Changed)?;
-            if fingerprint(&before) != fingerprint(&metadata) {
+            if before != facts {
                 return Err(Refusal::Changed);
             }
             self.snapshot.entries.insert(path, before);
@@ -516,17 +492,17 @@ impl Scan {
             return self.incomplete(Some(scope), Refusal::Protected);
         }
         if self.measurements[scope].incomplete.is_none() {
-            let bytes = metadata.blocks() * 512;
-            if metadata.is_dir() || metadata.nlink() == 1 {
+            let bytes = facts.bytes;
+            if metadata.is_dir() || facts.links == 1 {
                 self.measurements.get_mut(scope).expect("inserted").bytes += bytes;
             } else {
-                let inode = (metadata.dev(), metadata.ino());
+                let inode = (facts.dev, facts.inode);
                 if !self.links.contains_key(&inode) && self.links.len() >= self.max_entries {
                     self.incomplete(Some(scope), Refusal::Limit)?;
                 } else {
                     let link = self.links.entry(inode).or_insert_with(|| Link {
                         bytes,
-                        links: metadata.nlink(),
+                        links: facts.links,
                         seen: 0,
                         scope: self.measurements[scope].identity,
                     });
@@ -547,7 +523,7 @@ impl Scan {
             if self.snapshot.entries.len() >= self.max_entries {
                 return Err(Refusal::Limit);
             }
-            self.snapshot.entries.insert(path.to_owned(), metadata);
+            self.snapshot.entries.insert(path.to_owned(), facts);
         }
         Ok(())
     }
@@ -945,25 +921,63 @@ pub(crate) struct Cache {
     max_text_bytes: usize,
 }
 
+#[cfg(unix)]
+fn random_identity() -> std::io::Result<[u8; 16]> {
+    use std::io::Read as _;
+    let mut random = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    Ok(random)
+}
+
+#[cfg(windows)]
+fn random_identity() -> std::io::Result<[u8; 16]> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    let mut random = [0_u8; 16];
+    // SAFETY: the buffer is writable for its exact supplied length, and the
+    // flag selects the system's generator instead of an algorithm handle.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            random.as_mut_ptr(),
+            16,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::other(format!("status {status:#x}")));
+    }
+    Ok(random)
+}
+
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    let mut hostname = [0_u8; 256];
+    // SAFETY: the buffer is writable for its exact supplied length.
+    if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 {
+        return None;
+    }
+    let end = hostname
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(hostname.len());
+    Some(String::from_utf8_lossy(&hostname[..end]).into_owned())
+}
+
+#[cfg(windows)]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 impl Cache {
     pub(crate) fn new(home: &Path) -> Result<Self, String> {
-        let mut random = [0_u8; 16];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut random))
+        let random = random_identity()
             .map_err(|error| format!("could not identify daemon incarnation: {error}"))?;
-        let mut hostname = [0_u8; 256];
-        // SAFETY: the buffer is writable for its exact supplied length.
-        if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 {
-            return Err("could not identify cache host".into());
-        }
-        let end = hostname
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(hostname.len());
         let host = format!(
             "{}:{}",
-            String::from_utf8_lossy(&hostname[..end]),
-            home.canonicalize()
+            hostname().ok_or("could not identify cache host")?,
+            crate::snapshot::canonicalize(home)
                 .map_err(|error| error.to_string())?
                 .display()
         );
@@ -2058,7 +2072,7 @@ fn removal(items: &[ScopedItem], snapshots: HashMap<String, Snapshot>) -> Stage 
                     .copied()
                     .expect("manifest entry belongs to selected scope");
                 remaining[item] += 1;
-                (item, target, path, metadata.is_dir())
+                (item, target, path, metadata.is_dir)
             })
             .collect::<Vec<_>>();
         selected.sort_by_key(|(_, _, path, _)| std::cmp::Reverse(path.components().count()));
@@ -2716,6 +2730,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ordinary_symlink_leaves_are_removed_without_following_their_referents() {
         let mut fixture = Fixture::new();
@@ -2750,6 +2765,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_ancestors_refuse_selected_revalidation_and_preserve_external_data() {
         let mut fixture = Fixture::new();
@@ -3518,6 +3534,7 @@ mod tests {
         assert!(fixture.cache.budget_bytes() <= fixture.cache.max_text_bytes);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unsupported_artifact_group_is_visible_without_invented_size_or_approval() {
         let mut fixture = Fixture::new();
@@ -3632,6 +3649,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     mod torture {
         use super::*;
         #[test]

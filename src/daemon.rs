@@ -4,9 +4,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::os::fd::RawFd;
-use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use crate::activity::{ActivityLog, EventFile};
 use crate::budget::{Budget, Lease};
@@ -41,7 +37,8 @@ use crate::scheduler::{
 };
 use crate::slot::{self, Inventory, SlotDirectory, SlotRecord, slot_name};
 use crate::snapshot::{self, Source};
-use crate::spawn::spawn;
+use crate::socket::{UnixListener, UnixStream};
+use crate::spawn::{Descriptor, Group, outcome, spawn};
 
 /// How long a cancelled build may take to stop after `SIGTERM` before its
 /// process group is killed.
@@ -151,12 +148,12 @@ enum Event {
 /// prepared.
 pub fn run(home: &Path, config: Config) -> Result<Infallible, String> {
     std::fs::create_dir_all(home)
-        .and_then(|()| std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)))
+        .and_then(|()| make_private(home))
         .map_err(|error| format!("could not prepare {}: {error}", home.display()))?;
     // Held for the daemon's life: one daemon per home.
     let lock = std::fs::File::create(home.join("daemon.lock"))
         .map_err(|error| format!("could not create the daemon lock: {error}"))?;
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+    lock.try_lock()
         .map_err(|_| format!("another buildd daemon runs for {}", home.display()))?;
     let socket = config::socket(home);
     match std::fs::remove_file(&socket) {
@@ -754,11 +751,7 @@ impl Connection {
                         while matches!(reader.read(&mut buffer), Ok(read) if read > 0) {}
                         let mut child = child.lock().expect("child cannot panic");
                         if matches!(child.try_wait(), Ok(None)) {
-                            let pid = Pid::from_raw(
-                                i32::try_from(child.id()).expect("process ID fits i32"),
-                            )
-                            .expect("nonzero PID");
-                            let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+                            remote::kill_session(&child);
                         }
                     });
             },
@@ -928,7 +921,7 @@ impl Connection {
 /// Checks a directory a request names to copy products into: an absolute
 /// path without `..`, which means the same on every machine.
 fn copy_destination(directory: &Path) -> Result<(), String> {
-    if !directory.is_absolute()
+    if !config::absolute_somewhere(directory)
         || directory
             .components()
             .any(|part| part == std::path::Component::ParentDir)
@@ -946,6 +939,12 @@ fn copy_destination(directory: &Path) -> Result<(), String> {
 /// slots no copy may write into.
 fn copy_destination_here(directory: &Path, home: &Path) -> Result<(), String> {
     copy_destination(directory)?;
+    if !directory.is_absolute() {
+        return Err(format!(
+            "the directory to copy to is not absolute on this machine: {}",
+            directory.display()
+        ));
+    }
     if directory.starts_with(home) {
         return Err(format!(
             "the directory to copy to is inside buildd's home {}: {}",
@@ -990,7 +989,7 @@ fn check_prefix(prefix: &Path) -> Result<(), String> {
 /// `project`'s mirror, which must exist.
 fn existing_mirror(home: &Path, project: &str) -> Result<PathBuf, String> {
     let path = mirror_path(home, project)?;
-    std::fs::canonicalize(&path).map_err(|_| format!("no mirror of {project}: push to it first"))
+    snapshot::canonicalize(&path).map_err(|_| format!("no mirror of {project}: push to it first"))
 }
 
 /// `project`'s mirror under `home`, created when absent, with only its
@@ -1027,7 +1026,7 @@ fn mirror(home: &Path, project: &str) -> Result<PathBuf, String> {
             git::run(delete)?;
         }
     }
-    std::fs::canonicalize(&path).map_err(|error| format!("{}: {error}", path.display()))
+    snapshot::canonicalize(&path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Lets git pack `mirror` once pushes have left many loose objects or packs
@@ -1513,7 +1512,7 @@ struct Run(Mutex<RunState>);
 struct RunState {
     stopped: Option<Stop>,
     /// The process group of Cargo or the command, once it runs.
-    group: Option<Pid>,
+    group: Option<Group>,
     /// Its leader has exited; its group id may be reused.
     exited: bool,
     /// Its account in the job budget, once it has one.
@@ -1548,10 +1547,14 @@ impl Run {
         }
         let graceful = matches!(reason, Stop::Withdrawn);
         state.stopped = Some(reason);
-        let Some(group) = state.group.filter(|_| !state.exited) else {
+        let Some(group) = state.group.clone().filter(|_| !state.exited) else {
             return;
         };
-        signal_group(group, if graceful { Signal::TERM } else { Signal::KILL });
+        if graceful {
+            group.terminate();
+        } else {
+            group.kill();
+        }
         if !graceful {
             return;
         }
@@ -1563,29 +1566,9 @@ impl Run {
                 std::thread::sleep(TERMINATION_GRACE);
                 let state = run.lock();
                 if !state.exited {
-                    signal_group(group, Signal::KILL);
+                    group.kill();
                 }
             });
-    }
-}
-
-fn signal_group(group: Pid, signal: Signal) {
-    match rustix::process::kill_process_group(group, signal) {
-        // The group has no members left.
-        Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-        Err(error) => log!("could not signal process group {group:?}: {error}"),
-    }
-}
-
-/// Kills what remains of process group `group`, whose leader (Cargo or the
-/// command) has exited but is not reaped yet: processes it started and left
-/// behind.
-fn kill_leftovers(group: Pid) {
-    match rustix::process::kill_process_group(group, Signal::KILL) {
-        // No members left, or (macOS) only the unreaped leader itself, which
-        // a signal cannot reach.
-        Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => {}
-        Err(error) => log!("could not kill process group {group:?}: {error}"),
     }
 }
 
@@ -1880,7 +1863,7 @@ impl Building {
     fn execute(
         &self,
         command: std::process::Command,
-        inherit: &[RawFd],
+        inherit: &[Descriptor],
         stdout: Stream,
     ) -> Result<(ExitStatus, Usage), String> {
         let program = command.get_program().to_string_lossy().into_owned();
@@ -1894,17 +1877,17 @@ impl Building {
             }
             let process = spawn(command, inherit, self.priority)
                 .map_err(|error| format!("could not start {program}: {error}"))?;
-            state.group = Some(process.pid);
+            state.group = Some(process.group.clone());
             state.exited = false;
             process
         };
-        let pid = process.pid;
-        let monitor = match memory::Monitor::start(pid.as_raw_pid().cast_unsigned()) {
+        let group = process.group;
+        let monitor = match memory::Monitor::start(group.clone()) {
             Ok(monitor) => monitor,
             Err(error) => {
-                kill_leftovers(pid);
+                group.kill_leftovers();
                 self.run.lock().exited = true;
-                reap(pid);
+                group.reap();
                 return Err(format!("could not start memory sampling: {error}"));
             }
         };
@@ -1916,25 +1899,11 @@ impl Building {
             Some(monitor.events.clone()),
         );
         self.forward(process.stderr, Stream::Stderr, done, None);
-        // Wait without reaping, so the process group id cannot be reused
-        // while the group's remaining processes are killed and before a
-        // pending cancellation learns that the process exited.
-        loop {
-            match rustix::process::waitid(
-                WaitId::Pid(pid),
-                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-            ) {
-                Err(rustix::io::Errno::INTR) => {}
-                Ok(_) => break,
-                Err(error) => {
-                    panic!("waiting for our own child fails only by a bug: {error}")
-                }
-            }
-        }
+        group.wait_exited();
         let (peak, test_peak) = monitor.finish();
-        kill_leftovers(pid);
+        group.kill_leftovers();
         self.run.lock().exited = true;
-        let (status, mut usage) = reap(pid);
+        let (status, mut usage) = group.reap();
         usage.peak_memory = usage.peak_memory.max(peak);
         usage.test_memory = test_peak.map(|peak_memory| TestMemory {
             jobs: self.test_jobs,
@@ -2112,55 +2081,18 @@ fn log_line(log: &Mutex<Option<BuildLog>>, line: &str, stream: fn(&mut BuildLog,
     }
 }
 
-/// The unit of `ru_maxrss`: bytes on macOS, kilobytes elsewhere.
-#[cfg(target_os = "macos")]
-const MAX_RSS_UNIT: u64 = 1;
-#[cfg(not(target_os = "macos"))]
-const MAX_RSS_UNIT: u64 = 1024;
-
-/// Reaps `pid`, which has exited, with what it and the processes it
-/// waited for used: Cargo waits for every compiler it starts.
-fn reap(pid: Pid) -> (ExitStatus, Usage) {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let pid = pid.as_raw_pid();
-    let mut status = 0;
-    // SAFETY: rusage holds only integers, for which all zeroes is valid.
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    loop {
-        // SAFETY: `status` and `usage` are valid for writes for the call.
-        let reaped = unsafe { libc::wait4(pid, &raw mut status, 0, &raw mut usage) };
-        if reaped == pid {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        assert_eq!(
-            error.kind(),
-            std::io::ErrorKind::Interrupted,
-            "reaping our own exited child fails only by a bug: {error}"
-        );
-    }
-    let millis = |time: libc::timeval| {
-        u64::try_from(time.tv_sec).expect("CPU seconds are positive") * 1000
-            + u64::try_from(time.tv_usec).expect("CPU microseconds are positive") / 1000
-    };
-    let usage = Usage {
-        cpu_ms: millis(usage.ru_utime) + millis(usage.ru_stime),
-        peak_memory: u64::try_from(usage.ru_maxrss).expect("memory sizes are positive")
-            * MAX_RSS_UNIT,
-        test_memory: None,
-    };
-    (ExitStatus::from_raw(status), usage)
+/// Makes the daemon's home readable by its user alone. A new directory under
+/// the local application data of a Windows profile already is.
+#[cfg(unix)]
+fn make_private(home: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
 }
 
-fn outcome(status: ExitStatus) -> Outcome {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    match (status.code(), status.signal()) {
-        (Some(code), _) => Outcome::Exited { code },
-        (None, Some(signal)) => Outcome::Signaled { signal },
-        (None, None) => panic!("a reaped process exited or was signaled"),
-    }
+#[cfg(windows)]
+#[expect(clippy::unnecessary_wraps, reason = "the same signature as on Unix")]
+fn make_private(_home: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2181,6 +2113,7 @@ mod tests {
             .count()
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_resource_stop_kills_the_process_group_and_preserves_the_failure_reason() {
         use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -2190,7 +2123,7 @@ mod tests {
             .spawn()
             .unwrap();
         let run = Arc::new(Run::default());
-        run.lock().group = Some(Pid::from_child(&child));
+        run.lock().group = Some(Group(rustix::process::Pid::from_child(&child)));
         run.cancel(Stop::Failed("free disk floor breached".into()));
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
         run.lock().exited = true;
@@ -2203,22 +2136,30 @@ mod tests {
 
     #[test]
     fn products_are_copied_only_to_absolute_directories_outside_the_home() {
-        let home = Path::new("/srv/buildd");
-        assert_eq!(copy_destination_here(Path::new("/srv/bin"), home), Ok(()));
+        let root = if cfg!(windows) { "C:/srv" } else { "/srv" };
+        let home = format!("{root}/buildd");
+        let home = Path::new(&home);
+        assert_eq!(
+            copy_destination_here(Path::new(&format!("{root}/bin")), home),
+            Ok(())
+        );
         for refused in [
-            "bin",
-            "./bin",
-            "/srv/out/../buildd/slots",
-            "/srv/buildd/slots/x/0/target",
+            "bin".to_owned(),
+            "./bin".to_owned(),
+            format!("{root}/out/../buildd/slots"),
+            format!("{root}/buildd/slots/x/0/target"),
         ] {
             assert!(
-                copy_destination_here(Path::new(refused), home).is_err(),
+                copy_destination_here(Path::new(&refused), home).is_err(),
                 "{refused}"
             );
         }
-        // Another machine's home is that machine's to check.
+        // Another machine's home is that machine's to check, in its own form.
         assert_eq!(copy_destination(Path::new("/srv/buildd/out")), Ok(()));
+        assert_eq!(copy_destination(Path::new(r"C:\out")), Ok(()));
+        assert_eq!(copy_destination(Path::new("C:/out")), Ok(()));
         assert!(copy_destination(Path::new("out")).is_err());
+        assert!(copy_destination(Path::new("C:out")).is_err());
     }
 
     #[test]

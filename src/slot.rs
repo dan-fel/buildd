@@ -9,8 +9,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write as _;
-use std::os::unix::ffi::OsStringExt as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -119,7 +117,18 @@ pub(crate) fn existing_slots(home: &Path) -> Result<Vec<ExistingSlot>, String> {
                 project.display()
             )
         })?;
-        let repository = PathBuf::from(std::ffi::OsString::from_vec(repository));
+        #[cfg(unix)]
+        let repository = {
+            use std::os::unix::ffi::OsStringExt as _;
+            PathBuf::from(std::ffi::OsString::from_vec(repository))
+        };
+        #[cfg(windows)]
+        let repository = PathBuf::from(String::from_utf8(repository).map_err(|_| {
+            format!(
+                "{}: a repository identity is a path in UTF-8",
+                project.display()
+            )
+        })?);
         if !repository.is_absolute()
             || project.file_name() != Some(std::ffi::OsStr::new(&project_name(&repository)))
         {
@@ -448,9 +457,40 @@ pub(crate) fn remove(paths: &[PathBuf]) -> Result<(), String> {
 /// # Errors
 /// When the volume cannot be queried.
 pub(crate) fn free_disk(path: &Path) -> Result<u64, String> {
-    let stat = rustix::fs::statvfs(path)
-        .map_err(|error| format!("could not query free disk at {}: {error}", path.display()))?;
-    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    #[cfg(unix)]
+    {
+        let stat = rustix::fs::statvfs(path)
+            .map_err(|error| format!("could not query free disk at {}: {error}", path.display()))?;
+        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>();
+        let mut free = 0;
+        // SAFETY: `wide` is NUL-terminated, `free` is valid for writes, and
+        // the other outputs are optional.
+        let queried = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &raw mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(format!(
+                "could not query free disk at {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(free)
+    }
 }
 
 /// The directories of a profile whose entries are named with the hash of the
@@ -647,7 +687,9 @@ fn disk_usage(path: &Path, items: &[Evictable]) -> Result<DiskUsage, String> {
         let item = items.get(path).copied().or(item);
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let bytes = metadata.blocks() * 512;
+        let facts = crate::facts::Facts::read(path, &metadata)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let bytes = facts.bytes;
         if metadata.is_dir() {
             usage.total += bytes;
             if let Some(item) = item {
@@ -659,7 +701,7 @@ fn disk_usage(path: &Path, items: &[Evictable]) -> Result<DiskUsage, String> {
             }
             return Ok(());
         }
-        if metadata.nlink() == 1 {
+        if facts.links == 1 {
             usage.total += bytes;
             if let Some(item) = item {
                 usage.bytes[item] += bytes;
@@ -667,17 +709,15 @@ fn disk_usage(path: &Path, items: &[Evictable]) -> Result<DiskUsage, String> {
             }
             return Ok(());
         }
-        let inode = inodes
-            .entry((metadata.dev(), metadata.ino()))
-            .or_insert_with(|| {
-                usage.total += bytes;
-                Inode {
-                    bytes,
-                    links: metadata.nlink(),
-                    seen: 0,
-                    owners: BTreeSet::new(),
-                }
-            });
+        let inode = inodes.entry((facts.dev, facts.inode)).or_insert_with(|| {
+            usage.total += bytes;
+            Inode {
+                bytes,
+                links: facts.links,
+                seen: 0,
+                owners: BTreeSet::new(),
+            }
+        });
         inode.seen += 1;
         inode.owners.insert(item);
         Ok(())
@@ -740,7 +780,9 @@ fn remove_path(path: &Path) -> Result<(), String> {
 /// without write permission behind, such as a test's read-only install of a
 /// tool, which would make the removal fail: they are made writable first.
 fn remove_tree(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
     fn writable(path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir() {
             return Ok(());
@@ -753,6 +795,11 @@ fn remove_tree(path: &Path) -> Result<(), String> {
         for entry in std::fs::read_dir(path)? {
             writable(&entry?.path())?;
         }
+        Ok(())
+    }
+    // Windows removes read-only entries with their directory.
+    #[cfg(windows)]
+    fn writable(_path: &Path) -> std::io::Result<()> {
         Ok(())
     }
     writable(path)
@@ -873,10 +920,17 @@ mod tests {
 
     fn set_modified(path: &Path, seconds_ago: u64) {
         let time = SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
-        std::fs::File::open(path)
-            .unwrap()
-            .set_modified(time)
-            .unwrap();
+        let mut options = std::fs::File::options();
+        #[cfg(unix)]
+        options.read(true);
+        // Windows opens a directory only when asked to, and sets its times
+        // only through a handle that may write.
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(
+            options.write(true),
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        );
+        options.open(path).unwrap().set_modified(time).unwrap();
     }
 
     #[test]
@@ -1028,7 +1082,9 @@ mod tests {
             let target = slot.target();
             let first = target.join("debug/incremental/a/file");
             file(&first, 400_000);
-            let blocks = std::fs::metadata(&first).unwrap().blocks() * 512;
+            let blocks = crate::facts::Facts::read(&first, &std::fs::metadata(&first).unwrap())
+                .unwrap()
+                .bytes;
             for cache in ["b", "c"] {
                 let path = target.join(format!("debug/incremental/{cache}/file"));
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1143,6 +1199,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn removing_an_items_paths_takes_read_only_directories_too() {
         let home = TempDir::new();
@@ -1155,6 +1212,7 @@ mod tests {
             1000,
         );
         for directory in [locked.join("bin"), locked.clone()] {
+            use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
         let paths = slot

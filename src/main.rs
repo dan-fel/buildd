@@ -1,8 +1,6 @@
 //! The `buildd` command: the daemon and its command-line client.
 
 use std::io::ErrorKind;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -10,6 +8,7 @@ use std::time::{Duration, Instant};
 use buildd::cargo::{Command, Operation};
 use buildd::log::gib;
 use buildd::protocol::{BuildRequest, Chore, Failures, Message, Outcome, Status};
+use buildd::socket::UnixStream;
 use buildd::{client, config};
 use serde::Deserialize;
 
@@ -228,7 +227,7 @@ impl Options {
         }
         args.drain(..taken);
         if let Some(copy_to) = options.copy_to.take() {
-            if copy_to.is_relative()
+            if !buildd::config::absolute_somewhere(&copy_to)
                 && (options.os.is_some()
                     || options.host.as_deref().is_some_and(|host| host != "local"))
             {
@@ -831,17 +830,58 @@ fn start_daemon(home: &Path) -> Result<(), String> {
     std::fs::create_dir_all(home)
         .and_then(|()| Ok((open_log()?, open_log()?)))
         .and_then(|(stdout, stderr)| {
-            std::process::Command::new(std::env::current_exe()?)
+            let mut daemon = std::process::Command::new(std::env::current_exe()?);
+            daemon
                 .arg("daemon")
                 .env("BUILDD_HOME", home)
                 .stdin(Stdio::null())
                 .stdout(stdout)
-                .stderr(stderr)
-                .process_group(0)
-                .spawn()
+                .stderr(stderr);
+            spawn_detached(&mut daemon)
         })
         .map(drop)
         .map_err(|error| format!("could not start the daemon: {error}"))
+}
+
+/// Starts the daemon so that it outlives whoever starts it, such as an SSH
+/// session.
+#[cfg(unix)]
+fn spawn_detached(daemon: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt as _;
+    daemon.process_group(0).spawn()
+}
+
+/// Starts the daemon so that it outlives whoever starts it, such as an SSH
+/// session, whose job would otherwise take the daemon with it. A job may
+/// forbid leaving it: the daemon then lasts as long as that job does.
+#[cfg(windows)]
+fn spawn_detached(daemon: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+    };
+    // A child inherits every inheritable handle, not only those it is given.
+    // Holding this client's streams, it would keep whoever reads them, such
+    // as SSH, waiting for as long as the daemon runs.
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: both calls take integers or a handle GetStdHandle returned,
+        // and a process without that stream only fails the second call.
+        unsafe { SetHandleInformation(GetStdHandle(stream), HANDLE_FLAG_INHERIT, 0) };
+    }
+    let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    match daemon
+        .creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+    {
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            daemon.creation_flags(detached).spawn()
+        }
+        spawned => spawned,
+    }
 }
 
 #[cfg(test)]

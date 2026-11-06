@@ -55,7 +55,7 @@ fn serve(remote: &Remote) -> Result<Child, String> {
 fn ask<T: DeserializeOwned>(
     remote: &Remote,
     request: &Request,
-    requester: Option<&std::os::unix::net::UnixStream>,
+    requester: Option<&crate::socket::UnixStream>,
 ) -> Result<T, String> {
     let answer = exchange(
         serve(remote)?,
@@ -72,13 +72,21 @@ fn ask<T: DeserializeOwned>(
         .map_err(|error| format!("{} sent an invalid answer: {error}", remote.name))
 }
 
+/// Ends what an SSH session started on this machine: its process group.
+pub(crate) fn kill_session(child: &Child) {
+    let pid =
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("process ID fits i32"))
+            .expect("nonzero PID");
+    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+}
+
 const CACHE_REQUEST_TIME: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) fn cache(
     _home: &Path,
     remote: &Remote,
     operation: crate::cache::Operation,
-    requester: &std::os::unix::net::UnixStream,
+    requester: &crate::socket::UnixStream,
 ) -> Result<crate::cache::Response, crate::client::CacheError> {
     let deadline = std::time::Instant::now() + CACHE_REQUEST_TIME;
     let child = serve(remote).map_err(crate::client::CacheError::Transport)?;
@@ -105,7 +113,7 @@ pub(crate) fn cache(
 fn cache_request(
     child: Child,
     operation: crate::cache::Operation,
-    requester: &std::os::unix::net::UnixStream,
+    requester: &crate::socket::UnixStream,
     deadline: std::time::Instant,
     limit: usize,
 ) -> Result<crate::cache::Response, crate::client::CacheError> {
@@ -125,7 +133,7 @@ fn cache_request(
 fn exchange(
     mut child: Child,
     request: &Request,
-    requester: Option<&std::os::unix::net::UnixStream>,
+    requester: Option<&crate::socket::UnixStream>,
     deadline: std::time::Instant,
     limit: usize,
 ) -> Result<Vec<u8>, crate::client::CacheError> {
@@ -365,7 +373,7 @@ fn validate_capacity(remote: &Remote, capacity: &crate::protocol::Capacity) -> R
 pub(crate) fn forecast(
     remote: &Remote,
     request: RevisionRequest,
-    requester: &std::os::unix::net::UnixStream,
+    requester: &crate::socket::UnixStream,
 ) -> Result<crate::protocol::Forecast, String> {
     let forecast = ask::<Result<crate::protocol::Forecast, String>>(
         remote,
@@ -387,7 +395,7 @@ fn push(
     remote: &Remote,
     source: &Source,
     revision: &Revision,
-    requester: &std::os::unix::net::UnixStream,
+    requester: &crate::socket::UnixStream,
     started: &impl Fn(&std::sync::Arc<std::sync::Mutex<Child>>),
 ) -> Result<String, String> {
     let project = crate::slot::project_name(&source.repository);
@@ -407,15 +415,32 @@ fn push(
         let mut command = git::command(&source.repository);
         command
             .env("GIT_SSH_COMMAND", &ssh)
+            .env("GIT_ALLOW_PROTOCOL", "ssh:ext")
             .arg("--git-dir")
             .arg(&source.repository);
         command
     };
-    let destination = format!("{}:{}", remote.ssh, mirror.path.display());
+    let destination = destination(remote, &ssh, &mirror.path);
     push_snapshot_with(git, source, revision, &destination, |command| {
         run_git(command, started)
     })?;
     Ok(project)
+}
+
+/// Where to push `remote`'s mirror at `path`. Git quotes the path of an SSH
+/// destination in single quotes, which the shell of a Windows host keeps as part
+/// of the path, so a Windows host gets its command spelled out through git's
+/// `ext` transport, in which `%` escapes a space.
+fn destination(remote: &Remote, ssh: &str, path: &Path) -> String {
+    if remote.os != "windows" {
+        return format!("{}:{}", remote.ssh, path.display());
+    }
+    let path = path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .replace(' ', "% ");
+    format!("ext::{ssh} {} git receive-pack \"{path}\"", remote.ssh)
 }
 
 /// Pushes tree `revision` of `source` to the repository at `destination`,
@@ -514,7 +539,7 @@ pub(crate) fn build(
     source: &Source,
     revision: &Revision,
     request: RevisionRequest,
-    requester: &std::os::unix::net::UnixStream,
+    requester: &crate::socket::UnixStream,
     started: impl Fn(&std::sync::Arc<std::sync::Mutex<Child>>),
     pass: impl FnMut(&Message) -> bool,
 ) -> Result<(), String> {
@@ -673,6 +698,28 @@ mod stream_end_to_end {
     }
 
     #[test]
+    fn a_windows_host_is_pushed_to_through_a_command_its_shell_keeps_whole() {
+        let remote = |os: &str| Remote {
+            name: "pc".into(),
+            ssh: "me@pc".into(),
+            os: os.into(),
+            command: "buildd serve".into(),
+        };
+        assert_eq!(
+            destination(&remote("linux"), "ssh", Path::new("/home/me/mirror")),
+            "me@pc:/home/me/mirror"
+        );
+        assert_eq!(
+            destination(
+                &remote("windows"),
+                "ssh -o BatchMode=yes",
+                Path::new(r"C:\Users\my name\mirror")
+            ),
+            "ext::ssh -o BatchMode=yes me@pc git receive-pack \"C:/Users/my% name/mirror\""
+        );
+    }
+
+    #[test]
     fn early_exit_retains_ssh_status_and_diagnostics() {
         let (result, messages) = stream(
             "import sys\nprint('{\"type\":\"queued\",\"revision\":\"abc\"}')\nsys.stderr.write('channel fixture closed\\n')\nsys.exit(7)",
@@ -734,7 +781,7 @@ mod cache_end_to_end {
     fn ask(reply: &str) -> Result<Response, CacheError> {
         let child = fixture(reply);
         let pid = rustix::process::Pid::from_raw(child.id().try_into().unwrap()).unwrap();
-        let (_requester, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_requester, socket) = crate::socket::UnixStream::pair().unwrap();
         let response = cache_request(
             child,
             Operation::Capabilities,
@@ -793,7 +840,7 @@ mod cache_end_to_end {
 
     // The fixture signals readiness and request progress over a separate
     // socket. Neither startup timing nor sleeps decide the stalled boundary.
-    fn event_fixture(body: &str) -> (Child, std::os::unix::net::UnixStream) {
+    fn event_fixture(body: &str) -> (Child, crate::socket::UnixStream) {
         let directory = crate::snapshot::tests::TempDir::new();
         let path = directory.0.join("events");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -839,7 +886,7 @@ mod cache_end_to_end {
         ] {
             let (child, mut event) = event_fixture(body);
             let pid = rustix::process::Pid::from_raw(child.id().try_into().unwrap()).unwrap();
-            let (_requester, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (_requester, socket) = crate::socket::UnixStream::pair().unwrap();
             let response = cache_request(
                 child,
                 Operation::Capabilities,
@@ -862,7 +909,7 @@ mod cache_end_to_end {
         let (child, mut event) =
             event_fixture("sys.stdin.buffer.read(1); event.sendall(b'A'); signal.pause()");
         let pid = rustix::process::Pid::from_raw(child.id().try_into().unwrap()).unwrap();
-        let (_requester, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_requester, socket) = crate::socket::UnixStream::pair().unwrap();
         let response = cache_request(
             child,
             Operation::Preview {
@@ -894,7 +941,7 @@ mod cache_end_to_end {
         let (child, mut event) =
             event_fixture("json.loads(sys.stdin.readline()); event.sendall(b'A'); signal.pause()");
         let pid = rustix::process::Pid::from_raw(child.id().try_into().unwrap()).unwrap();
-        let (requester, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (requester, socket) = crate::socket::UnixStream::pair().unwrap();
         let (result, received) = crossbeam_channel::bounded(1);
         let worker = std::thread::spawn(move || {
             result
@@ -949,7 +996,7 @@ mod cache_end_to_end {
             .read_exact(&mut event)
             .unwrap();
         assert_eq!(&event, b"closed\n");
-        let (_requester, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_requester, socket) = crate::socket::UnixStream::pair().unwrap();
         assert!(matches!(
             cache_request(child, Operation::Capabilities, &socket,
                 std::time::Instant::now() + std::time::Duration::from_secs(2), 4096),

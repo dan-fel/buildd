@@ -39,7 +39,7 @@ pub(crate) fn copy(products: &[Product], directory: &Path) -> Result<Vec<String>
                 // Cargo names an uplifted file, which may link to the one it
                 // built in `deps`: the copy is what it names, not the link.
                 install(&to, |partial| {
-                    copy_tree(&std::fs::canonicalize(file)?, partial)
+                    copy_tree(&crate::snapshot::canonicalize(file)?, partial)
                 })
                 .map_err(|error| failed("copy", file, &to, &error))?;
             }
@@ -114,10 +114,25 @@ fn move_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path, _metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt as _;
+    if metadata.file_type().is_symlink_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(from)?;
     if metadata.is_symlink() {
-        std::os::unix::fs::symlink(std::fs::read_link(from)?, to)
+        symlink(&std::fs::read_link(from)?, to, &metadata)
     } else if metadata.is_dir() {
         std::fs::create_dir(to)?;
         for entry in std::fs::read_dir(from)? {
@@ -167,6 +182,7 @@ mod tests {
     use super::*;
     use crate::snapshot::tests::TempDir;
 
+    #[cfg(unix)]
     fn product(slot: &Path, name: &str) -> Product {
         let executable = slot.join(name);
         let symbols = slot.join(format!("{name}.dSYM"));
@@ -189,6 +205,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn executables_and_their_symbols_are_copied_and_their_messages_name_the_copies() {
         let slot = TempDir::new();
@@ -257,6 +274,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 3);
     }
 
+    #[cfg(unix)]
     #[test]
     fn two_products_with_one_name_are_refused_before_anything_is_copied() {
         let slot = TempDir::new();

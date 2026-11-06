@@ -4,19 +4,153 @@
 //! at the build's [`Priority`], which everything it starts keeps.
 
 use std::fs::File;
+#[cfg(unix)]
 use std::os::fd::{OwnedFd, RawFd};
+#[cfg(unix)]
 use std::process::Command;
+use std::process::ExitStatus;
 
-use rustix::process::Pid;
+#[cfg(unix)]
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
+#[cfg(unix)]
 use crate::config::Priority;
+#[cfg(unix)]
+use crate::log::log;
+use crate::protocol::Outcome;
+#[cfg(unix)]
+use crate::protocol::Usage;
+
+/// What a build process keeps open beyond its standard streams.
+#[cfg(unix)]
+pub(crate) type Descriptor = RawFd;
 
 /// A started build process. Whoever started it reaps it.
 pub(crate) struct Process {
-    pub(crate) pid: Pid,
+    pub(crate) group: Group,
     pub(crate) stdout: File,
     pub(crate) stderr: File,
 }
+
+/// A build process and everything it started: stopping the group stops them
+/// all. On Unix it is the process group that its leader names.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(crate) struct Group(pub(crate) Pid);
+
+#[cfg(unix)]
+impl Group {
+    /// Asks the group to stop, as a client's withdrawal does.
+    pub(crate) fn terminate(&self) {
+        self.signal(Signal::TERM);
+    }
+
+    pub(crate) fn kill(&self) {
+        self.signal(Signal::KILL);
+    }
+
+    fn signal(&self, signal: Signal) {
+        match rustix::process::kill_process_group(self.0, signal) {
+            // The group has no members left.
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => log!("could not signal process group {:?}: {error}", self.0),
+        }
+    }
+
+    /// Waits for the leader to exit without reaping it, so the group's id
+    /// cannot be reused while what remains of the group is killed.
+    pub(crate) fn wait_exited(&self) {
+        loop {
+            match rustix::process::waitid(
+                WaitId::Pid(self.0),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+            ) {
+                Err(rustix::io::Errno::INTR) => {}
+                Ok(_) => break,
+                Err(error) => {
+                    panic!("waiting for our own child fails only by a bug: {error}")
+                }
+            }
+        }
+    }
+
+    /// Kills what remains of the group, whose leader (Cargo or the command)
+    /// has exited but is not reaped yet: processes it started and left
+    /// behind.
+    pub(crate) fn kill_leftovers(&self) {
+        match rustix::process::kill_process_group(self.0, Signal::KILL) {
+            // No members left, or (macOS) only the unreaped leader itself,
+            // which a signal cannot reach.
+            Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => {}
+            Err(error) => log!("could not kill process group {:?}: {error}", self.0),
+        }
+    }
+
+    /// Reaps the leader, which has exited, with what it and the processes
+    /// it waited for used: Cargo waits for every compiler it starts.
+    pub(crate) fn reap(self) -> (ExitStatus, Usage) {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let pid = self.0.as_raw_pid();
+        let mut status = 0;
+        // SAFETY: rusage holds only integers, for which all zeroes is valid.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: `status` and `usage` are valid for writes for the call.
+            let reaped = unsafe { libc::wait4(pid, &raw mut status, 0, &raw mut usage) };
+            if reaped == pid {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "reaping our own exited child fails only by a bug: {error}"
+            );
+        }
+        let millis = |time: libc::timeval| {
+            u64::try_from(time.tv_sec).expect("CPU seconds are positive") * 1000
+                + u64::try_from(time.tv_usec).expect("CPU microseconds are positive") / 1000
+        };
+        let usage = Usage {
+            cpu_ms: millis(usage.ru_utime) + millis(usage.ru_stime),
+            peak_memory: u64::try_from(usage.ru_maxrss).expect("memory sizes are positive")
+                * MAX_RSS_UNIT,
+            test_memory: None,
+        };
+        (ExitStatus::from_raw(status), usage)
+    }
+}
+
+/// The unit of `ru_maxrss`: bytes on macOS, kilobytes elsewhere.
+#[cfg(target_os = "macos")]
+const MAX_RSS_UNIT: u64 = 1;
+#[cfg(all(unix, not(target_os = "macos")))]
+const MAX_RSS_UNIT: u64 = 1024;
+
+#[cfg(unix)]
+pub(crate) fn outcome(status: ExitStatus) -> Outcome {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => Outcome::Exited { code },
+        (None, Some(signal)) => Outcome::Signaled { signal },
+        (None, None) => panic!("a reaped process exited or was signaled"),
+    }
+}
+
+/// Every Windows process ends with an exit code, also when it was killed.
+#[cfg(windows)]
+pub(crate) fn outcome(status: ExitStatus) -> Outcome {
+    Outcome::Exited {
+        code: status.code().expect("Windows processes have exit codes"),
+    }
+}
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::{Descriptor, Group, spawn};
 
 /// Starts `command`, with `inherit` open in it as well as its standard
 /// streams, at `priority`. Of `command`, only its program, arguments,
@@ -27,7 +161,7 @@ pub(crate) struct Process {
 #[cfg(target_os = "linux")]
 pub(crate) fn spawn(
     mut command: Command,
-    inherit: &[RawFd],
+    inherit: &[Descriptor],
     priority: Priority,
 ) -> std::io::Result<Process> {
     use std::os::unix::process::CommandExt as _;
@@ -57,7 +191,7 @@ pub(crate) fn spawn(
     let stdout = child.stdout.take().expect("the output is piped");
     let stderr = child.stderr.take().expect("the errors are piped");
     Ok(Process {
-        pid: Pid::from_child(&child),
+        group: Group(Pid::from_child(&child)),
         stdout: File::from(OwnedFd::from(stdout)),
         stderr: File::from(OwnedFd::from(stderr)),
     })
@@ -110,7 +244,7 @@ fn lower() -> std::io::Result<()> {
 #[cfg(target_os = "macos")]
 pub(crate) fn spawn(
     command: Command,
-    inherit: &[RawFd],
+    inherit: &[Descriptor],
     priority: Priority,
 ) -> std::io::Result<Process> {
     use std::collections::BTreeMap;
@@ -290,14 +424,14 @@ pub(crate) fn spawn(
             envp.as_ptr(),
         ))?;
         Ok(Process {
-            pid: Pid::from_raw(pid).expect("posix_spawn reports the started process"),
+            group: Group(Pid::from_raw(pid).expect("posix_spawn reports the started process")),
             stdout: File::from(OwnedFd::from(stdout)),
             stderr: File::from(OwnedFd::from(stderr)),
         })
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::io::Read as _;
 
@@ -326,7 +460,7 @@ mod tests {
         let mut text = String::new();
         process.stdout.read_to_string(&mut text).unwrap();
         let status =
-            rustix::process::waitpid(Some(process.pid), rustix::process::WaitOptions::empty())
+            rustix::process::waitpid(Some(process.group.0), rustix::process::WaitOptions::empty())
                 .unwrap()
                 .unwrap()
                 .1;
@@ -375,7 +509,8 @@ mod tests {
         process.stderr.read_to_string(&mut errors).unwrap();
         assert_eq!(output, format!("{}\nset\nleader\n", directory.display()));
         assert_eq!(errors, "error\n");
-        rustix::process::waitpid(Some(process.pid), rustix::process::WaitOptions::empty()).unwrap();
+        rustix::process::waitpid(Some(process.group.0), rustix::process::WaitOptions::empty())
+            .unwrap();
         assert!(spawn(Command::new("buildd-no-such-program"), &[], Priority::Low).is_err());
     }
 }

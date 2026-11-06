@@ -85,7 +85,7 @@ pub struct Remote {
     pub name: String,
     /// The SSH destination: `user@host`.
     pub ssh: String,
-    /// The OS its builds run on, as Rust names it: `linux`, `macos`.
+    /// The OS its builds run on, as Rust names it: `linux`, `macos`, `windows`.
     pub os: String,
     /// The shell command that runs `buildd serve` there, with whatever
     /// environment it needs: `bash -lc 'buildd serve'`.
@@ -292,10 +292,16 @@ pub fn home() -> Result<PathBuf, String> {
         }
         return Ok(home);
     }
+    #[cfg(windows)]
+    return std::env::var_os("LOCALAPPDATA")
+        .map(|cache| PathBuf::from(cache).join("buildd"))
+        .ok_or_else(|| "the user has no local application data directory".to_owned());
+    #[cfg(not(windows))]
     default_home(std::env::home_dir(), std::env::var_os("XDG_CACHE_HOME"))
         .ok_or_else(|| "the user has no home directory".to_owned())
 }
 
+#[cfg(not(windows))]
 fn default_home(home: Option<PathBuf>, xdg_cache: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let home = home.filter(|path| !path.as_os_str().is_empty())?;
     let cache = if cfg!(target_os = "macos") {
@@ -309,6 +315,16 @@ fn default_home(home: Option<PathBuf>, xdg_cache: Option<std::ffi::OsString>) ->
     Some(cache.join("buildd"))
 }
 
+/// Whether `directory` is absolute on some machine: the one that builds may
+/// not be this one, so a Mac may name `C:\\out` and Windows may name `/out`.
+#[must_use]
+pub fn absolute_somewhere(directory: &Path) -> bool {
+    let text = directory.as_os_str().as_encoded_bytes();
+    directory.is_absolute()
+        || text.starts_with(b"/")
+        || matches!(text, [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+}
+
 /// The daemon's socket in `home`.
 #[must_use]
 pub fn socket(home: &Path) -> PathBuf {
@@ -320,6 +336,7 @@ mod tests {
     use super::*;
     use crate::snapshot::tests::TempDir;
 
+    #[cfg(unix)]
     #[test]
     fn default_home_requires_an_account_home_even_with_an_xdg_override() {
         for home in [None, Some(PathBuf::new())] {
@@ -327,6 +344,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn default_home_preserves_native_cache_locations_and_xdg_rules() {
         for xdg in [None, Some(""), Some("relative"), Some("/cache")] {

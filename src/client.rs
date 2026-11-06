@@ -1,10 +1,10 @@
 //! Talking to a running daemon.
 
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use crate::config;
+pub use crate::socket::UnixStream;
 use serde::de::DeserializeOwned;
 
 use crate::protocol::{
@@ -16,7 +16,18 @@ use crate::protocol::{
 /// # Errors
 /// `NotFound` or `ConnectionRefused` when no daemon runs.
 pub fn connect(home: &Path) -> std::io::Result<UnixStream> {
-    UnixStream::connect(config::socket(home))
+    let connected = UnixStream::connect(config::socket(home));
+    // Winsock reports a socket nobody made as a network that is down.
+    #[cfg(windows)]
+    let connected = connected.map_err(|error| {
+        const WSAENETDOWN: i32 = 10050;
+        if error.raw_os_error() == Some(WSAENETDOWN) {
+            std::io::Error::new(std::io::ErrorKind::NotFound, error)
+        } else {
+            error
+        }
+    });
+    connected
 }
 
 /// Asks for `request` and passes each message to `on_message`. Returns the

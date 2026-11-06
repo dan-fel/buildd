@@ -1,7 +1,8 @@
 //! The machine's job budget, shared by every running build.
 //!
 //! Each build gets a jobserver of its own: a FIFO its Cargo and compilers
-//! take tokens from and give them back to, as GNU make's protocol says. The
+//! take tokens from and give them back to, as GNU make's protocol says, or
+//! on Windows the named semaphore that protocol uses there. The
 //! daemon moves tokens between these jobservers from one budget, so it knows
 //! at every moment what each build holds: the tokens its processes took, the
 //! ones waiting in its FIFO, and Cargo's implicit token. A build that is
@@ -20,13 +21,11 @@
 //! not take waits in its FIFO for one tick at most.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, RawFd};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+use crate::spawn::Descriptor;
 
 /// How often tokens are dealt again while builds run.
 const TICK: Duration = Duration::from_millis(5);
@@ -57,14 +56,7 @@ struct Ledger {
 
 /// A build's jobserver and what it is charged.
 struct Account {
-    /// The daemon's own end: reads never block.
-    reader: File,
-    /// Where tokens are written; the build's processes write theirs back
-    /// through it too.
-    writer: File,
-    /// The read end the build's processes inherit: reads block, as every
-    /// jobserver client expects.
-    child_reader: File,
+    jobserver: Jobserver,
     /// Tokens written into the FIFO and not taken back: held by the build's
     /// processes or waiting in the FIFO.
     deposited: usize,
@@ -99,34 +91,18 @@ impl Account {
 
     /// Tokens waiting in the FIFO.
     fn waiting(&self) -> usize {
-        rustix::io::ioctl_fionread(&self.reader).map_or_else(
-            |error| panic!("a FIFO the daemon holds open can be queried: {error}"),
-            |waiting| usize::try_from(waiting).expect("a FIFO holds few bytes"),
-        )
+        self.jobserver.waiting()
     }
 
-    /// Takes back every token waiting in the FIFO.
+    /// Takes back every token waiting in the FIFO. A process may have given
+    /// back more than it took: nothing to take back beyond what was deposited.
     fn withdraw_waiting(&mut self) {
-        let mut buffer = [0; 64];
-        loop {
-            match self.reader.read(&mut buffer) {
-                Ok(0) => panic!("the daemon holds the FIFO's writer open"),
-                Ok(read) => {
-                    // A process wrote back more than it took: nothing to
-                    // take back beyond what was deposited.
-                    self.deposited = self.deposited.saturating_sub(read);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => panic!("reading the daemon's own FIFO fails only by a bug: {error}"),
-            }
-        }
+        let taken = self.jobserver.take_waiting();
+        self.deposited = self.deposited.saturating_sub(taken);
     }
 
     fn deposit(&mut self) {
-        self.writer
-            .write_all(b"|")
-            .expect("a FIFO with room for every token takes one more");
+        self.jobserver.put();
         self.deposited += 1;
     }
 }
@@ -179,12 +155,19 @@ impl Budget {
         let mut ledger = self.ledger();
         let id = ledger.next;
         ledger.next += 1;
-        let account = fifo(
+        let jobserver = Jobserver::new(
             &ledger
                 .scratch
                 .join(format!("jobs-{}-{id}", std::process::id())),
         )?;
-        ledger.accounts.insert(id, account);
+        ledger.accounts.insert(
+            id,
+            Account {
+                jobserver,
+                deposited: 0,
+                fixed_share: false,
+            },
+        );
         drop(ledger);
         self.shared.joined.notify_one();
         Ok(Lease {
@@ -269,19 +252,11 @@ pub(crate) struct Lease {
 
 impl Lease {
     /// Makes `command` a client of the build's jobserver, as Cargo reads it
-    /// from `CARGO_MAKEFLAGS`. Returns the jobserver's descriptors, which
-    /// the process must inherit; the account keeps them open until the
-    /// lease is dropped.
-    pub(crate) fn configure(&self, command: &mut std::process::Command) -> [RawFd; 2] {
+    /// from `CARGO_MAKEFLAGS`. Returns what the process must inherit; the
+    /// account keeps it open until the lease is dropped.
+    pub(crate) fn configure(&self, command: &mut std::process::Command) -> Vec<Descriptor> {
         let ledger = self.budget.ledger();
-        let account = &ledger.accounts[&self.id];
-        let read = account.child_reader.as_raw_fd();
-        let write = account.writer.as_raw_fd();
-        command.env(
-            "CARGO_MAKEFLAGS",
-            format!("-j --jobserver-fds={read},{write} --jobserver-auth={read},{write}"),
-        );
-        [read, write]
+        ledger.accounts[&self.id].jobserver.configure(command)
     }
 
     /// The build's processes use cores without taking tokens from now on,
@@ -309,38 +284,224 @@ impl Drop for Lease {
     }
 }
 
-/// Makes a FIFO at `path`, opens its three ends and removes the path: the
-/// open descriptors keep it alive.
-fn fifo(path: &Path) -> Result<Account, String> {
-    let failed = |error: std::io::Error| format!("could not make a jobserver: {error}");
-    std::fs::create_dir_all(path.parent().expect("a FIFO lives in a directory")).map_err(failed)?;
-    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .expect("scratch paths hold no NUL");
-    // SAFETY: `name` is a NUL-terminated path.
-    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
-        return Err(failed(std::io::Error::last_os_error()));
+#[cfg(unix)]
+use unix::Jobserver;
+#[cfg(windows)]
+use windows::Jobserver;
+
+#[cfg(unix)]
+mod unix {
+    use std::fs::File;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::path::Path;
+
+    use crate::spawn::Descriptor;
+
+    /// A FIFO of tokens, which only its open descriptors keep alive.
+    pub(super) struct Jobserver {
+        /// The daemon's own end: reads never block.
+        reader: File,
+        /// Where tokens are written; the build's processes write theirs back
+        /// through it too.
+        writer: File,
+        /// The read end the build's processes inherit: reads block, as every
+        /// jobserver client expects.
+        child_reader: File,
     }
-    let opened = (|| {
-        // Opening for reading and writing never waits for a peer, and keeps
-        // a writer open so reads never see the end of the file.
-        let writer = File::options().read(true).write(true).open(path)?;
-        let child_reader = File::open(path)?;
-        let reader = File::options()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)?;
-        Ok(Account {
-            reader,
-            writer,
-            child_reader,
-            deposited: 0,
-            fixed_share: false,
-        })
-    })();
-    let removed = std::fs::remove_file(path);
-    let account = opened.map_err(failed)?;
-    removed.map_err(failed)?;
-    Ok(account)
+
+    impl Jobserver {
+        /// Makes a FIFO at `path`, opens its three ends and removes the path:
+        /// the open descriptors keep it alive.
+        pub(super) fn new(path: &Path) -> Result<Self, String> {
+            let failed = |error: std::io::Error| format!("could not make a jobserver: {error}");
+            std::fs::create_dir_all(path.parent().expect("a FIFO lives in a directory"))
+                .map_err(failed)?;
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .expect("scratch paths hold no NUL");
+            // SAFETY: `name` is a NUL-terminated path.
+            if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+                return Err(failed(std::io::Error::last_os_error()));
+            }
+            let opened = (|| {
+                // Opening for reading and writing never waits for a peer, and
+                // keeps a writer open so reads never see the end of the file.
+                let writer = File::options().read(true).write(true).open(path)?;
+                let child_reader = File::open(path)?;
+                let reader = File::options()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)?;
+                Ok(Self {
+                    reader,
+                    writer,
+                    child_reader,
+                })
+            })();
+            let removed = std::fs::remove_file(path);
+            let jobserver = opened.map_err(failed)?;
+            removed.map_err(failed)?;
+            Ok(jobserver)
+        }
+
+        pub(super) fn waiting(&self) -> usize {
+            rustix::io::ioctl_fionread(&self.reader).map_or_else(
+                |error| panic!("a FIFO the daemon holds open can be queried: {error}"),
+                |waiting| usize::try_from(waiting).expect("a FIFO holds few bytes"),
+            )
+        }
+
+        pub(super) fn take_waiting(&mut self) -> usize {
+            let mut buffer = [0; 64];
+            let mut taken = 0;
+            loop {
+                match self.reader.read(&mut buffer) {
+                    Ok(0) => panic!("the daemon holds the FIFO's writer open"),
+                    Ok(read) => taken += read,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return taken,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        panic!("reading the daemon's own FIFO fails only by a bug: {error}")
+                    }
+                }
+            }
+        }
+
+        pub(super) fn put(&mut self) {
+            self.writer
+                .write_all(b"|")
+                .expect("a FIFO with room for every token takes one more");
+        }
+
+        /// A process of the build takes a token, as a jobserver client does.
+        #[cfg(test)]
+        pub(super) fn client_take(&self) {
+            (&self.child_reader).read_exact(&mut [0]).unwrap();
+        }
+
+        #[cfg(test)]
+        pub(super) fn client_give_back(&self) {
+            (&self.writer).write_all(b"|").unwrap();
+        }
+
+        pub(super) fn configure(&self, command: &mut std::process::Command) -> Vec<Descriptor> {
+            let read = self.child_reader.as_raw_fd();
+            let write = self.writer.as_raw_fd();
+            command.env(
+                "CARGO_MAKEFLAGS",
+                format!("-j --jobserver-fds={read},{write} --jobserver-auth={read},{write}"),
+            );
+            vec![read, write]
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        CreateSemaphoreW, ReleaseSemaphore, WaitForSingleObject,
+    };
+
+    use crate::spawn::Descriptor;
+
+    /// A named semaphore of tokens, which GNU make's protocol uses on Windows:
+    /// clients open it by its name.
+    pub(super) struct Jobserver {
+        semaphore: OwnedHandle,
+        name: String,
+    }
+
+    impl Jobserver {
+        /// Makes the semaphore named after the last part of `path`.
+        pub(super) fn new(path: &Path) -> Result<Self, String> {
+            let name = format!(
+                "buildd-{}",
+                path.file_name()
+                    .expect("a jobserver has a name")
+                    .to_string_lossy()
+            );
+            let wide = name.encode_utf16().chain([0]).collect::<Vec<_>>();
+            // SAFETY: `wide` is NUL-terminated and default security is null.
+            let semaphore =
+                unsafe { CreateSemaphoreW(std::ptr::null(), 0, i32::MAX, wide.as_ptr()) };
+            if semaphore.is_null() {
+                return Err(format!(
+                    "could not make a jobserver: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self {
+                // SAFETY: the handle was just created and is owned here alone.
+                semaphore: unsafe { OwnedHandle::from_raw_handle(semaphore) },
+                name,
+            })
+        }
+
+        fn release(&self, count: usize) {
+            let count = i32::try_from(count).expect("few tokens");
+            // SAFETY: the handle is open, and the previous count is optional.
+            let released = unsafe {
+                ReleaseSemaphore(self.semaphore.as_raw_handle(), count, std::ptr::null_mut())
+            };
+            assert_ne!(released, 0, "a semaphore far from its maximum takes more");
+        }
+
+        /// Windows reads a semaphore's count only by taking it: tokens are
+        /// put back at once, so a client waits a moment at most.
+        pub(super) fn waiting(&self) -> usize {
+            let waiting = self.drain();
+            if waiting > 0 {
+                self.release(waiting);
+            }
+            waiting
+        }
+
+        pub(super) fn take_waiting(&mut self) -> usize {
+            self.drain()
+        }
+
+        fn drain(&self) -> usize {
+            let mut taken = 0;
+            loop {
+                // SAFETY: the handle is open.
+                match unsafe { WaitForSingleObject(self.semaphore.as_raw_handle(), 0) } {
+                    WAIT_OBJECT_0 => taken += 1,
+                    WAIT_TIMEOUT => return taken,
+                    other => panic!("waiting on our own semaphore fails only by a bug: {other}"),
+                }
+            }
+        }
+
+        pub(super) fn put(&mut self) {
+            self.release(1);
+        }
+
+        /// A process of the build takes a token, as a jobserver client does.
+        #[cfg(test)]
+        pub(super) fn client_take(&self) {
+            // SAFETY: the handle is open.
+            let waited = unsafe { WaitForSingleObject(self.semaphore.as_raw_handle(), 0) };
+            assert_eq!(waited, WAIT_OBJECT_0);
+        }
+
+        #[cfg(test)]
+        pub(super) fn client_give_back(&self) {
+            self.release(1);
+        }
+
+        pub(super) fn configure(&self, command: &mut std::process::Command) -> Vec<Descriptor> {
+            command.env(
+                "CARGO_MAKEFLAGS",
+                format!("-j --jobserver-auth={}", self.name),
+            );
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -363,7 +524,18 @@ mod tests {
     fn open(ledger: &mut Ledger) -> u64 {
         let id = ledger.next;
         ledger.next += 1;
-        let account = fifo(&ledger.scratch.join(format!("jobs-{id}"))).unwrap();
+        // Named semaphores are the machine's: each test needs its own.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let account = Account {
+            jobserver: Jobserver::new(&ledger.scratch.join(format!(
+                "jobs-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )))
+            .unwrap(),
+            deposited: 0,
+            fixed_share: false,
+        };
         ledger.accounts.insert(id, account);
         id
     }
@@ -371,15 +543,12 @@ mod tests {
     /// A process of build `id` takes a token, as a jobserver client does.
     fn take(ledger: &Ledger, id: u64) {
         assert!(ledger.accounts[&id].waiting() > 0, "a token waits for {id}");
-        let mut byte = [0];
-        (&ledger.accounts[&id].child_reader)
-            .read_exact(&mut byte)
-            .unwrap();
+        ledger.accounts[&id].jobserver.client_take();
     }
 
     /// A process of build `id` gives a token back.
     fn give_back(ledger: &Ledger, id: u64) {
-        (&ledger.accounts[&id].writer).write_all(b"|").unwrap();
+        ledger.accounts[&id].jobserver.client_give_back();
     }
 
     /// Tokens the processes of build `id` hold.

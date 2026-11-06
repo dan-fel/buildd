@@ -14,7 +14,6 @@
 //! Anything else runs again.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -45,12 +44,12 @@ pub(crate) struct FileIdentity {
 impl FileIdentity {
     /// The identity of the file at `path`; None when it is gone.
     pub(crate) fn of(path: &Path) -> Option<Self> {
-        let metadata = std::fs::metadata(path).ok()?;
+        let facts = crate::facts::Facts::read(path, &std::fs::metadata(path).ok()?).ok()?;
         Some(Self {
-            size: metadata.len(),
-            modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
-                + i128::from(metadata.mtime_nsec()),
-            inode: metadata.ino(),
+            size: facts.len,
+            modified_ns: i128::from(facts.modified.0) * 1_000_000_000
+                + i128::from(facts.modified.1),
+            inode: facts.inode,
         })
     }
 }

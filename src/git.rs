@@ -98,6 +98,7 @@ pub(crate) fn snapshot_commit(
 
 /// The commit `HEAD` names in the worktree at `worktree`, or `None` before
 /// its first commit.
+#[cfg(unix)]
 pub(crate) fn head_commit(worktree: &Path) -> Result<Option<String>, String> {
     let mut parse = command(worktree);
     parse.args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);

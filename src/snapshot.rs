@@ -87,7 +87,27 @@ pub fn resolve(directory: &Path) -> Result<Source, String> {
 }
 
 fn canonical(path: &str) -> Result<PathBuf, String> {
-    std::fs::canonicalize(path).map_err(|error| format!("{path}: {error}"))
+    canonicalize(Path::new(path)).map_err(|error| format!("{path}: {error}"))
+}
+
+/// `path` with links resolved, as a path git and Cargo can use: on Windows the
+/// system spells it in a verbatim form (`\\?\C:\...`) that git refuses.
+///
+/// # Errors
+/// When the path does not exist.
+pub(crate) fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    if let Some(verbatim) = canonical
+        .to_str()
+        .and_then(|path| path.strip_prefix(r"\\?\"))
+    {
+        return Ok(match verbatim.strip_prefix(r"UNC\") {
+            Some(share) => PathBuf::from(format!(r"\\{share}")),
+            None => PathBuf::from(verbatim),
+        });
+    }
+    Ok(canonical)
 }
 
 impl Source {
@@ -156,7 +176,7 @@ pub(crate) mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).expect("create a temporary directory");
-            Self(std::fs::canonicalize(&path).expect("canonicalize it"))
+            Self(super::canonicalize(&path).expect("canonicalize it"))
         }
     }
 

@@ -98,7 +98,7 @@ pub(crate) fn command(
     command
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 

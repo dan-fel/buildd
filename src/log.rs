@@ -17,6 +17,7 @@ pub(crate) fn write(message: fmt::Arguments<'_>) {
 }
 
 /// `at` in the local time zone, as `2026-10-06 12:34:56`.
+#[cfg(unix)]
 pub fn local_time(at: SystemTime) -> String {
     let seconds = at
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -39,6 +40,46 @@ pub fn local_time(at: SystemTime) -> String {
         tm.tm_hour,
         tm.tm_min,
         tm.tm_sec
+    )
+}
+
+/// A point in time as local calendar time, as `local_time` on other systems.
+#[cfg(windows)]
+#[must_use]
+pub fn local_time(at: SystemTime) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+
+    /// Seconds from the Windows epoch, 1601, to 1970.
+    const EPOCH: u64 = 11_644_473_600;
+    let seconds = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_secs();
+    let ticks = (seconds + EPOCH) * 10_000_000;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the two halves of the time"
+    )]
+    let time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    // SAFETY: the structure holds integers, for which zeroes are valid.
+    let mut utc: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is valid for the call; null names the system's
+    // current time zone.
+    let converted = unsafe {
+        FileTimeToSystemTime(&raw const time, &raw mut utc) != 0
+            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &raw const utc, &raw mut local)
+                != 0
+    };
+    assert!(converted, "a time after 1970 has a local calendar date");
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond
     )
 }
 

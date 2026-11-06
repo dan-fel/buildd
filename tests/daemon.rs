@@ -1,4 +1,5 @@
 //! The daemon end to end: a real daemon process, git repositories and Cargo.
+#![cfg(unix)]
 
 mod planning_end_to_end {
     use super::*;

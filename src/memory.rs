@@ -1,6 +1,8 @@
 //! Memory as admission sees it: the machine's physical memory, and what a
 //! build's process group has resident.
 
+use crate::spawn::Group;
+
 /// The machine's physical memory, in bytes.
 #[cfg(target_os = "macos")]
 pub(crate) fn physical() -> u64 {
@@ -22,7 +24,7 @@ pub(crate) fn physical() -> u64 {
 }
 
 /// The machine's physical memory, in bytes.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn physical() -> u64 {
     // SAFETY: sysconf has no preconditions.
     let (pages, size) = unsafe {
@@ -36,6 +38,20 @@ pub(crate) fn physical() -> u64 {
     pages * size
 }
 
+/// The machine's physical memory, in bytes.
+#[cfg(windows)]
+pub(crate) fn physical() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: the structure holds integers, for which zeroes are valid.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).expect("small");
+    // SAFETY: `status` states its own size and is valid for writes.
+    let read = unsafe { GlobalMemoryStatusEx(&raw mut status) };
+    assert_ne!(read, 0, "a process can read the machine's memory");
+    status.ullTotalPhys
+}
+
+#[cfg(unix)]
 /// Processes of the build, including descendants that start their own process
 /// groups (as nextest does), and group members whose parent already exited.
 fn related_processes(root: u32, processes: &[(u32, u32, u32)]) -> std::collections::HashSet<u32> {
@@ -59,11 +75,19 @@ fn related_processes(root: u32, processes: &[(u32, u32, u32)]) -> std::collectio
 /// Summed resident memory of the build's process tree and group. Shared pages
 /// count once per process. The caller keeps the root unreaped during sampling,
 /// so another process cannot reuse its identity.
-pub(crate) fn tree_resident(root: u32) -> u64 {
+#[cfg(unix)]
+pub(crate) fn tree_resident(group: &Group) -> u64 {
+    let root = group.0.as_raw_pid().cast_unsigned();
     related_processes(root, &processes())
         .into_iter()
         .map(resident)
         .sum()
+}
+
+/// Summed resident memory of the build's job.
+#[cfg(windows)]
+pub(crate) fn tree_resident(group: &Group) -> u64 {
+    group.resident()
 }
 
 #[cfg(target_os = "macos")]
@@ -125,7 +149,7 @@ fn resident(pid: u32) -> u64 {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn processes() -> Vec<(u32, u32, u32)> {
     let Ok(processes) = std::fs::read_dir("/proc") else {
         return Vec::new();
@@ -147,7 +171,7 @@ fn processes() -> Vec<(u32, u32, u32)> {
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn resident(pid: u32) -> u64 {
     // SAFETY: sysconf has no preconditions.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
@@ -171,7 +195,7 @@ pub(crate) struct Monitor {
 }
 
 impl Monitor {
-    pub(crate) fn start(root: u32) -> std::io::Result<Self> {
+    pub(crate) fn start(group: Group) -> std::io::Result<Self> {
         let (events, received) = crossbeam_channel::unbounded();
         let thread = std::thread::Builder::new()
             .name("buildd-memory".into())
@@ -180,7 +204,7 @@ impl Monitor {
                 let mut tests: Option<u64> = None;
                 let mut testing = false;
                 loop {
-                    let memory = tree_resident(root);
+                    let memory = tree_resident(&group);
                     peak = peak.max(memory);
                     if testing && memory > 0 {
                         tests = Some(tests.unwrap_or(0).max(memory));
@@ -219,7 +243,7 @@ impl Drop for Monitor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -260,7 +284,7 @@ mod tests {
         assert_eq!(ready, "ready\n");
         let listed = processes();
         let included = related_processes(std::process::id(), &listed);
-        let memory = tree_resident(child.id());
+        let memory = tree_resident(&Group(rustix::process::Pid::from_child(&child)));
         drop(child.stdin.take());
         child.wait().unwrap();
         assert!(
@@ -275,7 +299,7 @@ mod tests {
     #[test]
     fn sampling_records_testing_and_stops_without_waiting_for_the_sample_interval() {
         assert!(physical() > 1 << 30);
-        let monitor = Monitor::start(std::process::id()).unwrap();
+        let monitor = Monitor::start(Group(rustix::process::getpid())).unwrap();
         monitor.events.send(Sample::Testing).unwrap();
         let (peak, tests) = monitor.finish();
         assert!(tests.is_some_and(|tests| tests > 0 && tests <= peak));
