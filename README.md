@@ -10,7 +10,7 @@ build, and every result names the exact source snapshot it compiled.
 
 ## Get started
 
-Requires Git, Rust 1.95+ and macOS or Linux.
+Requires Git, Rust 1.95+ and macOS, Linux or Windows.
 
 ```sh
 cargo install --path . --root ~/.local
@@ -84,6 +84,8 @@ buildd chooses among enabled hosts using load and cache reuse. Use
 `--exclusive` waits for existing builds, then runs alone among all work
 managed by that host's daemon. `run` executes any command on the same
 snapshot a Cargo build would use.
+
+A Windows machine can build for the others, with `os = "windows"` and `command = "buildd serve"`. Its daemon sends nothing on to other machines, and a cancelled build stops at once, without the grace period Unix builds get.
 
 ## Configuration and limits
 
